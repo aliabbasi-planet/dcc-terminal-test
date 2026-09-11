@@ -16,6 +16,7 @@ dependencies = [
     "streamlit==1.40.2",
     "pyodbc==5.0.1",
     "pandas==2.0.3",
+    "numpy<2",
     "python-dotenv==1.0.0",
 ]
 
