@@ -1,0 +1,8 @@
+streamlit==1.40.2
+pyodbc==5.0.1
+streamlit==1.40.2
+pyodbc==5.0.1
+pandas==2.0.3
+python-dotenv==1.0.0
+plotly==5.17.0
+requests==2.31.0

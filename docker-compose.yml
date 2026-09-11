@@ -1,0 +1,10 @@
+services:
+  console:
+    build: .
+    image: dcc-console:1.0.0
+    container_name: dcc-console
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    restart: unless-stopped

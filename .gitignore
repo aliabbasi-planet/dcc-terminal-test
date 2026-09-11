@@ -1,0 +1,53 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.env
+.env.*
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+# Secrets and local configuration
+.env
+*.env
+!.env.example
+*.local.*
+*.secret
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs and scratch output
+*.log
+logs/
+
+# Office temporary lock files
+~$*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
