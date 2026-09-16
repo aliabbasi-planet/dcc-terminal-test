@@ -51,3 +51,6 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Cortex Code session artifacts
+.cortex/
