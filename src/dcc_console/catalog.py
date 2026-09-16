@@ -43,6 +43,13 @@ class TestDefinition:
     value_options: tuple[str, ...] | None
     proc_args: tuple[str, ...]
     verify: VerifiedColumn
+    # Fixed procedure constant that identifies this test within its display bit,
+    # e.g. the location extra_function name for Bit 1. Declared here (never built
+    # from user input) so the generated EXEC cannot be redirected to another node.
+    function_name: str | None = None
+    # A concise note surfaced in the CAB report when the mapping to the procedure
+    # is inferred rather than confirmed by the procedure owner.
+    assumption: str | None = None
 
     @property
     def json_field(self) -> str:
@@ -80,6 +87,69 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             value_options=("Add", "Remove"),
             proc_args=("@location_json", "@extra_function_name", "@add", "@is_simulation"),
             verify=VerifiedColumn("[ccc].[location]", "extra_function", "location_no", "xml"),
+            function_name="DCCXpressCO",
+        ),
+        TestDefinition(
+            key="Bit 1 — DCC Xpress CO Delayed Terminal (location extra_function)",
+            bit=1,
+            target="location",
+            summary=(
+                "Adds or removes the `DCCXpressCODT` (Delayed Terminal) entry inside "
+                "`ccc.location.extra_function` for the selected location."
+            ),
+            business_meaning=(
+                "DCC Xpress CO Delayed Terminal governs the currency-conversion offer for "
+                "delayed/deferred terminal capture flows (for example unattended or store-and-"
+                "forward terminals). Enabling it opts those terminals at the location into the "
+                "offer; removing it withdraws them. An incorrect setting means delayed-capture "
+                "terminals either miss an entitled DCC offer or present one they should not."
+            ),
+            mechanism=(
+                "The procedure rewrites the location's `extra_function` XML document, adding "
+                "or dropping the node that represents DCCXpressCODT."
+            ),
+            value_label="Action",
+            value_options=("Add", "Remove"),
+            proc_args=("@location_json", "@extra_function_name", "@add", "@is_simulation"),
+            verify=VerifiedColumn("[ccc].[location]", "extra_function", "location_no", "xml"),
+            function_name="DCCXpressCODT",
+            assumption=(
+                "The Delayed Terminal variant is exercised through the same "
+                "`@extra_function_name` parameter as DCCXpressCO with `@add = 1`. The exact "
+                "node name `DCCXpressCODT` should be confirmed with the procedure owner before "
+                "this row is treated as a fully verified capability."
+            ),
+        ),
+        TestDefinition(
+            key="Bit 1 — DCC Xpress CO Fallback (location extra_function)",
+            bit=1,
+            target="location",
+            summary=(
+                "Adds or removes the `DCCXpressCOFallback` entry inside "
+                "`ccc.location.extra_function` for the selected location."
+            ),
+            business_meaning=(
+                "DCC Xpress CO Fallback controls whether the location may fall back to a "
+                "currency-conversion offer when the primary Xpress CO path is unavailable. "
+                "Enabling it keeps the offer available on the fallback route; removing it "
+                "suppresses conversion when the primary path cannot run. An incorrect setting "
+                "changes cardholder experience during degraded/fallback processing."
+            ),
+            mechanism=(
+                "The procedure rewrites the location's `extra_function` XML document, adding "
+                "or dropping the node that represents DCCXpressCOFallback."
+            ),
+            value_label="Action",
+            value_options=("Add", "Remove"),
+            proc_args=("@location_json", "@extra_function_name", "@add", "@is_simulation"),
+            verify=VerifiedColumn("[ccc].[location]", "extra_function", "location_no", "xml"),
+            function_name="DCCXpressCOFallback",
+            assumption=(
+                "The Fallback variant is exercised through the same `@extra_function_name` "
+                "parameter as DCCXpressCO with `@add = 1`. The exact node name "
+                "`DCCXpressCOFallback` should be confirmed with the procedure owner before "
+                "this row is treated as a fully verified capability."
+            ),
         ),
         TestDefinition(
             key="Bit 2 — Config Download Version (terminal)",
@@ -162,6 +232,8 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "dccEnableCompletion",
                 "dccEnableNfc",
                 "dccEnableNfcSingleTap",
+                "dccEnableRefund",
+                "dccFlagsEnabled",
             ),
             proc_args=(
                 "@instance_json",
@@ -174,6 +246,13 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "package_config",
                 "instance_identifier",
                 "xml",
+            ),
+            assumption=(
+                "`dccEnableRefund` is treated as a boolean handler flag set to 1, consistent "
+                "with the other dccEnable* flags. `dccFlagsEnabled` is also exercised as a "
+                "boolean (`@Config_value = 1`); if it is in fact an integer bitmask its exact "
+                "numeric semantics must be confirmed with the procedure owner before that "
+                "value is treated as a fully verified capability."
             ),
         ),
         TestDefinition(

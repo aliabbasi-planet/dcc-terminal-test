@@ -44,6 +44,12 @@ class TestResult:
     timestamp: str
     rollback_log: list[dict] = field(default_factory=list)
     campaign_id: str | None = None
+    # --- CAB evidence fields (defaulted so existing constructors keep working) ---
+    input_json: str = ""
+    params: list = field(default_factory=list)
+    proc_args: tuple[str, ...] = ()
+    proposed_change_observed: bool = False
+    is_negative: bool = False
 
     @property
     def is_live(self) -> bool:
@@ -58,11 +64,74 @@ class TestResult:
         """Live run, a captured restore point, and a value that still differs."""
         return self.is_live and self.restore_point_known and self.change_persisted
 
+    @property
+    def verdict_code(self) -> str:
+        """Precise, CAB-facing outcome that never implies a config was changed.
+
+        Distinguishes *the procedure executed safely under simulation* from *the
+        configuration was verified as changed*, which is the core of CAB issue #5.
+        """
+        if self.is_negative:
+            if self.status == "BLOCKED":
+                return "BLOCKED"
+            return "REJECTED-AS-EXPECTED" if self.status == "PASS" else "NOT-REJECTED"
+        if self.status == "BLOCKED":
+            return "BLOCKED"
+        if self.status == "FAIL":
+            return "FAIL"
+        if self.status == "REVIEW":
+            return "REVIEW"
+        # status == PASS
+        if self.mode == "SIMULATION":
+            return "SIMULATED-OK"
+        return "APPLIED"
+
+    @property
+    def verdict_detail(self) -> str:
+        """One-sentence justification for :pyattr:`verdict_code`."""
+        code = self.verdict_code
+        proposed = (
+            "the procedure returned a simulation/preview result set"
+            if self.proposed_change_observed
+            else "the procedure returned no preview result set"
+        )
+        details = {
+            "SIMULATED-OK": (
+                f"Procedure executed under @is_simulation=1, {proposed}, and the enclosing "
+                "transaction was rolled back — the verified column was unchanged afterwards, "
+                "so nothing was persisted. This proves the call ran, not that a config changed."
+            ),
+            "APPLIED": (
+                "Live call committed and the verified column changed from its pre-test value, "
+                "confirming the configuration was actually applied."
+            ),
+            "REVIEW": (
+                "Live call completed without error but the verified column did not change — "
+                "the procedure accepted the call without acting; inspect the target and value."
+            ),
+            "BLOCKED": (
+                "The connected login lacked EXECUTE, so the procedure body never ran. This is "
+                "an environment/permission gap, not a procedure defect."
+            ),
+            "FAIL": f"The call raised a SQL error: {self.error or 'see error field'}.",
+            "REJECTED-AS-EXPECTED": (
+                "Deliberately invalid input was rejected by the procedure (SQL exception or "
+                "ERROR trace), proving the validation path works."
+            ),
+            "NOT-REJECTED": (
+                "Deliberately invalid input was NOT rejected — the procedure accepted or "
+                "silently ignored it. This must be reviewed with the procedure owner."
+            ),
+        }
+        return details.get(code, "")
+
     def export(self) -> dict:
         payload = {
             key: value for key, value in self.__dict__.items() if key != "grid_frames"
         }
         payload["can_rollback"] = self.can_rollback
+        payload["verdict_code"] = self.verdict_code
+        payload["verdict_detail"] = self.verdict_detail
         return payload
 
 
@@ -82,7 +151,13 @@ def build_call(
             f"EXEC {PROCEDURE} @display_config = ?, @location_json = ?, "
             "@extra_function_name = ?, @add = ?, @is_simulation = ?"
         )
-        params = (bit, payload, "DCCXpressCO", 1 if config_value == "Add" else 0, sim)
+        params = (
+            bit,
+            payload,
+            definition.function_name or "DCCXpressCO",
+            1 if config_value == "Add" else 0,
+            sim,
+        )
     elif bit == 2:
         sql = (
             f"EXEC {PROCEDURE} @display_config = ?, @terminal_json = ?, "
@@ -157,6 +232,10 @@ def run_test(
     after = read_state(connection, definition, target_identifier)
     persisted = before != after
 
+    # The procedure's own simulation/preview result set (or a server message) is the
+    # evidence that the intended change was computed — CAB issue #1/#6.
+    proposed_change_observed = bool(grids) or bool(messages)
+
     # A failed live call must never leave a half-applied change behind.
     if not simulation and error and persisted and before is not None:
         auto: RollbackOutcome = restore_state(
@@ -200,6 +279,10 @@ def run_test(
         timestamp=started.isoformat(timespec="seconds"),
         rollback_log=rollback_log,
         campaign_id=campaign_id,
+        input_json=params[1] if len(params) > 1 else "",
+        params=list(params),
+        proc_args=definition.proc_args,
+        proposed_change_observed=proposed_change_observed,
     )
 
 

@@ -7,8 +7,10 @@ execute both, before any test is allowed to run.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
+from .config import PROCEDURE
 from .database import DatabaseConnection
 
 
@@ -90,3 +92,38 @@ def grant_script(outcomes: list[ReadinessOutcome], database: str, environment: s
     ]
     header = [f"-- Run as a DBA / sysadmin on {database} ({environment})", f"USE [{database}];"]
     return "\n".join(header + (statements or ["-- No permission grants outstanding."]))
+
+
+def capture_procedure_version(connection: DatabaseConnection) -> dict | None:
+    """Pin the exact procedure build under test (CAB issue #1).
+
+    Returns object id, create/modify dates and a SHA-256 of the procedure
+    definition, or ``None`` if the procedure or its definition cannot be read.
+    """
+    sql = (
+        "SELECT o.object_id, o.create_date, o.modify_date, m.definition "
+        "FROM sys.objects AS o "
+        "JOIN sys.sql_modules AS m ON m.object_id = o.object_id "
+        "WHERE o.object_id = OBJECT_ID(?, N'P')"
+    )
+    try:
+        frame = connection.query(sql, (PROCEDURE,))
+    except Exception:
+        return None
+    if frame.empty:
+        return None
+
+    row = frame.iloc[0]
+    definition = row.get("definition")
+    definition_sha256 = (
+        hashlib.sha256(str(definition).encode("utf-8", "replace")).hexdigest()
+        if definition is not None
+        else "unavailable"
+    )
+    return {
+        "object": PROCEDURE,
+        "object_id": int(row["object_id"]) if row.get("object_id") is not None else None,
+        "create_date": str(row.get("create_date")),
+        "modify_date": str(row.get("modify_date")),
+        "definition_sha256": definition_sha256,
+    }
