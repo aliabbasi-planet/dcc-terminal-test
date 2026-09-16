@@ -12,9 +12,12 @@ import streamlit as st
 from ..campaign import campaign_markdown, campaign_results, campaign_summary, campaign_tests
 from ..catalog import TEST_CATALOG, TEST_KEYS
 from ..config import ENVIRONMENTS
+from ..coverage import compute_coverage, coverage_totals
 from ..execution import TestResult, apply_rollback, build_call, run_test
-from ..readiness import all_passed, grant_script, run_readiness
+from ..negatives import NegativeCase, default_negative_cases, run_negative, run_negative_battery
+from ..readiness import all_passed, capture_procedure_version, grant_script, run_readiness
 from ..reference import load_instances, load_locations, load_terminals
+from ..report import cab_report
 from ..state import add_result, connection, results
 
 STATUS_BADGES = {"PASS": "🟢", "FAIL": "🔴", "REVIEW": "🟡", "BLOCKED": "⛔"}
@@ -73,6 +76,20 @@ def _session_history_markdown() -> str:
     return "\n".join(lines)
 
 
+def _cab_meta(all_results: list[TestResult]) -> dict:
+    """Assemble the header metadata block for the CAB report."""
+    conn = st.session_state.connection
+    mode = "LIVE" if any(result.is_live for result in all_results) else "SIMULATION"
+    return {
+        "server": getattr(conn, "server", "?"),
+        "database": getattr(conn, "database", "?"),
+        "environment": st.session_state.connected_env or "?",
+        "login": st.session_state.connected_login or "?",
+        "mode": mode,
+        "procedure_version": st.session_state.get("procedure_version"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 1 · readiness
 # ---------------------------------------------------------------------------
@@ -90,6 +107,7 @@ def render_readiness() -> bool:
             st.session_state.readiness = run_readiness(
                 connection(), st.session_state.connected_login
             )
+            st.session_state.procedure_version = capture_procedure_version(connection())
 
     outcomes = st.session_state.readiness
     controls = st.columns([1, 3])
@@ -99,6 +117,7 @@ def render_readiness() -> bool:
             st.session_state.readiness = run_readiness(
                 connection(), st.session_state.connected_login
             )
+            st.session_state.procedure_version = capture_procedure_version(connection())
         st.rerun()
 
     passed = sum(1 for outcome in outcomes if outcome.passed)
@@ -310,18 +329,55 @@ def render_test(simulation: bool, armed: bool) -> None:
         _, _, preview = build_call(definition, target, value, simulation)
         st.code(preview, language="sql")
 
+    negative_mode = st.checkbox(
+        "🔀 Negative test — use an invalid target to prove rejection",
+        help=(
+            "Overrides the target with a deliberately non-existent identifier. "
+            "The procedure SHOULD reject it; silent acceptance is a finding."
+        ),
+        key="negative_single_mode",
+    )
+    if negative_mode:
+        invalid_defaults = {
+            "instance": "I000099999",
+            "terminal": "99999999",
+            "location": "9999999",
+        }
+        target = st.text_input(
+            "Invalid target identifier (type any non-existent value)",
+            value=invalid_defaults.get(definition.target, "INVALID"),
+            key="negative_single_target",
+        ).strip()
+
     blocked = not target or not value or not armed
     if st.button("▶️ Run this test", type="primary", use_container_width=True, disabled=blocked):
-        with st.spinner(f"Executing {test_key}…"):
-            result = run_test(
-                connection(),
-                definition,
-                target,
-                value,
-                simulation,
-                st.session_state.connected_env,
-                st.session_state.connected_login,
+        if negative_mode:
+            case = NegativeCase(
+                name=f"Manual: {test_key}",
+                base_key=test_key,
+                target=target,
+                value=value,
+                invalid_reason="User-specified invalid target for negative validation",
+                expected="Procedure should reject or error on this input.",
             )
+            with st.spinner(f"Negative test: {test_key} → {target}…"):
+                result = run_negative(
+                    connection(),
+                    case,
+                    st.session_state.connected_env,
+                    st.session_state.connected_login,
+                )
+        else:
+            with st.spinner(f"Executing {test_key}…"):
+                result = run_test(
+                    connection(),
+                    definition,
+                    target,
+                    value,
+                    simulation,
+                    st.session_state.connected_env,
+                    st.session_state.connected_login,
+                )
         add_result(result)
         st.rerun()
 
@@ -376,14 +432,27 @@ def render_campaign(simulation: bool, armed: bool) -> None:
             "environment in section 2 before a campaign can run."
         )
 
-    campaign_name = st.text_input("Campaign name", value="Terminal DCC verification")
+    campaign_name = st.text_input(
+        "Campaign name", value="Full DCC CAB validation", key="campaign_name"
+    )
     definitions = campaign_tests()
     selected_keys = st.multiselect(
         "Configuration tests",
         [definition.key for definition in definitions],
-        default=[definition.key for definition in definitions if definition.bit == 2],
+        default=[definition.key for definition in definitions],
     )
     selected_definitions = [TEST_CATALOG[key] for key in selected_keys]
+
+    include_negatives = st.checkbox(
+        "Include negative validation battery (wrong inputs, imposed failures — Section C)",
+        value=True,
+        key="campaign-include-negatives",
+        help=(
+            "Appends 7 deliberately-invalid cases to the campaign: non-existent instance, "
+            "terminal, and location; unknown flag name; unknown function; unknown version; "
+            "empty JSON. Each must be rejected by the procedure for the campaign to be CAB-grade."
+        ),
+    )
 
     targets: dict[str, list[str]] = {}
     if any(definition.target == "terminal" for definition in selected_definitions):
@@ -436,17 +505,21 @@ def render_campaign(simulation: bool, armed: bool) -> None:
     for definition in definitions:
         if definition.key not in selected_keys:
             continue
+        short_name = (
+            definition.function_name
+            or definition.key.split(" — ", 1)[-1].split(" (")[0]
+        )
         if definition.value_options:
             values[definition.key] = st.multiselect(
-                f"{definition.value_label} — one run per selected value",
+                f"{definition.value_label} for {short_name} — one run per selected value",
                 definition.value_options,
                 default=[definition.value_options[0]],
-                key=f"campaign-value-{definition.bit}",
+                key=f"campaign-value-{definition.key}",
             )
         else:
             entered = st.text_input(
-                definition.value_label,
-                key=f"campaign-value-{definition.bit}",
+                f"{definition.value_label} for {short_name}",
+                key=f"campaign-value-{definition.key}",
                 placeholder="exact value expected by the procedure",
             ).strip()
             values[definition.key] = [entered] if entered else []
@@ -468,8 +541,14 @@ def render_campaign(simulation: bool, armed: bool) -> None:
         len(targets.get(definition.target, [])) * len(values.get(definition.key, []))
         for definition in selected_definitions
     )
+    neg_count = len(default_negative_cases()) if include_negatives else 0
+    total_planned = planned_runs + neg_count
     mode_label = "SIMULATION" if simulation else "LIVE"
-    st.caption(f"Planned executions: {planned_runs} test run(s) in {mode_label} mode.")
+    neg_label = f" + {neg_count} negative cases" if neg_count else ""
+    st.caption(
+        f"Planned executions: {planned_runs} positive{neg_label} = "
+        f"**{total_planned} total** run(s) in {mode_label} mode."
+    )
 
     if st.button(
         "▶️ Run campaign",
@@ -478,13 +557,13 @@ def render_campaign(simulation: bool, armed: bool) -> None:
         disabled=bool(blocked),
     ):
         campaign_id = f"campaign-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:8]}"
-        progress = st.progress(0, text=f"Preparing {planned_runs} campaign test(s)...")
+        progress = st.progress(0, text=f"Preparing {total_planned} campaign test(s)...")
         completed = 0
         for definition in selected_definitions:
             for target in targets[definition.target]:
                 for value in values[definition.key]:
                     progress.progress(
-                        completed / planned_runs,
+                        completed / max(total_planned, 1),
                         text=f"Testing {target}: {definition.key} = {value}",
                     )
                     result = run_test(
@@ -499,6 +578,20 @@ def render_campaign(simulation: bool, armed: bool) -> None:
                     )
                     add_result(result)
                     completed += 1
+        if include_negatives:
+            progress.progress(
+                completed / max(total_planned, 1),
+                text="Running negative validation battery (wrong inputs)…",
+            )
+            neg_results = run_negative_battery(
+                connection(),
+                st.session_state.connected_env,
+                st.session_state.connected_login,
+                campaign_id=campaign_id,
+            )
+            for r in neg_results:
+                add_result(r)
+            completed += len(neg_results)
         st.session_state.campaigns.insert(
             0,
             {
@@ -570,8 +663,17 @@ def _render_campaign_report(campaign: dict) -> None:
     )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    actions = st.columns(2)
+    actions = st.columns(3)
     actions[0].download_button(
+        "📋 CAB report (Markdown)",
+        data=cab_report(entries, _cab_meta(entries)),
+        file_name=f"dcc_cab_campaign_{stamp}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        type="primary",
+        key=f"campaign-cab-{campaign_id}",
+    )
+    actions[1].download_button(
         "📄 Campaign report (Markdown)",
         data=campaign_markdown(campaign["name"], entries),
         file_name=f"dcc_campaign_{stamp}.md",
@@ -579,7 +681,7 @@ def _render_campaign_report(campaign: dict) -> None:
         use_container_width=True,
         key=f"campaign-md-{campaign_id}",
     )
-    actions[1].download_button(
+    actions[2].download_button(
         "📥 Campaign results (JSON)",
         data=json.dumps([result.export() for result in entries], indent=2, default=str),
         file_name=f"dcc_campaign_{stamp}.json",
@@ -711,6 +813,76 @@ def _render_result(result: TestResult, expanded: bool) -> None:
         st.markdown("**↩️ Rollback**")
         _render_rollback_panel(result)
 
+
+def _render_negative_battery() -> None:
+    """Run the deliberately-invalid input battery — Section C evidence."""
+    with st.expander("🧪 Negative validation battery (Section C evidence)"):
+        st.caption(
+            "Sends deliberately invalid input (bad instance, terminal, location, flag name, "
+            "location function, version, and an empty target JSON). Every case runs with "
+            "`@is_simulation = 1` and is rolled back. A **rejection** is the pass condition; "
+            "silent acceptance is a finding."
+        )
+        cases = default_negative_cases(
+            valid_terminal=st.session_state.selected_terminal or None
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Case": case.name,
+                        "Sends": f"{case.base_key.split(' — ')[0]} · {case.value}",
+                        "Why invalid": case.invalid_reason,
+                        "Expected": case.expected,
+                    }
+                    for case in cases
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if st.button("▶️ Run negative validation battery", use_container_width=True):
+            progress = st.progress(0.0, text="Running negative cases…")
+            outcomes = run_negative_battery(
+                connection(),
+                st.session_state.connected_env,
+                st.session_state.connected_login,
+                cases=cases,
+            )
+            for result in outcomes:
+                add_result(result)
+            progress.progress(1.0, text=f"Ran {len(outcomes)} negative case(s).")
+            st.rerun()
+
+
+def _render_cab_report_download(all_results: list[TestResult], stamp: str) -> None:
+    """Full-width CAB report download plus a live coverage preview."""
+    rows = compute_coverage([r for r in all_results if not r.is_negative])
+    totals = coverage_totals(rows)
+    negatives = [r for r in all_results if r.is_negative]
+    rejected = sum(r.verdict_code == "REJECTED-AS-EXPECTED" for r in negatives)
+
+    st.markdown("#### 📋 CAB validation report")
+    cols = st.columns(3)
+    cols[0].metric("Areas covered", f"{totals['covered']}/{totals['total']}")
+    cols[1].metric("Areas blocked", totals["blocked"])
+    cols[2].metric("Negatives rejected", f"{rejected}/{len(negatives)}")
+    if totals["not_tested"]:
+        st.caption(
+            f"{totals['not_tested']} area(s) not yet exercised — they will appear as "
+            "NOT TESTED in the coverage matrix until you run them."
+        )
+
+    st.download_button(
+        "📄 Download CAB validation report (Markdown)",
+        data=cab_report(all_results, _cab_meta(all_results)),
+        file_name=f"dcc_cab_report_{stamp}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        type="primary",
+    )
+
+
 def render_results() -> None:
     st.subheader("5 · Results and rollback")
 
@@ -722,19 +894,25 @@ def render_results() -> None:
             mime="text/markdown",
         )
 
+    _render_negative_battery()
+
     all_results = results()
     if not all_results:
-        st.info("No tests executed yet.")
+        st.info(
+            "No tests executed yet. Run a configuration test, a campaign, or the negative "
+            "battery above."
+        )
         return
 
     outstanding = [result for result in all_results if result.can_rollback]
+    negatives = [result for result in all_results if result.is_negative]
 
     summary = st.columns(6)
-    summary[0].metric("Total", len(all_results))
-    summary[1].metric("Passed", sum(r.status == "PASS" for r in all_results))
+    summary[0].metric("Total runs", len(all_results))
+    summary[1].metric("Executed", sum(r.status in {"PASS", "REVIEW"} for r in all_results))
     summary[2].metric("Failed", sum(r.status == "FAIL" for r in all_results))
-    summary[3].metric("Review", sum(r.status == "REVIEW" for r in all_results))
-    summary[4].metric("Blocked", sum(r.status == "BLOCKED" for r in all_results))
+    summary[3].metric("Blocked", sum(r.status == "BLOCKED" for r in all_results))
+    summary[4].metric("Negatives", len(negatives))
     summary[5].metric("Awaiting rollback", len(outstanding))
 
     if outstanding:
@@ -753,9 +931,13 @@ def render_results() -> None:
 
     st.divider()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    _render_cab_report_download(all_results, stamp)
+    st.divider()
+
     report_parts = ["# DCC Enablement Configuration Test Session", "## Per-test ledger"]
     for index, result in enumerate(all_results, start=1):
-        report_parts.append(f"## {index}. {result.test_key} — {result.status}")
+        report_parts.append(f"## {index}. {result.test_key} — {result.verdict_code}")
         report_parts.append("```")
         report_parts.append(_result_ledger(result))
         report_parts.append("```")
@@ -771,9 +953,9 @@ def render_results() -> None:
         use_container_width=True,
     )
     actions[1].download_button(
-        "📄 Report (Markdown)",
+        "📄 Per-test ledger (Markdown)",
         data=markdown_report,
-        file_name=f"dcc_report_{stamp}.md",
+        file_name=f"dcc_ledger_{stamp}.md",
         mime="text/markdown",
         use_container_width=True,
     )
