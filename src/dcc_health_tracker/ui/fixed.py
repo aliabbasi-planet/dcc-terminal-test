@@ -1,4 +1,4 @@
-"""Fixed terminals page — filterable list of broken→healthy transitions."""
+"""Fixed terminals page — filterable list of broken→healthy transitions with profit."""
 
 from __future__ import annotations
 
@@ -10,9 +10,11 @@ from .helpers import filter_bar
 
 DISPLAY_COLS = [
     "TERMINAL_IDENTIFIER", "FLAG_NAME", "FIX_SOURCE", "FIX_DATE",
+    "CAMPAIGN_ID", "CAMPAIGN_NAME",
     "BREAK_AGAIN_DATE", "IS_OPEN", "EPISODE_END_DATE", "EPISODE_DAYS",
     "BANK_MERCHANT_ID", "CUSTOMER_NAME", "COUNTRY_NAME", "REGION",
-    "INDUSTRY_NAME", "ACQUIRER_NAME", "LOCATION_NAME", "FIRMWARE_VERSION",
+    "INDUSTRY_NAME", "ACQUIRER_NAME", "LOCATION_NAME",
+    "FIRMWARE_VERSION", "MARKET_GROUP", "BRAND", "ALLOCATED_DCC_PROFIT",
 ]
 
 COL_CONFIG = {
@@ -20,6 +22,8 @@ COL_CONFIG = {
     "FLAG_NAME": "Flag",
     "FIX_SOURCE": "Source",
     "FIX_DATE": "Fix date",
+    "CAMPAIGN_ID": "Campaign",
+    "CAMPAIGN_NAME": "Campaign name",
     "BREAK_AGAIN_DATE": "Broke again",
     "IS_OPEN": "Open?",
     "EPISODE_END_DATE": "End date",
@@ -32,12 +36,18 @@ COL_CONFIG = {
     "ACQUIRER_NAME": "Acquirer",
     "LOCATION_NAME": "Location",
     "FIRMWARE_VERSION": "Firmware",
+    "MARKET_GROUP": "Market Group",
+    "BRAND": "Brand",
+    "ALLOCATED_DCC_PROFIT": st.column_config.NumberColumn("Profit ($)", format="$%.2f"),
 }
 
 
 def render(conn) -> None:
     st.title("Fixed Terminals")
-    st.caption("Terminals that transitioned from broken to healthy. Filter, sort and download.")
+    st.caption(
+        "Terminals that transitioned from broken to healthy. "
+        "Includes historical campaign fixes and snapshot-detected fixes."
+    )
 
     df = conn.query(queries.fix_episodes())
     if df.empty:
@@ -52,12 +62,15 @@ def render(conn) -> None:
 
     filtered = filter_bar(df, "fix", date_col="FIX_DATE")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(filtered):,}")
-    c2.metric("Terminals", f"{filtered['TERMINAL_IDENTIFIER'].nunique():,}")
-    avg = f"{filtered['EPISODE_DAYS'].mean():.0f}" if not filtered.empty else "—"
-    c3.metric("Avg episode (days)", avg)
-    c4.metric("Still open", f"{int(filtered['IS_OPEN'].sum()):,}" if not filtered.empty else "0")
+    with st.container(border=True):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Rows", f"{len(filtered):,}")
+        c2.metric("Terminals", f"{filtered['TERMINAL_IDENTIFIER'].nunique():,}")
+        avg = f"{filtered['EPISODE_DAYS'].mean():.0f}" if not filtered.empty else "—"
+        c3.metric("Avg episode (days)", avg)
+        c4.metric("Still open", f"{int(filtered['IS_OPEN'].sum()):,}" if not filtered.empty else "0")
+        profit = filtered["ALLOCATED_DCC_PROFIT"].sum() if "ALLOCATED_DCC_PROFIT" in filtered else 0
+        c5.metric("Total profit", f"${profit:,.2f}")
 
     cols = [c for c in DISPLAY_COLS if c in filtered.columns]
     st.dataframe(

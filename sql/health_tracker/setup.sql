@@ -1,106 +1,148 @@
 -- ============================================================================
--- DCC Terminal Health Tracker — setup DDL
+-- DCC Terminal Health Tracker V3 — setup DDL
 -- ============================================================================
--- Run this once in your Snowflake worksheet to create the pipeline output
--- tables.  Replace the schema prefix below with your own before executing.
+-- Run this once in your Snowflake worksheet to create the required tables.
+-- These match the production notebook (dcc_terminal_profit_tracking_v3).
 --
--- The pipeline (src/dcc_health_tracker/pipeline.py) populates these tables
--- from the input snapshot table using day-over-day transition detection.
--- ============================================================================
-
+-- External source tables (read-only, owned by other teams):
+--   PROD_PRESENTATION.CORTEX.CORTEX_TERMINAL_MAINTENANCE
+--   PROD_CORE.TRANSFORMATION.TRN_DWH_DCC_REVENUE
+--
 -- >>> EDIT THIS to match your environment <<<
 -- USE SCHEMA DEV_CORE_AAB.PUBLIC;
+-- ============================================================================
 
--- Step 1: Transition log — every day-over-day flag change (FIXED or BROKEN)
-CREATE TABLE IF NOT EXISTS DCC_TRANSITION_LOG (
-    transition_date     DATE            NOT NULL,
-    terminal_identifier VARCHAR(100)    NOT NULL,
-    flag_column         VARCHAR(60)     NOT NULL,
-    flag_name           VARCHAR(100),
-    flag_type           VARCHAR(30),
-    transition_type     VARCHAR(10)     NOT NULL,  -- FIXED or BROKEN
-    current_value       INT,
-    prev_value          INT,
-    prev_snapshot_date  DATE,
-    country_name        VARCHAR(100),
-    region              VARCHAR(100),
-    industry_name       VARCHAR(100),
-    bank_merchant_id    VARCHAR(50),
-    customer_name       VARCHAR(250),
-    acquirer_name       VARCHAR(250),
-    location_name       VARCHAR(500),
-    firmware_version    VARCHAR(200),
-    PRIMARY KEY (transition_date, terminal_identifier, flag_column)
+-- Flag reference table (metadata about each health check flag)
+CREATE TABLE IF NOT EXISTS DCC_V3_FLAG_REFERENCE (
+    FLAG_COLUMN     VARCHAR(60) PRIMARY KEY,
+    FLAG_NAME       VARCHAR(100),
+    FLAG_TYPE       VARCHAR(30),
+    FIX_CATEGORY    VARCHAR(30)
 );
 
--- Step 2: Fix episodes — broken-to-healthy transitions with duration
-CREATE TABLE IF NOT EXISTS DCC_FIX_EPISODE (
-    terminal_identifier VARCHAR(100)    NOT NULL,
-    flag_column         VARCHAR(60)     NOT NULL,
-    flag_name           VARCHAR(100),
-    fix_date            DATE            NOT NULL,
-    fix_source          VARCHAR(20)     NOT NULL DEFAULT 'SNAPSHOT',
-    break_again_date    DATE,
-    is_open             INT             NOT NULL,
-    episode_end_date    DATE,
-    episode_days        INT,
-    country_name        VARCHAR(100),
-    region              VARCHAR(100),
-    industry_name       VARCHAR(100),
-    bank_merchant_id    VARCHAR(50),
-    customer_name       VARCHAR(250),
-    acquirer_name       VARCHAR(250),
-    location_name       VARCHAR(500),
-    firmware_version    VARCHAR(200),
-    PRIMARY KEY (terminal_identifier, flag_column, fix_date)
+-- Seed reference data
+MERGE INTO DCC_V3_FLAG_REFERENCE tgt
+USING (SELECT * FROM VALUES
+    ('LOCATION_DCCENABLED_CHECK_C','Location DCC Enabled','Configuration','CONFIG'),
+    ('HANDLER_DCCENABLE_CHECK_O','Handler DCC Enable','Handler','HANDLER'),
+    ('HANDLER_DCCENABLECOMPLETION_CHECK_O','Handler DCC Completion','Handler','HANDLER'),
+    ('HANDLER_DCCENABLEAUTH_CHECK_O','Handler DCC Auth','Handler','HANDLER'),
+    ('HANDLER_DCCENABLENFC_CHECK_O','Handler DCC NFC','Handler','HANDLER'),
+    ('HANDLER_DCCENABLENFCSINGLETAP_CHECK_O','Handler DCC NFC Single Tap','Handler','HANDLER'),
+    ('DCCXPRESSCO_CHECK_O','DCC Xpress CO','DCC Xpress','HANDLER'),
+    ('DCCXPRESSCODT_CHECK_O','DCC Xpress CO Delayed Terminal','DCC Xpress','HANDLER'),
+    ('DCCMERCHANT_NO_CHECK_O','DCC Merchant Number','Merchant','NON_HANDLER'),
+    ('FIRMWARE_VERSION','Firmware Version','Firmware','NON_HANDLER')
+    AS v(FLAG_COLUMN,FLAG_NAME,FLAG_TYPE,FIX_CATEGORY)) src
+ON tgt.FLAG_COLUMN = src.FLAG_COLUMN
+WHEN NOT MATCHED THEN INSERT (FLAG_COLUMN,FLAG_NAME,FLAG_TYPE,FIX_CATEGORY)
+VALUES (src.FLAG_COLUMN,src.FLAG_NAME,src.FLAG_TYPE,src.FIX_CATEGORY);
+
+-- Daily health snapshot (populated by MERGE from CORTEX_TERMINAL_MAINTENANCE)
+CREATE TABLE IF NOT EXISTS DCC_V3_HEALTH_DAILY_SNAPSHOT (
+    SNAPSHOT_DATE                       DATE NOT NULL,
+    TERMINAL_IDENTIFIER                 VARCHAR(100) NOT NULL,
+    COUNTRY_NAME                        VARCHAR(100),
+    REGION                              VARCHAR(100),
+    INDUSTRY_NAME                       VARCHAR(100),
+    BANK_MERCHANT_ID                    VARCHAR(50),
+    CUSTOMER_NAME                       VARCHAR(250),
+    ACQUIRER_NAME                       VARCHAR(250),
+    LOCATION_NAME                       VARCHAR(250),
+    LOCATION_DCCENABLED_CHECK_C         INTEGER,
+    HANDLER_DCCENABLE_CHECK_O           INTEGER,
+    HANDLER_DCCENABLECOMPLETION_CHECK_O INTEGER,
+    HANDLER_DCCENABLEAUTH_CHECK_O       INTEGER,
+    HANDLER_DCCENABLENFC_CHECK_O        INTEGER,
+    HANDLER_DCCENABLENFCSINGLETAP_CHECK_O INTEGER,
+    DCCXPRESSCO_CHECK_O                 INTEGER,
+    DCCXPRESSCODT_CHECK_O               INTEGER,
+    DCCMERCHANT_NO_CHECK_O              INTEGER,
+    FIRMWARE_VERSION                    VARCHAR(200),
+    IS_DCC_BROKEN                       BOOLEAN NOT NULL,
+    PRIMARY KEY (SNAPSHOT_DATE, TERMINAL_IDENTIFIER)
 );
 
--- Step 3: Break episodes — healthy-to-broken transitions with duration
-CREATE TABLE IF NOT EXISTS DCC_BREAK_EPISODE (
-    terminal_identifier VARCHAR(100)    NOT NULL,
-    flag_column         VARCHAR(60)     NOT NULL,
-    flag_name           VARCHAR(100),
-    break_date          DATE            NOT NULL,
-    fixed_again_date    DATE,
-    is_open             INT             NOT NULL,
-    episode_end_date    DATE,
-    episode_days        INT,
-    country_name        VARCHAR(100),
-    region              VARCHAR(100),
-    industry_name       VARCHAR(100),
-    bank_merchant_id    VARCHAR(50),
-    customer_name       VARCHAR(250),
-    acquirer_name       VARCHAR(250),
-    location_name       VARCHAR(500),
-    firmware_version    VARCHAR(200),
-    PRIMARY KEY (terminal_identifier, flag_column, break_date)
+-- Fix episodes (broken→healthy transitions including firmware changes)
+CREATE TABLE IF NOT EXISTS DCC_V3_FIX_EPISODES (
+    TERMINAL_IDENTIFIER     VARCHAR(100) NOT NULL,
+    FLAG_COLUMN             VARCHAR(60) NOT NULL,
+    FIX_DATE                DATE NOT NULL,
+    FIX_SOURCE              VARCHAR(20) NOT NULL,       -- CAMPAIGN or SNAPSHOT
+    CAMPAIGN_ID             VARCHAR(20),
+    CAMPAIGN_NAME           VARCHAR(300),
+    FLAG_NAME               VARCHAR(100),
+    BANK_MERCHANT_ID        VARCHAR(50),
+    CUSTOMER_NAME           VARCHAR(250),
+    COUNTRY_NAME            VARCHAR(100),
+    REGION                  VARCHAR(100),
+    INDUSTRY_NAME           VARCHAR(100),
+    ACQUIRER_NAME           VARCHAR(250),
+    LOCATION_NAME           VARCHAR(500),
+    TERMINAL_MODEL_NAME     VARCHAR(200),
+    FIRMWARE_VERSION        VARCHAR(200),
+    PREV_FIRMWARE_VERSION   VARCHAR(200),
+    BREAK_AGAIN_DATE        DATE,
+    IS_OPEN                 INTEGER NOT NULL,
+    EPISODE_END_DATE        DATE,
+    EPISODE_DAYS            INTEGER,
+    PRIMARY KEY (TERMINAL_IDENTIFIER, FLAG_COLUMN, FIX_DATE)
 );
 
--- Step 4: Daily tracker — aggregate fix/break counts per day
-CREATE TABLE IF NOT EXISTS DCC_DAILY_TRACKER (
-    track_date              DATE        NOT NULL PRIMARY KEY,
-    day_label               VARCHAR(30),
-    terminals_fixed         INT,
-    flag_fix_events         INT,
-    flags_fixed_list        VARCHAR(2000),
-    terminals_broken        INT,
-    flag_break_events       INT,
-    flags_broken_list       VARCHAR(2000),
-    cum_terminals_fixed     INT,
-    cum_terminals_broken    INT
+-- Fix episodes with profit allocation (joined with TRN_DWH_DCC_REVENUE)
+CREATE TABLE IF NOT EXISTS DCC_V3_FIX_EPISODE_PROFIT (
+    TERMINAL_IDENTIFIER     VARCHAR(100) NOT NULL,
+    FLAG_COLUMN             VARCHAR(60) NOT NULL,
+    FIX_DATE                DATE NOT NULL,
+    FIX_SOURCE              VARCHAR(20),
+    CAMPAIGN_ID             VARCHAR(20),
+    CAMPAIGN_NAME           VARCHAR(300),
+    FLAG_NAME               VARCHAR(100),
+    BANK_MERCHANT_ID        VARCHAR(50),
+    CUSTOMER_NAME           VARCHAR(250),
+    COUNTRY_NAME            VARCHAR(100),
+    REGION                  VARCHAR(100),
+    INDUSTRY_NAME           VARCHAR(100),
+    ACQUIRER_NAME           VARCHAR(250),
+    LOCATION_NAME           VARCHAR(500),
+    TERMINAL_MODEL_NAME     VARCHAR(200),
+    FIRMWARE_VERSION        VARCHAR(200),
+    MARKET_GROUP            VARCHAR(100),
+    BRAND                   VARCHAR(100),
+    BREAK_AGAIN_DATE        DATE,
+    IS_OPEN                 INTEGER,
+    EPISODE_END_DATE        DATE,
+    EPISODE_DAYS            INTEGER,
+    ALLOCATED_DCC_PROFIT    FLOAT,
+    PRIMARY KEY (TERMINAL_IDENTIFIER, FLAG_COLUMN, FIX_DATE)
 );
 
--- Step 5: Single-row summary
-CREATE TABLE IF NOT EXISTS DCC_HEALTH_SUMMARY (
-    total_fix_episodes      INT,
-    unique_terminals_fixed  INT,
-    open_fix_episodes       INT,
-    avg_fix_episode_days    FLOAT,
-    total_break_episodes    INT,
-    unique_terminals_broken INT,
-    open_break_episodes     INT,
-    avg_break_episode_days  FLOAT,
-    earliest_snapshot       DATE,
-    latest_snapshot         DATE,
-    refreshed_at            TIMESTAMP_LTZ
+-- Daily tracker (aggregate fix counts and profit per day)
+CREATE TABLE IF NOT EXISTS DCC_V3_FIX_DAILY_TRACKER (
+    TRACK_DATE                      DATE NOT NULL PRIMARY KEY,
+    DAY_LABEL                       VARCHAR(30),
+    DAY_NUMBER                      INTEGER,
+    TERMINALS_FIXED                 INTEGER,
+    PROFIT_RECOVERED                FLOAT,
+    FLAG_FIX_EVENTS                 INTEGER,
+    DISTINCT_FLAGS_FIXED            INTEGER,
+    FLAGS_FIXED_LIST                VARCHAR(2000),
+    FIXED_TERMINAL_LIST             VARCHAR(16777216),
+    CUMULATIVE_TERMINALS_FIXED      INTEGER,
+    CUMULATIVE_PROFIT_RECOVERED     FLOAT
+);
+
+-- Single-row summary (refreshed each pipeline run)
+CREATE TABLE IF NOT EXISTS DCC_V3_FIX_PROFIT_SUMMARY (
+    TOTAL_FIX_EPISODES      INTEGER,
+    UNIQUE_TERMINALS_FIXED  INTEGER,
+    HISTORICAL_EPISODES     INTEGER,        -- from CAMPAIGN source
+    DETECTED_EPISODES       INTEGER,        -- from SNAPSHOT source
+    TOTAL_ALLOCATED_PROFIT  FLOAT,
+    OPEN_EPISODES           INTEGER,
+    CLOSED_EPISODES         INTEGER,
+    AVG_EPISODE_DAYS        FLOAT,
+    ACTIVE_CAMPAIGNS        INTEGER,
+    BASELINE_DATE           DATE,
+    REFRESHED_AT            TIMESTAMP_LTZ
 );

@@ -12,21 +12,24 @@ ORANGE = "#F39C12"
 RED = "#E74C3C"
 
 
-def filter_bar(df: pd.DataFrame, key_prefix: str, date_col: str = "FIX_DATE") -> pd.DataFrame:
+def filter_bar(
+    df: pd.DataFrame, key_prefix: str, date_col: str | None = "FIX_DATE"
+) -> pd.DataFrame:
     if df.empty:
         return df
     with st.container(border=True):
         st.markdown("**Filters**")
         c1, c2, c3, c4 = st.columns(4)
+        date_range = None
         with c1:
-            if date_col in df.columns:
+            if date_col and date_col in df.columns:
                 date_range = st.date_input(
                     "Date range",
                     value=(df[date_col].min(), df[date_col].max()),
                     key=f"{key_prefix}_dates",
                 )
             else:
-                date_range = None
+                st.caption("(no date filter)")
         with c2:
             flags = _multi(df, "FLAG_NAME", "Flag", key_prefix)
         with c3:
@@ -42,7 +45,7 @@ def filter_bar(df: pd.DataFrame, key_prefix: str, date_col: str = "FIX_DATE") ->
             merchants = _multi(df, "BANK_MERCHANT_ID", "Merchant", key_prefix)
 
     out = df.copy()
-    if date_range and isinstance(date_range, tuple) and len(date_range) == 2:
+    if date_col and date_range and isinstance(date_range, tuple) and len(date_range) == 2:
         out = out[(out[date_col] >= date_range[0]) & (out[date_col] <= date_range[1])]
     for col, vals in {
         "FLAG_NAME": flags, "COUNTRY_NAME": countries, "REGION": regions,

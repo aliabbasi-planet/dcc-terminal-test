@@ -1,72 +1,88 @@
-"""Broken terminals page — filterable list of healthy→broken transitions."""
+"""Broken terminals page — currently broken terminals from latest snapshot."""
 
 from __future__ import annotations
 
-import pandas as pd
 import streamlit as st
 
 from .. import queries
 from .helpers import filter_bar
 
 DISPLAY_COLS = [
-    "TERMINAL_IDENTIFIER", "FLAG_NAME", "BREAK_DATE",
-    "FIXED_AGAIN_DATE", "IS_OPEN", "EPISODE_END_DATE", "EPISODE_DAYS",
-    "BANK_MERCHANT_ID", "CUSTOMER_NAME", "COUNTRY_NAME", "REGION",
-    "INDUSTRY_NAME", "ACQUIRER_NAME", "LOCATION_NAME", "FIRMWARE_VERSION",
+    "TERMINAL_IDENTIFIER", "COUNTRY_NAME", "REGION", "INDUSTRY_NAME",
+    "BANK_MERCHANT_ID", "CUSTOMER_NAME", "ACQUIRER_NAME", "LOCATION_NAME",
+    "FIRMWARE_VERSION",
+    "LOCATION_DCCENABLED_CHECK_C", "HANDLER_DCCENABLE_CHECK_O",
+    "HANDLER_DCCENABLECOMPLETION_CHECK_O", "HANDLER_DCCENABLEAUTH_CHECK_O",
+    "HANDLER_DCCENABLENFC_CHECK_O", "HANDLER_DCCENABLENFCSINGLETAP_CHECK_O",
+    "DCCXPRESSCO_CHECK_O", "DCCXPRESSCODT_CHECK_O", "DCCMERCHANT_NO_CHECK_O",
 ]
 
 COL_CONFIG = {
     "TERMINAL_IDENTIFIER": "Terminal ID",
-    "FLAG_NAME": "Flag",
-    "BREAK_DATE": "Broke on",
-    "FIXED_AGAIN_DATE": "Fixed again",
-    "IS_OPEN": "Still broken?",
-    "EPISODE_END_DATE": "End date",
-    "EPISODE_DAYS": st.column_config.NumberColumn("Days broken", format="%d"),
-    "BANK_MERCHANT_ID": "Merchant ID",
-    "CUSTOMER_NAME": "Customer",
     "COUNTRY_NAME": "Country",
     "REGION": "Region",
     "INDUSTRY_NAME": "Industry",
+    "BANK_MERCHANT_ID": "Merchant ID",
+    "CUSTOMER_NAME": "Customer",
     "ACQUIRER_NAME": "Acquirer",
     "LOCATION_NAME": "Location",
     "FIRMWARE_VERSION": "Firmware",
+    "LOCATION_DCCENABLED_CHECK_C": st.column_config.CheckboxColumn("Loc DCC"),
+    "HANDLER_DCCENABLE_CHECK_O": st.column_config.CheckboxColumn("Enable"),
+    "HANDLER_DCCENABLECOMPLETION_CHECK_O": st.column_config.CheckboxColumn("Completion"),
+    "HANDLER_DCCENABLEAUTH_CHECK_O": st.column_config.CheckboxColumn("Auth"),
+    "HANDLER_DCCENABLENFC_CHECK_O": st.column_config.CheckboxColumn("NFC"),
+    "HANDLER_DCCENABLENFCSINGLETAP_CHECK_O": st.column_config.CheckboxColumn("NFC Tap"),
+    "DCCXPRESSCO_CHECK_O": st.column_config.CheckboxColumn("Xpress CO"),
+    "DCCXPRESSCODT_CHECK_O": st.column_config.CheckboxColumn("Xpress DT"),
+    "DCCMERCHANT_NO_CHECK_O": st.column_config.CheckboxColumn("Merchant"),
 }
 
 
 def render(conn) -> None:
-    st.title("Broken Terminals")
-    st.caption("Terminals that transitioned from healthy to broken. Filter, sort and download.")
+    st.title("Currently Broken Terminals")
+    st.caption(
+        "Terminals from the latest snapshot where IS_DCC_BROKEN = TRUE. "
+        "Use this to identify terminals that need attention."
+    )
 
-    df = conn.query(queries.break_episodes())
+    df = conn.query(queries.current_broken_terminals())
     if df.empty:
-        st.info("No break episodes found. Run the pipeline to detect transitions.")
+        st.success("No broken terminals found in the latest snapshot.")
         return
 
-    df["BREAK_DATE"] = pd.to_datetime(df["BREAK_DATE"]).dt.date
-    if "EPISODE_END_DATE" in df.columns:
-        df["EPISODE_END_DATE"] = pd.to_datetime(df["EPISODE_END_DATE"]).dt.date
-    if "FIXED_AGAIN_DATE" in df.columns:
-        df["FIXED_AGAIN_DATE"] = pd.to_datetime(df["FIXED_AGAIN_DATE"]).dt.date
+    filtered = filter_bar(df, "brk", date_col=None)
 
-    filtered = filter_bar(df, "brk", date_col="BREAK_DATE")
+    with st.container(border=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Broken", f"{len(filtered):,}")
+        c2.metric("Countries", f"{filtered['COUNTRY_NAME'].nunique():,}")
+        c3.metric("Merchants", f"{filtered['BANK_MERCHANT_ID'].nunique():,}")
+        c4.metric("Acquirers", f"{filtered['ACQUIRER_NAME'].nunique():,}")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rows", f"{len(filtered):,}")
-    c2.metric("Terminals", f"{filtered['TERMINAL_IDENTIFIER'].nunique():,}")
-    avg = f"{filtered['EPISODE_DAYS'].mean():.0f}" if not filtered.empty else "—"
-    c3.metric("Avg duration (days)", avg)
-    c4.metric("Still broken", f"{int(filtered['IS_OPEN'].sum()):,}" if not filtered.empty else "0")
+    # Show breakdown by flag
+    st.subheader("Breakdown by flag (1 = broken)")
+    flag_cols = [c for c in DISPLAY_COLS if c.endswith("_CHECK_O") or c.endswith("_CHECK_C")]
+    if filtered.empty:
+        st.info("No data to display.")
+    else:
+        flag_counts = {col: int(filtered[col].sum()) for col in flag_cols if col in filtered}
+        cols = st.columns(len(flag_counts))
+        for i, (flag, count) in enumerate(sorted(flag_counts.items(), key=lambda x: -x[1])):
+            short_name = flag.replace("_CHECK_O", "").replace("_CHECK_C", "")
+            short_name = short_name.replace("HANDLER_", "").replace("LOCATION_", "")
+            cols[i % len(cols)].metric(short_name, f"{count:,}")
 
+    st.divider()
     cols = [c for c in DISPLAY_COLS if c in filtered.columns]
     st.dataframe(
-        filtered[cols].sort_values("BREAK_DATE", ascending=False),
-        hide_index=True, use_container_width=True, height=560,
+        filtered[cols].sort_values("TERMINAL_IDENTIFIER"),
+        hide_index=True, use_container_width=True, height=500,
         column_config=COL_CONFIG,
     )
 
     st.download_button(
-        "Download filtered results as CSV",
+        "Download broken terminals as CSV",
         data=filtered[cols].to_csv(index=False).encode("utf-8"),
         file_name="dcc_broken_terminals.csv",
         mime="text/csv",

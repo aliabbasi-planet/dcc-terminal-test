@@ -1,7 +1,7 @@
 """Read-only SQL queries used by the Streamlit dashboard.
 
-Every function returns a query string referencing the output tables from config.
-None of these write data — they are SELECT-only for the dashboard pages.
+Aligned with the production tables from config.py.
+All queries are SELECT-only for dashboard pages.
 """
 
 from __future__ import annotations
@@ -14,74 +14,117 @@ def summary() -> str:
 
 
 def fix_episodes() -> str:
+    """All fix episodes with profit allocation."""
     return f"""SELECT
-    e.terminal_identifier, e.flag_column, e.flag_name,
-    e.fix_date, e.fix_source,
-    e.break_again_date, e.is_open, e.episode_end_date, e.episode_days,
-    e.bank_merchant_id, e.customer_name, e.country_name, e.region,
-    e.industry_name, e.acquirer_name, e.location_name, e.firmware_version
-FROM {cfg.FIX_EPISODE_TABLE} e
-ORDER BY e.fix_date DESC, e.terminal_identifier"""
+    TERMINAL_IDENTIFIER, FLAG_COLUMN, FLAG_NAME, FIX_DATE, FIX_SOURCE,
+    CAMPAIGN_ID, CAMPAIGN_NAME,
+    BREAK_AGAIN_DATE, IS_OPEN, EPISODE_END_DATE, EPISODE_DAYS,
+    BANK_MERCHANT_ID, CUSTOMER_NAME, COUNTRY_NAME, REGION,
+    INDUSTRY_NAME, ACQUIRER_NAME, LOCATION_NAME,
+    FIRMWARE_VERSION, MARKET_GROUP, BRAND,
+    ALLOCATED_DCC_PROFIT
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+ORDER BY FIX_DATE DESC, TERMINAL_IDENTIFIER"""
 
 
-def break_episodes() -> str:
+def fix_episodes_today() -> str:
+    """Fix episodes detected today."""
     return f"""SELECT
-    e.terminal_identifier, e.flag_column, e.flag_name,
-    e.break_date, e.fixed_again_date,
-    e.is_open, e.episode_end_date, e.episode_days,
-    e.bank_merchant_id, e.customer_name, e.country_name, e.region,
-    e.industry_name, e.acquirer_name, e.location_name, e.firmware_version
-FROM {cfg.BREAK_EPISODE_TABLE} e
-ORDER BY e.break_date DESC, e.terminal_identifier"""
+    TERMINAL_IDENTIFIER, FLAG_COLUMN, FLAG_NAME, FIX_DATE,
+    BANK_MERCHANT_ID, CUSTOMER_NAME, COUNTRY_NAME,
+    FIRMWARE_VERSION, ALLOCATED_DCC_PROFIT
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+WHERE FIX_DATE = CURRENT_DATE
+ORDER BY TERMINAL_IDENTIFIER"""
 
 
 def daily_tracker() -> str:
-    return f"SELECT * FROM {cfg.DAILY_TRACKER_TABLE} ORDER BY track_date"
-
-
-def transition_log() -> str:
-    return f"""SELECT
-    transition_date, terminal_identifier, flag_column, flag_name,
-    transition_type, country_name, region, firmware_version
-FROM {cfg.TRANSITION_LOG_TABLE}
-ORDER BY transition_date DESC, terminal_identifier"""
+    return f"SELECT * FROM {cfg.DAILY_TRACKER_TABLE} ORDER BY TRACK_DATE"
 
 
 def fix_by_flag() -> str:
+    """Fix episodes grouped by flag type."""
     return f"""SELECT
-    flag_name,
-    COUNT(DISTINCT terminal_identifier) AS terminals,
-    COUNT(*)                            AS episodes,
-    AVG(episode_days)                   AS avg_days
-FROM {cfg.FIX_EPISODE_TABLE}
-GROUP BY flag_name ORDER BY terminals DESC"""
-
-
-def break_by_flag() -> str:
-    return f"""SELECT
-    flag_name,
-    COUNT(DISTINCT terminal_identifier) AS terminals,
-    COUNT(*)                            AS episodes,
-    AVG(episode_days)                   AS avg_days
-FROM {cfg.BREAK_EPISODE_TABLE}
-GROUP BY flag_name ORDER BY terminals DESC"""
+    FLAG_NAME,
+    COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINALS,
+    COUNT(*)                            AS EPISODES,
+    ROUND(SUM(ALLOCATED_DCC_PROFIT), 2) AS TOTAL_PROFIT,
+    ROUND(AVG(EPISODE_DAYS), 1)         AS AVG_DAYS
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+GROUP BY FLAG_NAME ORDER BY TERMINALS DESC"""
 
 
 def fix_by_country() -> str:
+    """Fix episodes grouped by country."""
     return f"""SELECT
-    country_name,
-    COUNT(DISTINCT terminal_identifier) AS terminals,
-    COUNT(*) AS episodes
-FROM {cfg.FIX_EPISODE_TABLE}
-GROUP BY country_name ORDER BY terminals DESC
+    COUNTRY_NAME,
+    COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINALS,
+    COUNT(*) AS EPISODES,
+    ROUND(SUM(ALLOCATED_DCC_PROFIT), 2) AS TOTAL_PROFIT
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+GROUP BY COUNTRY_NAME ORDER BY TERMINALS DESC
 LIMIT 20"""
 
 
-def break_by_country() -> str:
+def fix_by_region() -> str:
+    """Fix episodes grouped by region."""
     return f"""SELECT
-    country_name,
-    COUNT(DISTINCT terminal_identifier) AS terminals,
-    COUNT(*) AS episodes
-FROM {cfg.BREAK_EPISODE_TABLE}
-GROUP BY country_name ORDER BY terminals DESC
+    REGION,
+    COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINALS,
+    COUNT(*) AS EPISODES,
+    ROUND(SUM(ALLOCATED_DCC_PROFIT), 2) AS TOTAL_PROFIT
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+GROUP BY REGION ORDER BY TERMINALS DESC
 LIMIT 20"""
+
+
+def fix_by_campaign() -> str:
+    """Fix episodes grouped by campaign (historical fixes)."""
+    return f"""SELECT
+    CAMPAIGN_ID, CAMPAIGN_NAME, FLAG_NAME,
+    COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINALS,
+    COUNT(*) AS EPISODES,
+    ROUND(SUM(ALLOCATED_DCC_PROFIT), 2) AS TOTAL_PROFIT,
+    MIN(FIX_DATE) AS FIX_DATE
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+WHERE FIX_SOURCE = 'CAMPAIGN'
+GROUP BY CAMPAIGN_ID, CAMPAIGN_NAME, FLAG_NAME
+ORDER BY FIX_DATE DESC"""
+
+
+def firmware_changes() -> str:
+    """Firmware version changes (FIRMWARE_VERSION flag)."""
+    return f"""SELECT
+    TERMINAL_IDENTIFIER, FIX_DATE,
+    BANK_MERCHANT_ID, CUSTOMER_NAME, COUNTRY_NAME,
+    FIRMWARE_VERSION, ALLOCATED_DCC_PROFIT
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+WHERE FLAG_COLUMN = '{cfg.FIRMWARE_COLUMN}'
+ORDER BY FIX_DATE DESC, TERMINAL_IDENTIFIER
+LIMIT 500"""
+
+
+def snapshot_dates() -> str:
+    """Min/max snapshot dates in the snapshot table."""
+    return f"""SELECT
+    MIN(SNAPSHOT_DATE) AS EARLIEST,
+    MAX(SNAPSHOT_DATE) AS LATEST,
+    COUNT(DISTINCT SNAPSHOT_DATE) AS TOTAL_DAYS,
+    COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TOTAL_TERMINALS
+FROM {cfg.SNAPSHOT_TABLE}"""
+
+
+def current_broken_terminals() -> str:
+    """Terminals currently broken (latest snapshot, IS_DCC_BROKEN=TRUE)."""
+    return f"""SELECT
+    TERMINAL_IDENTIFIER, COUNTRY_NAME, REGION, INDUSTRY_NAME,
+    BANK_MERCHANT_ID, CUSTOMER_NAME, ACQUIRER_NAME, LOCATION_NAME,
+    FIRMWARE_VERSION, IS_DCC_BROKEN,
+    LOCATION_DCCENABLED_CHECK_C, HANDLER_DCCENABLE_CHECK_O,
+    HANDLER_DCCENABLECOMPLETION_CHECK_O, HANDLER_DCCENABLEAUTH_CHECK_O,
+    HANDLER_DCCENABLENFC_CHECK_O, HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,
+    DCCXPRESSCO_CHECK_O, DCCXPRESSCODT_CHECK_O, DCCMERCHANT_NO_CHECK_O
+FROM {cfg.SNAPSHOT_TABLE}
+WHERE SNAPSHOT_DATE = (SELECT MAX(SNAPSHOT_DATE) FROM {cfg.SNAPSHOT_TABLE})
+  AND IS_DCC_BROKEN = TRUE
+ORDER BY TERMINAL_IDENTIFIER"""

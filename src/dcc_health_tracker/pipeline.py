@@ -1,16 +1,14 @@
-"""SQL generators for the transition detection and episode-building pipeline.
+"""SQL generators for the terminal health tracking pipeline.
 
-Every function returns a SQL string that uses the table names from config.py.
-The caller decides when and how to execute (Snowflake worksheet, Streamlit
-connection, or a task scheduler). Nothing is executed at import time.
+Aligned with the production notebook (dcc_terminal_profit_tracking_v3.ipynb).
+Uses the correct source tables and output tables from config.py.
 
 Pipeline stages:
-    1. unpivot_snapshot_cte  — wide snapshot → narrow (terminal, flag, value) rows
-    2. detect_transitions    — LAG over consecutive days → FIXED / BROKEN events
-    3. build_fix_episodes    — FIXED transitions with episode end and duration
-    4. build_break_episodes  — BROKEN transitions with episode end and duration
-    5. refresh_daily_tracker — per-day aggregate counts
-    6. refresh_summary       — single-row KPI summary
+    1. daily_snapshot_merge  — MERGE today's data from SOURCE_TERMINAL_TABLE
+    2. detect_fixes          — boolean 1→0 transitions + firmware changes
+    3. allocate_profit       — join fix episodes with revenue data
+    4. refresh_daily_tracker — per-day aggregate counts
+    5. refresh_summary       — single-row KPI summary
 """
 
 from __future__ import annotations
@@ -19,273 +17,370 @@ from . import config as cfg
 
 
 def _flag_list() -> str:
-    return ",\n        ".join(cfg.FLAG_COLUMNS)
+    return ",\n            ".join(cfg.FLAG_COLUMNS)
 
 
-def unpivot_cte() -> str:
-    return f"""unpivoted AS (
+def _array_construct_flags() -> str:
+    """Build ARRAY_CONSTRUCT for LATERAL FLATTEN."""
+    items = [
+        f"OBJECT_CONSTRUCT('c','{col}','v',{col})"
+        for col in cfg.FLAG_COLUMNS
+    ]
+    return ",\n                ".join(items)
+
+
+def daily_snapshot_merge() -> str:
+    """MERGE today's snapshot from the source terminal table."""
+    return f"""MERGE INTO {cfg.SNAPSHOT_TABLE} AS tgt
+USING (
     SELECT
-        s.snapshot_date,
-        s.terminal_identifier,
-        s.country_name,
-        s.region,
-        s.industry_name,
-        s.bank_merchant_id,
-        s.customer_name,
-        s.acquirer_name,
-        s.location_name,
-        s.firmware_version,
-        s.is_dcc_broken,
-        t.flag_column,
-        t.flag_value
-    FROM {cfg.SNAPSHOT_TABLE} AS s,
-    LATERAL FLATTEN(ARRAY_CONSTRUCT(
-        {', '.join(f"OBJECT_CONSTRUCT('{col}', s.{col})" for col in cfg.FLAG_COLUMNS)}
-    )) AS flat,
-    LATERAL (
-        SELECT key AS flag_column, value::INT AS flag_value
-        FROM TABLE(FLATTEN(flat.value))
-    ) AS t
-)"""
+        CURRENT_DATE AS SNAPSHOT_DATE,
+        TERMINAL_IDENTIFIER,
+        ANY_VALUE(COUNTRY_NAME) AS COUNTRY_NAME,
+        ANY_VALUE(REGION) AS REGION,
+        ANY_VALUE(INDUSTRY_NAME) AS INDUSTRY_NAME,
+        ANY_VALUE(BANK_MERCHANT_ID) AS BANK_MERCHANT_ID,
+        ANY_VALUE(CUSTOMER_NAME) AS CUSTOMER_NAME,
+        ANY_VALUE(ACQUIRER_NAME) AS ACQUIRER_NAME,
+        ANY_VALUE(LOCATION_NAME) AS LOCATION_NAME,
+        MAX(COALESCE(LOCATION_DCCENABLED_CHECK_C,0))::INTEGER AS LOCATION_DCCENABLED_CHECK_C,
+        MAX(COALESCE(HANDLER_DCCENABLE_CHECK_O,0))::INTEGER AS HANDLER_DCCENABLE_CHECK_O,
+        MAX(COALESCE(HANDLER_DCCENABLECOMPLETION_CHECK_O,0))::INTEGER AS HANDLER_DCCENABLECOMPLETION_CHECK_O,
+        MAX(COALESCE(HANDLER_DCCENABLEAUTH_CHECK_O,0))::INTEGER AS HANDLER_DCCENABLEAUTH_CHECK_O,
+        MAX(COALESCE(HANDLER_DCCENABLENFC_CHECK_O,0))::INTEGER AS HANDLER_DCCENABLENFC_CHECK_O,
+        MAX(COALESCE(HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,0))::INTEGER AS HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,
+        MAX(COALESCE(DCCXPRESSCO_CHECK_O,0))::INTEGER AS DCCXPRESSCO_CHECK_O,
+        MAX(COALESCE(DCCXPRESSCODT_CHECK_O,0))::INTEGER AS DCCXPRESSCODT_CHECK_O,
+        MAX(COALESCE(DCCMERCHANT_NO_CHECK_O,0))::INTEGER AS DCCMERCHANT_NO_CHECK_O,
+        ANY_VALUE(FIRMWARE_VERSION) AS FIRMWARE_VERSION,
+        CASE WHEN MAX(COALESCE(LOCATION_DCCENABLED_CHECK_C,0))=1
+              OR MAX(COALESCE(HANDLER_DCCENABLE_CHECK_O,0))=1
+              OR MAX(COALESCE(HANDLER_DCCENABLECOMPLETION_CHECK_O,0))=1
+              OR MAX(COALESCE(HANDLER_DCCENABLEAUTH_CHECK_O,0))=1
+              OR MAX(COALESCE(HANDLER_DCCENABLENFC_CHECK_O,0))=1
+              OR MAX(COALESCE(HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,0))=1
+              OR MAX(COALESCE(DCCXPRESSCO_CHECK_O,0))=1
+              OR MAX(COALESCE(DCCXPRESSCODT_CHECK_O,0))=1
+              OR MAX(COALESCE(DCCMERCHANT_NO_CHECK_O,0))=1
+        THEN TRUE ELSE FALSE END AS IS_DCC_BROKEN
+    FROM {cfg.SOURCE_TERMINAL_TABLE}
+    WHERE ACTIVE_TERMINAL = TRUE AND ACTIVE_LOCATION = TRUE AND LOCATION_DCCENABLED = TRUE
+    GROUP BY TERMINAL_IDENTIFIER
+) AS src
+ON tgt.SNAPSHOT_DATE = src.SNAPSHOT_DATE AND tgt.TERMINAL_IDENTIFIER = src.TERMINAL_IDENTIFIER
+WHEN MATCHED THEN UPDATE SET
+    COUNTRY_NAME=src.COUNTRY_NAME, REGION=src.REGION, INDUSTRY_NAME=src.INDUSTRY_NAME,
+    BANK_MERCHANT_ID=src.BANK_MERCHANT_ID, CUSTOMER_NAME=src.CUSTOMER_NAME,
+    ACQUIRER_NAME=src.ACQUIRER_NAME, LOCATION_NAME=src.LOCATION_NAME,
+    LOCATION_DCCENABLED_CHECK_C=src.LOCATION_DCCENABLED_CHECK_C,
+    HANDLER_DCCENABLE_CHECK_O=src.HANDLER_DCCENABLE_CHECK_O,
+    HANDLER_DCCENABLECOMPLETION_CHECK_O=src.HANDLER_DCCENABLECOMPLETION_CHECK_O,
+    HANDLER_DCCENABLEAUTH_CHECK_O=src.HANDLER_DCCENABLEAUTH_CHECK_O,
+    HANDLER_DCCENABLENFC_CHECK_O=src.HANDLER_DCCENABLENFC_CHECK_O,
+    HANDLER_DCCENABLENFCSINGLETAP_CHECK_O=src.HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,
+    DCCXPRESSCO_CHECK_O=src.DCCXPRESSCO_CHECK_O,
+    DCCXPRESSCODT_CHECK_O=src.DCCXPRESSCODT_CHECK_O,
+    DCCMERCHANT_NO_CHECK_O=src.DCCMERCHANT_NO_CHECK_O,
+    FIRMWARE_VERSION=src.FIRMWARE_VERSION, IS_DCC_BROKEN=src.IS_DCC_BROKEN
+WHEN NOT MATCHED THEN INSERT (
+    SNAPSHOT_DATE,TERMINAL_IDENTIFIER,COUNTRY_NAME,REGION,
+    INDUSTRY_NAME,BANK_MERCHANT_ID,CUSTOMER_NAME,ACQUIRER_NAME,LOCATION_NAME,
+    LOCATION_DCCENABLED_CHECK_C,HANDLER_DCCENABLE_CHECK_O,HANDLER_DCCENABLECOMPLETION_CHECK_O,
+    HANDLER_DCCENABLEAUTH_CHECK_O,HANDLER_DCCENABLENFC_CHECK_O,HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,
+    DCCXPRESSCO_CHECK_O,DCCXPRESSCODT_CHECK_O,DCCMERCHANT_NO_CHECK_O,FIRMWARE_VERSION,IS_DCC_BROKEN)
+VALUES (
+    src.SNAPSHOT_DATE,src.TERMINAL_IDENTIFIER,src.COUNTRY_NAME,src.REGION,
+    src.INDUSTRY_NAME,src.BANK_MERCHANT_ID,src.CUSTOMER_NAME,src.ACQUIRER_NAME,src.LOCATION_NAME,
+    src.LOCATION_DCCENABLED_CHECK_C,src.HANDLER_DCCENABLE_CHECK_O,src.HANDLER_DCCENABLECOMPLETION_CHECK_O,
+    src.HANDLER_DCCENABLEAUTH_CHECK_O,src.HANDLER_DCCENABLENFC_CHECK_O,src.HANDLER_DCCENABLENFCSINGLETAP_CHECK_O,
+    src.DCCXPRESSCO_CHECK_O,src.DCCXPRESSCODT_CHECK_O,src.DCCMERCHANT_NO_CHECK_O,
+    src.FIRMWARE_VERSION,src.IS_DCC_BROKEN);"""
 
 
-def unpivot_cte_simple() -> str:
-    """UNPIVOT-based CTE — cleaner and supported natively in Snowflake."""
-    return f"""unpivoted AS (
-    SELECT
-        snapshot_date,
-        terminal_identifier,
-        country_name,
-        region,
-        industry_name,
-        bank_merchant_id,
-        customer_name,
-        acquirer_name,
-        location_name,
-        firmware_version,
-        is_dcc_broken,
-        flag_column,
-        flag_value
-    FROM {cfg.SNAPSHOT_TABLE}
-    UNPIVOT (
-        flag_value FOR flag_column IN (
-            {_flag_list()}
+def detect_fixes_merge() -> str:
+    """Detect FIXED transitions (boolean 1→0) and firmware version changes."""
+    return f"""MERGE INTO {cfg.FIX_EPISODE_TABLE} tgt
+USING (
+    WITH recent AS (
+        SELECT * FROM {cfg.SNAPSHOT_TABLE}
+        WHERE SNAPSHOT_DATE >= DATEADD('day', -1, CURRENT_DATE)
+    ),
+    m AS (
+        SELECT TERMINAL_IDENTIFIER,
+            ANY_VALUE(COUNTRY_NAME) AS COUNTRY_NAME,
+            ANY_VALUE(REGION) AS REGION,
+            ANY_VALUE(INDUSTRY_NAME) AS INDUSTRY_NAME,
+            ANY_VALUE(ACQUIRER_NAME) AS ACQUIRER_NAME,
+            ANY_VALUE(LOCATION_NAME) AS LOCATION_NAME
+        FROM {cfg.SOURCE_TERMINAL_TABLE}
+        GROUP BY TERMINAL_IDENTIFIER
+    ),
+    boolean_fixes AS (
+        SELECT TERMINAL_IDENTIFIER, SNAPSHOT_DATE AS FIX_DATE, FLAG_COLUMN,
+            BANK_MERCHANT_ID, CUSTOMER_NAME, FIRMWARE_VERSION,
+            CAST(NULL AS VARCHAR) AS PREV_FIRMWARE_VERSION
+        FROM (
+            SELECT r.*, FLAG_COLUMN, FLAG_VALUE,
+                LAG(FLAG_VALUE) OVER (
+                    PARTITION BY TERMINAL_IDENTIFIER, FLAG_COLUMN
+                    ORDER BY SNAPSHOT_DATE
+                ) AS PREV
+            FROM recent r,
+            LATERAL FLATTEN(INPUT => ARRAY_CONSTRUCT(
+                {_array_construct_flags()}
+            )) f,
+            LATERAL (SELECT f.value:c::VARCHAR AS FLAG_COLUMN, f.value:v::INTEGER AS FLAG_VALUE)
         )
+        WHERE PREV = 1 AND FLAG_VALUE = 0 AND SNAPSHOT_DATE = CURRENT_DATE
+    ),
+    firmware_fixes AS (
+        SELECT TERMINAL_IDENTIFIER, SNAPSHOT_DATE AS FIX_DATE,
+            '{cfg.FIRMWARE_COLUMN}' AS FLAG_COLUMN,
+            BANK_MERCHANT_ID, CUSTOMER_NAME, FIRMWARE_VERSION,
+            PREV_FW AS PREV_FIRMWARE_VERSION
+        FROM (
+            SELECT r.*,
+                LAG(FIRMWARE_VERSION) OVER (
+                    PARTITION BY TERMINAL_IDENTIFIER
+                    ORDER BY SNAPSHOT_DATE
+                ) AS PREV_FW
+            FROM recent r
+        )
+        WHERE SNAPSHOT_DATE = CURRENT_DATE
+          AND PREV_FW IS NOT NULL
+          AND FIRMWARE_VERSION IS NOT NULL
+          AND PREV_FW <> FIRMWARE_VERSION
+    ),
+    all_fixes AS (
+        SELECT * FROM boolean_fixes
+        UNION ALL
+        SELECT * FROM firmware_fixes
     )
-)"""
-
-
-def transitions_cte() -> str:
-    return """transitions AS (
     SELECT
-        snapshot_date       AS transition_date,
-        terminal_identifier,
-        flag_column,
-        flag_value          AS current_value,
-        LAG(flag_value) OVER (
-            PARTITION BY terminal_identifier, flag_column
-            ORDER BY snapshot_date
-        ) AS prev_value,
-        LAG(snapshot_date) OVER (
-            PARTITION BY terminal_identifier, flag_column
-            ORDER BY snapshot_date
-        ) AS prev_snapshot_date,
-        CASE
-            WHEN LAG(flag_value) OVER (
-                     PARTITION BY terminal_identifier, flag_column
-                     ORDER BY snapshot_date) = 1
-                 AND flag_value = 0 THEN 'FIXED'
-            WHEN LAG(flag_value) OVER (
-                     PARTITION BY terminal_identifier, flag_column
-                     ORDER BY snapshot_date) = 0
-                 AND flag_value = 1 THEN 'BROKEN'
-        END AS transition_type,
-        country_name, region, industry_name, bank_merchant_id,
-        customer_name, acquirer_name, location_name, firmware_version
-    FROM unpivoted
-)"""
+        af.TERMINAL_IDENTIFIER, af.FLAG_COLUMN, af.FIX_DATE,
+        'SNAPSHOT' AS FIX_SOURCE,
+        CAST(NULL AS VARCHAR) AS CAMPAIGN_ID,
+        CAST(NULL AS VARCHAR) AS CAMPAIGN_NAME,
+        r.FLAG_NAME,
+        af.BANK_MERCHANT_ID, af.CUSTOMER_NAME,
+        m.COUNTRY_NAME, m.REGION, m.INDUSTRY_NAME, m.ACQUIRER_NAME, m.LOCATION_NAME,
+        CAST(NULL AS VARCHAR) AS TERMINAL_MODEL_NAME,
+        af.FIRMWARE_VERSION, af.PREV_FIRMWARE_VERSION,
+        CAST(NULL AS DATE) AS BREAK_AGAIN_DATE,
+        1 AS IS_OPEN,
+        CURRENT_DATE AS EPISODE_END_DATE,
+        DATEDIFF('day', af.FIX_DATE, CURRENT_DATE) + 1 AS EPISODE_DAYS
+    FROM all_fixes af
+    LEFT JOIN {cfg.FLAG_REF_TABLE} r ON af.FLAG_COLUMN = r.FLAG_COLUMN
+    LEFT JOIN m ON af.TERMINAL_IDENTIFIER = m.TERMINAL_IDENTIFIER
+) src
+ON tgt.TERMINAL_IDENTIFIER = src.TERMINAL_IDENTIFIER
+   AND tgt.FLAG_COLUMN = src.FLAG_COLUMN
+   AND tgt.FIX_DATE = src.FIX_DATE
+WHEN NOT MATCHED THEN INSERT (
+    TERMINAL_IDENTIFIER, FLAG_COLUMN, FIX_DATE, FIX_SOURCE, CAMPAIGN_ID, CAMPAIGN_NAME,
+    FLAG_NAME, BANK_MERCHANT_ID, CUSTOMER_NAME, COUNTRY_NAME, REGION, INDUSTRY_NAME,
+    ACQUIRER_NAME, LOCATION_NAME, TERMINAL_MODEL_NAME, FIRMWARE_VERSION,
+    PREV_FIRMWARE_VERSION, BREAK_AGAIN_DATE, IS_OPEN, EPISODE_END_DATE, EPISODE_DAYS)
+VALUES (
+    src.TERMINAL_IDENTIFIER, src.FLAG_COLUMN, src.FIX_DATE, src.FIX_SOURCE,
+    src.CAMPAIGN_ID, src.CAMPAIGN_NAME, src.FLAG_NAME, src.BANK_MERCHANT_ID,
+    src.CUSTOMER_NAME, src.COUNTRY_NAME, src.REGION, src.INDUSTRY_NAME,
+    src.ACQUIRER_NAME, src.LOCATION_NAME, src.TERMINAL_MODEL_NAME, src.FIRMWARE_VERSION,
+    src.PREV_FIRMWARE_VERSION, src.BREAK_AGAIN_DATE, src.IS_OPEN,
+    src.EPISODE_END_DATE, src.EPISODE_DAYS);"""
 
 
-def create_transition_log() -> str:
-    return f"""CREATE OR REPLACE TABLE {cfg.TRANSITION_LOG_TABLE} AS
-WITH
-{unpivot_cte_simple()},
-{transitions_cte()}
-SELECT
-    transition_date,
-    terminal_identifier,
-    flag_column,
-    f.flag_name,
-    f.flag_type,
-    transition_type,
-    current_value,
-    prev_value,
-    prev_snapshot_date,
-    t.country_name,
-    t.region,
-    t.industry_name,
-    t.bank_merchant_id,
-    t.customer_name,
-    t.acquirer_name,
-    t.location_name,
-    t.firmware_version
-FROM transitions t
-LEFT JOIN {cfg.FLAG_REF_TABLE} f ON f.flag_column = t.flag_column
-WHERE transition_type IS NOT NULL
-ORDER BY transition_date, terminal_identifier, flag_column;"""
+def update_open_episodes() -> str:
+    """Update episode_end_date and episode_days for all open episodes."""
+    return f"""UPDATE {cfg.FIX_EPISODE_TABLE}
+SET EPISODE_END_DATE = CURRENT_DATE,
+    EPISODE_DAYS = DATEDIFF('day', FIX_DATE, CURRENT_DATE) + 1
+WHERE IS_OPEN = 1;"""
 
 
-def create_fix_episodes() -> str:
-    return f"""CREATE OR REPLACE TABLE {cfg.FIX_EPISODE_TABLE} AS
-WITH fixes AS (
-    SELECT * FROM {cfg.TRANSITION_LOG_TABLE} WHERE transition_type = 'FIXED'
+def allocate_profit() -> str:
+    """Join fix episodes with revenue data to allocate profit."""
+    return f"""TRUNCATE TABLE {cfg.FIX_EPISODE_PROFIT_TABLE};
+
+INSERT INTO {cfg.FIX_EPISODE_PROFIT_TABLE} (
+    TERMINAL_IDENTIFIER, FLAG_COLUMN, FIX_DATE, FIX_SOURCE, CAMPAIGN_ID, CAMPAIGN_NAME,
+    FLAG_NAME, BANK_MERCHANT_ID, CUSTOMER_NAME, COUNTRY_NAME, REGION, INDUSTRY_NAME,
+    ACQUIRER_NAME, LOCATION_NAME, TERMINAL_MODEL_NAME, FIRMWARE_VERSION,
+    MARKET_GROUP, BRAND, BREAK_AGAIN_DATE, IS_OPEN, EPISODE_END_DATE, EPISODE_DAYS,
+    ALLOCATED_DCC_PROFIT
+)
+WITH ep AS (SELECT * FROM {cfg.FIX_EPISODE_TABLE}),
+tc AS (
+    SELECT BANK_MERCHANT_ID, COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINAL_COUNT
+    FROM {cfg.SOURCE_TERMINAL_TABLE}
+    WHERE ACTIVE_TERMINAL=TRUE AND ACTIVE_LOCATION=TRUE AND LOCATION_DCCENABLED=TRUE
+    GROUP BY BANK_MERCHANT_ID
 ),
-next_break AS (
-    SELECT
-        f.*,
-        MIN(b.transition_date) AS break_again_date
-    FROM fixes f
-    LEFT JOIN {cfg.TRANSITION_LOG_TABLE} b
-        ON  b.terminal_identifier = f.terminal_identifier
-        AND b.flag_column         = f.flag_column
-        AND b.transition_type     = 'BROKEN'
-        AND b.transition_date     > f.transition_date
-    GROUP BY ALL
+mp_raw AS (
+    SELECT MERCHANT_ID, FIRST_OF_MONTH,
+        ANY_VALUE(MARKET_GROUP) AS MARKET_GROUP,
+        ANY_VALUE(BRAND) AS BRAND,
+        SUM(DCC_PROFIT) AS MONTHLY_DCC_PROFIT,
+        DATEDIFF('day', FIRST_OF_MONTH, DATEADD('month',1,FIRST_OF_MONTH)) AS DAYS_IN_MONTH
+    FROM {cfg.SOURCE_REVENUE_TABLE}
+    GROUP BY MERCHANT_ID, FIRST_OF_MONTH
+),
+latest_month AS (
+    SELECT MERCHANT_ID, MAX(FIRST_OF_MONTH) AS MAX_MONTH FROM mp_raw
+    WHERE FIRST_OF_MONTH >= DATEADD('month', -3, DATE_TRUNC('month', CURRENT_DATE))
+    GROUP BY MERCHANT_ID
+),
+months_needed AS (
+    SELECT DISTINCT BANK_MERCHANT_ID, NEEDED_MONTH FROM (
+        SELECT ep.BANK_MERCHANT_ID,
+            DATEADD('month', d.VALUE::INT, DATE_TRUNC('month', ep.FIX_DATE)) AS NEEDED_MONTH
+        FROM (SELECT DISTINCT BANK_MERCHANT_ID, FIX_DATE, EPISODE_END_DATE FROM ep) ep,
+        LATERAL FLATTEN(INPUT => ARRAY_GENERATE_RANGE(0,
+            DATEDIFF('month', DATE_TRUNC('month', ep.FIX_DATE), ep.EPISODE_END_DATE) + 1)) d
+        WHERE DATEADD('month', d.VALUE::INT, DATE_TRUNC('month', ep.FIX_DATE)) <= ep.EPISODE_END_DATE
+    )
+),
+monthly_profit AS (
+    SELECT mn.BANK_MERCHANT_ID AS MERCHANT_ID, mn.NEEDED_MONTH AS FIRST_OF_MONTH,
+        COALESCE(mpr.MARKET_GROUP, fb.MARKET_GROUP) AS MARKET_GROUP,
+        COALESCE(mpr.BRAND, fb.BRAND) AS BRAND,
+        COALESCE(mpr.MONTHLY_DCC_PROFIT, fb.MONTHLY_DCC_PROFIT) AS MONTHLY_DCC_PROFIT,
+        COALESCE(mpr.DAYS_IN_MONTH,
+            DATEDIFF('day', mn.NEEDED_MONTH, DATEADD('month',1,mn.NEEDED_MONTH))) AS DAYS_IN_MONTH
+    FROM months_needed mn
+    LEFT JOIN mp_raw mpr
+        ON mn.BANK_MERCHANT_ID = mpr.MERCHANT_ID AND mn.NEEDED_MONTH = mpr.FIRST_OF_MONTH
+    LEFT JOIN latest_month lm ON mn.BANK_MERCHANT_ID = lm.MERCHANT_ID
+    LEFT JOIN mp_raw fb ON lm.MERCHANT_ID = fb.MERCHANT_ID AND lm.MAX_MONTH = fb.FIRST_OF_MONTH
+),
+episode_profit AS (
+    SELECT e.TERMINAL_IDENTIFIER, e.FLAG_COLUMN, e.FIX_DATE,
+        ANY_VALUE(mp.MARKET_GROUP) AS MARKET_GROUP,
+        ANY_VALUE(mp.BRAND) AS BRAND,
+        SUM(
+            (mp.MONTHLY_DCC_PROFIT / NULLIF(tc.TERMINAL_COUNT, 0))
+            * GREATEST(DATEDIFF('day',
+                GREATEST(mp.FIRST_OF_MONTH, e.FIX_DATE),
+                LEAST(DATEADD('day', -1, DATEADD('month', 1, mp.FIRST_OF_MONTH)), e.EPISODE_END_DATE)
+            ) + 1, 0)
+            / NULLIF(mp.DAYS_IN_MONTH, 0)
+        ) AS ALLOCATED
+    FROM ep e
+    JOIN tc ON e.BANK_MERCHANT_ID = tc.BANK_MERCHANT_ID
+    JOIN monthly_profit mp ON e.BANK_MERCHANT_ID = mp.MERCHANT_ID
+        AND mp.FIRST_OF_MONTH <= e.EPISODE_END_DATE
+        AND DATEADD('month', 1, mp.FIRST_OF_MONTH) > e.FIX_DATE
+    WHERE mp.MONTHLY_DCC_PROFIT IS NOT NULL
+    GROUP BY e.TERMINAL_IDENTIFIER, e.FLAG_COLUMN, e.FIX_DATE
 )
 SELECT
-    terminal_identifier,
-    flag_column,
-    flag_name,
-    transition_date                                             AS fix_date,
-    'SNAPSHOT'                                                  AS fix_source,
-    break_again_date,
-    IFF(break_again_date IS NULL, 1, 0)                        AS is_open,
-    COALESCE(break_again_date, CURRENT_DATE())                 AS episode_end_date,
-    DATEDIFF('day', transition_date,
-             COALESCE(break_again_date, CURRENT_DATE()))        AS episode_days,
-    country_name, region, industry_name, bank_merchant_id,
-    customer_name, acquirer_name, location_name, firmware_version
-FROM next_break
-ORDER BY fix_date, terminal_identifier, flag_column;"""
-
-
-def create_break_episodes() -> str:
-    return f"""CREATE OR REPLACE TABLE {cfg.BREAK_EPISODE_TABLE} AS
-WITH breaks AS (
-    SELECT * FROM {cfg.TRANSITION_LOG_TABLE} WHERE transition_type = 'BROKEN'
-),
-next_fix AS (
-    SELECT
-        b.*,
-        MIN(f.transition_date) AS fixed_again_date
-    FROM breaks b
-    LEFT JOIN {cfg.TRANSITION_LOG_TABLE} f
-        ON  f.terminal_identifier = b.terminal_identifier
-        AND f.flag_column         = b.flag_column
-        AND f.transition_type     = 'FIXED'
-        AND f.transition_date     > b.transition_date
-    GROUP BY ALL
-)
-SELECT
-    terminal_identifier,
-    flag_column,
-    flag_name,
-    transition_date                                             AS break_date,
-    fixed_again_date,
-    IFF(fixed_again_date IS NULL, 1, 0)                        AS is_open,
-    COALESCE(fixed_again_date, CURRENT_DATE())                 AS episode_end_date,
-    DATEDIFF('day', transition_date,
-             COALESCE(fixed_again_date, CURRENT_DATE()))        AS episode_days,
-    country_name, region, industry_name, bank_merchant_id,
-    customer_name, acquirer_name, location_name, firmware_version
-FROM next_fix
-ORDER BY break_date, terminal_identifier, flag_column;"""
+    e.TERMINAL_IDENTIFIER, e.FLAG_COLUMN, e.FIX_DATE, e.FIX_SOURCE, e.CAMPAIGN_ID,
+    e.CAMPAIGN_NAME, e.FLAG_NAME, e.BANK_MERCHANT_ID, e.CUSTOMER_NAME, e.COUNTRY_NAME,
+    e.REGION, e.INDUSTRY_NAME, e.ACQUIRER_NAME, e.LOCATION_NAME, e.TERMINAL_MODEL_NAME,
+    e.FIRMWARE_VERSION, ep.MARKET_GROUP, ep.BRAND, e.BREAK_AGAIN_DATE, e.IS_OPEN,
+    e.EPISODE_END_DATE, e.EPISODE_DAYS,
+    GREATEST(COALESCE(ep.ALLOCATED, 0), 0) AS ALLOCATED_DCC_PROFIT
+FROM ep e
+LEFT JOIN episode_profit ep
+    ON e.TERMINAL_IDENTIFIER = ep.TERMINAL_IDENTIFIER
+   AND e.FLAG_COLUMN = ep.FLAG_COLUMN
+   AND e.FIX_DATE = ep.FIX_DATE;"""
 
 
 def refresh_daily_tracker() -> str:
-    return f"""CREATE OR REPLACE TABLE {cfg.DAILY_TRACKER_TABLE} AS
-WITH fix_daily AS (
+    """Refresh the daily tracker with fix events and profit."""
+    return f"""MERGE INTO {cfg.DAILY_TRACKER_TABLE} tgt
+USING (
+    WITH day_epis AS (
+        SELECT
+            COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMS,
+            COALESCE(SUM(ALLOCATED_DCC_PROFIT), 0) AS PROF,
+            COUNT(*) AS EVENTS,
+            COUNT(DISTINCT FLAG_COLUMN) AS N_FLAGS,
+            LISTAGG(DISTINCT FLAG_NAME, ', ') WITHIN GROUP (ORDER BY FLAG_NAME) AS FLAGS_LIST,
+            LISTAGG(DISTINCT TERMINAL_IDENTIFIER, ', ')
+                WITHIN GROUP (ORDER BY TERMINAL_IDENTIFIER) AS TERM_LIST
+        FROM {cfg.FIX_EPISODE_PROFIT_TABLE}
+        WHERE FIX_DATE = CURRENT_DATE
+    ),
+    prev AS (
+        SELECT
+            COALESCE(MAX(CUMULATIVE_TERMINALS_FIXED), 0) AS CT,
+            COALESCE(MAX(CUMULATIVE_PROFIT_RECOVERED), 0) AS CP
+        FROM {cfg.DAILY_TRACKER_TABLE}
+    )
     SELECT
-        fix_date                                            AS track_date,
-        COUNT(DISTINCT terminal_identifier)                 AS terminals_fixed,
-        COUNT(*)                                            AS flag_fix_events,
-        COUNT(DISTINCT flag_column)                         AS distinct_flags_fixed,
-        LISTAGG(DISTINCT flag_name, ', ') WITHIN GROUP
-            (ORDER BY flag_name)                            AS flags_fixed_list
-    FROM {cfg.FIX_EPISODE_TABLE}
-    GROUP BY fix_date
-),
-break_daily AS (
-    SELECT
-        break_date                                          AS track_date,
-        COUNT(DISTINCT terminal_identifier)                 AS terminals_broken,
-        COUNT(*)                                            AS flag_break_events,
-        COUNT(DISTINCT flag_column)                         AS distinct_flags_broken,
-        LISTAGG(DISTINCT flag_name, ', ') WITHIN GROUP
-            (ORDER BY flag_name)                            AS flags_broken_list
-    FROM {cfg.BREAK_EPISODE_TABLE}
-    GROUP BY break_date
-)
-SELECT
-    COALESCE(f.track_date, b.track_date)                    AS track_date,
-    TO_CHAR(COALESCE(f.track_date, b.track_date), 'YYYY-MM-DD (DY)') AS day_label,
-    COALESCE(f.terminals_fixed,   0)                        AS terminals_fixed,
-    COALESCE(f.flag_fix_events,   0)                        AS flag_fix_events,
-    COALESCE(f.flags_fixed_list,  '')                       AS flags_fixed_list,
-    COALESCE(b.terminals_broken,  0)                        AS terminals_broken,
-    COALESCE(b.flag_break_events, 0)                        AS flag_break_events,
-    COALESCE(b.flags_broken_list, '')                       AS flags_broken_list,
-    SUM(COALESCE(f.terminals_fixed, 0)) OVER
-        (ORDER BY COALESCE(f.track_date, b.track_date))     AS cum_terminals_fixed,
-    SUM(COALESCE(b.terminals_broken, 0)) OVER
-        (ORDER BY COALESCE(f.track_date, b.track_date))     AS cum_terminals_broken
-FROM fix_daily f
-FULL OUTER JOIN break_daily b ON f.track_date = b.track_date
-ORDER BY track_date;"""
+        CURRENT_DATE AS TRACK_DATE,
+        TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD (DY)') AS DAY_LABEL,
+        (SELECT COALESCE(MAX(DAY_NUMBER), 0) + 1 FROM {cfg.DAILY_TRACKER_TABLE}) AS DAY_NUMBER,
+        de.TERMS AS TERMINALS_FIXED,
+        de.PROF AS PROFIT_RECOVERED,
+        de.EVENTS AS FLAG_FIX_EVENTS,
+        de.N_FLAGS AS DISTINCT_FLAGS_FIXED,
+        de.FLAGS_LIST AS FLAGS_FIXED_LIST,
+        de.TERM_LIST AS FIXED_TERMINAL_LIST,
+        p.CT + de.TERMS AS CUMULATIVE_TERMINALS_FIXED,
+        p.CP + de.PROF AS CUMULATIVE_PROFIT_RECOVERED
+    FROM day_epis de, prev p
+) src
+ON tgt.TRACK_DATE = src.TRACK_DATE
+WHEN MATCHED THEN UPDATE SET
+    DAY_LABEL=src.DAY_LABEL, DAY_NUMBER=src.DAY_NUMBER,
+    TERMINALS_FIXED=src.TERMINALS_FIXED, PROFIT_RECOVERED=src.PROFIT_RECOVERED,
+    FLAG_FIX_EVENTS=src.FLAG_FIX_EVENTS, DISTINCT_FLAGS_FIXED=src.DISTINCT_FLAGS_FIXED,
+    FLAGS_FIXED_LIST=src.FLAGS_FIXED_LIST, FIXED_TERMINAL_LIST=src.FIXED_TERMINAL_LIST,
+    CUMULATIVE_TERMINALS_FIXED=src.CUMULATIVE_TERMINALS_FIXED,
+    CUMULATIVE_PROFIT_RECOVERED=src.CUMULATIVE_PROFIT_RECOVERED
+WHEN NOT MATCHED THEN INSERT (
+    TRACK_DATE, DAY_LABEL, DAY_NUMBER, TERMINALS_FIXED, PROFIT_RECOVERED,
+    FLAG_FIX_EVENTS, DISTINCT_FLAGS_FIXED, FLAGS_FIXED_LIST, FIXED_TERMINAL_LIST,
+    CUMULATIVE_TERMINALS_FIXED, CUMULATIVE_PROFIT_RECOVERED)
+VALUES (
+    src.TRACK_DATE, src.DAY_LABEL, src.DAY_NUMBER, src.TERMINALS_FIXED, src.PROFIT_RECOVERED,
+    src.FLAG_FIX_EVENTS, src.DISTINCT_FLAGS_FIXED, src.FLAGS_FIXED_LIST, src.FIXED_TERMINAL_LIST,
+    src.CUMULATIVE_TERMINALS_FIXED, src.CUMULATIVE_PROFIT_RECOVERED);"""
 
 
 def refresh_summary() -> str:
-    return f"""CREATE OR REPLACE TABLE {cfg.SUMMARY_TABLE} AS
+    """Refresh single-row summary table."""
+    return f"""TRUNCATE TABLE {cfg.SUMMARY_TABLE};
+
+INSERT INTO {cfg.SUMMARY_TABLE}
 SELECT
-    (SELECT COUNT(*)
-     FROM {cfg.FIX_EPISODE_TABLE})                          AS total_fix_episodes,
-    (SELECT COUNT(DISTINCT terminal_identifier)
-     FROM {cfg.FIX_EPISODE_TABLE})                          AS unique_terminals_fixed,
-    (SELECT SUM(is_open)
-     FROM {cfg.FIX_EPISODE_TABLE})                          AS open_fix_episodes,
-    (SELECT AVG(episode_days)
-     FROM {cfg.FIX_EPISODE_TABLE})                          AS avg_fix_episode_days,
-    (SELECT COUNT(*)
-     FROM {cfg.BREAK_EPISODE_TABLE})                        AS total_break_episodes,
-    (SELECT COUNT(DISTINCT terminal_identifier)
-     FROM {cfg.BREAK_EPISODE_TABLE})                        AS unique_terminals_broken,
-    (SELECT SUM(is_open)
-     FROM {cfg.BREAK_EPISODE_TABLE})                        AS open_break_episodes,
-    (SELECT AVG(episode_days)
-     FROM {cfg.BREAK_EPISODE_TABLE})                        AS avg_break_episode_days,
-    (SELECT MIN(snapshot_date)
-     FROM {cfg.SNAPSHOT_TABLE})                              AS earliest_snapshot,
-    (SELECT MAX(snapshot_date)
-     FROM {cfg.SNAPSHOT_TABLE})                              AS latest_snapshot,
-    CURRENT_TIMESTAMP()                                      AS refreshed_at;"""
+    COUNT(*) AS TOTAL_FIX_EPISODES,
+    COUNT(DISTINCT TERMINAL_IDENTIFIER) AS UNIQUE_TERMINALS_FIXED,
+    SUM(CASE WHEN FIX_SOURCE = 'CAMPAIGN' THEN 1 ELSE 0 END) AS HISTORICAL_EPISODES,
+    SUM(CASE WHEN FIX_SOURCE = 'SNAPSHOT' THEN 1 ELSE 0 END) AS DETECTED_EPISODES,
+    ROUND(SUM(ALLOCATED_DCC_PROFIT), 2) AS TOTAL_ALLOCATED_PROFIT,
+    SUM(CASE WHEN IS_OPEN = 1 THEN 1 ELSE 0 END) AS OPEN_EPISODES,
+    SUM(CASE WHEN IS_OPEN = 0 THEN 1 ELSE 0 END) AS CLOSED_EPISODES,
+    ROUND(AVG(EPISODE_DAYS), 1) AS AVG_EPISODE_DAYS,
+    COUNT(DISTINCT CAMPAIGN_ID) AS ACTIVE_CAMPAIGNS,
+    (SELECT MIN(SNAPSHOT_DATE) FROM {cfg.SNAPSHOT_TABLE}) AS BASELINE_DATE,
+    CURRENT_TIMESTAMP AS REFRESHED_AT
+FROM {cfg.FIX_EPISODE_PROFIT_TABLE};"""
 
 
 def full_refresh_script() -> str:
-    """Return the complete pipeline as a single multi-statement script."""
+    """Return the complete daily pipeline as a multi-statement script."""
     steps = [
-        "-- Step 1: detect all day-over-day transitions (FIXED + BROKEN)",
-        create_transition_log(),
+        "-- Step 1: MERGE today's snapshot from source",
+        daily_snapshot_merge(),
         "",
-        "-- Step 2: build fix episodes (broken → healthy, with optional re-break)",
-        create_fix_episodes(),
+        "-- Step 2: Detect fix transitions (boolean 1→0 and firmware changes)",
+        detect_fixes_merge(),
         "",
-        "-- Step 3: build break episodes (healthy → broken, with optional re-fix)",
-        create_break_episodes(),
+        "-- Step 3: Update open episode durations",
+        update_open_episodes(),
         "",
-        "-- Step 4: daily tracker (fixes and breaks per day)",
+        "-- Step 4: Allocate profit to episodes",
+        allocate_profit(),
+        "",
+        "-- Step 5: Refresh daily tracker",
         refresh_daily_tracker(),
         "",
-        "-- Step 5: single-row summary",
+        "-- Step 6: Refresh summary KPIs",
         refresh_summary(),
     ]
     return "\n\n".join(steps)
