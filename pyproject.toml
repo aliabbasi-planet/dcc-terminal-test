@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Planet" }]
-keywords = ["dcc", "payments", "sql-server", "streamlit", "qa"]
+keywords = ["dcc", "payments", "sql-server", "snowflake", "streamlit", "qa"]
 
 dependencies = [
     "streamlit==1.40.2",
@@ -29,6 +29,7 @@ dev = [
 
 [project.scripts]
 dcc-console = "dcc_console.__main__:main"
+dcc-health-tracker = "dcc_health_tracker.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -49,3 +50,5 @@ ignore = ["S101"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106"]
+"src/dcc_health_tracker/pipeline.py" = ["S608"]
+"src/dcc_health_tracker/queries.py" = ["S608"]
