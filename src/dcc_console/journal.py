@@ -53,11 +53,19 @@ _PURGE_DAYS = 30
 
 
 class RestoreJournal:
-    """ACID-safe restore point storage backed by SQLite."""
+    """ACID-safe restore point storage backed by SQLite.
+
+    Uses ``check_same_thread=False`` because Streamlit runs callbacks on
+    multiple threads.  WAL mode makes concurrent reads safe.
+    """
 
     def __init__(self) -> None:
         _JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(_JOURNAL_DB), isolation_level="DEFERRED")
+        self._conn = sqlite3.connect(
+            str(_JOURNAL_DB),
+            isolation_level="DEFERRED",
+            check_same_thread=False,
+        )
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
