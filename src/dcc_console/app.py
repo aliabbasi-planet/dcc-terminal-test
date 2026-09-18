@@ -9,6 +9,7 @@ import streamlit as st
 from dcc_console.config import ENVIRONMENTS, PROCEDURE
 from dcc_console.state import init_state
 from dcc_console.ui import (
+    render_broken_terminals,
     render_campaign,
     render_connection,
     render_mode,
@@ -57,13 +58,15 @@ def main() -> None:
     st.divider()
     render_terminals()
     st.divider()
-    test_tab, campaign_tab = st.tabs(["Single test", "Campaigns"])
+    test_tab, campaign_tab, broken_tab = st.tabs(["Single test", "Campaigns", "Broken Terminals"])
     with test_tab:
         render_test(simulation, confirmed and ready)
         st.divider()
         render_results()
     with campaign_tab:
         render_campaign(simulation, confirmed and ready)
+    with broken_tab:
+        render_broken_terminals()
 
 
 if __name__ == "__main__":

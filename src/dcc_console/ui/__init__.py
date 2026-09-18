@@ -1,6 +1,7 @@
 """Streamlit UI components."""
 
 from .sections import (
+    render_broken_terminals,
     render_campaign,
     render_mode,
     render_readiness,
@@ -13,6 +14,7 @@ from .sidebar import render_connection
 
 __all__ = [
     "render_connection",
+    "render_broken_terminals",
     "render_campaign",
     "render_mode",
     "render_readiness",

@@ -9,6 +9,7 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
+from ..broken import broken_summary, compute_broken_flags, find_broken_terminals, HANDLER_FLAGS
 from ..campaign import campaign_markdown, campaign_results, campaign_summary, campaign_tests
 from ..catalog import TEST_CATALOG, TEST_KEYS
 from ..config import ENVIRONMENTS
@@ -1001,6 +1002,131 @@ def render_results() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Broken terminal finder
+# ---------------------------------------------------------------------------
+
+
+def render_broken_terminals() -> None:
+    """Tab for finding terminals with broken DCC handler flags."""
+    st.subheader("Broken Terminal Finder")
+    st.caption(
+        "Scans the connected database for terminals with disabled or missing DCC handler "
+        "flags. Use this to identify terminals that need campaign fixes."
+    )
+
+    if not st.session_state.db_connected:
+        st.info("Connect to an environment first.")
+        return
+
+    c1, c2 = st.columns(2)
+    only_active = c1.checkbox("Only active terminals (online + DCC-enabled locations)", value=True)
+    limit = c2.number_input("Max terminals to scan", min_value=100, max_value=10000, value=2000)
+
+    if st.button("🔍 Scan for broken terminals", type="primary", use_container_width=True):
+        with st.spinner("Querying handler flags from package_config XML..."):
+            raw = find_broken_terminals(connection(), only_active=only_active, limit=int(limit))
+            st.session_state["broken_scan"] = compute_broken_flags(raw)
+        st.rerun()
+
+    df = st.session_state.get("broken_scan")
+    if df is None:
+        st.info("Click **Scan** to query the connected database for broken terminals.")
+        return
+    if df.empty:
+        st.success("No terminals found matching the filter criteria.")
+        return
+
+    summary = broken_summary(df)
+    broken_df = df[df["broken_flag_count"] > 0]
+
+    with st.container(border=True):
+        cols = st.columns(4)
+        cols[0].metric("Total scanned", f"{summary['total_terminals']:,}")
+        cols[1].metric("Broken", f"{summary['broken_terminals']:,}")
+        cols[2].metric("Healthy", f"{summary['healthy_terminals']:,}")
+        pct = (
+            round(summary["broken_terminals"] / summary["total_terminals"] * 100, 1)
+            if summary["total_terminals"] > 0 else 0
+        )
+        cols[3].metric("Broken %", f"{pct}%")
+
+    st.subheader("Broken flags breakdown")
+    flag_cols = st.columns(len(summary["by_flag"]) or 1)
+    for idx, (flag, count) in enumerate(
+        sorted(summary["by_flag"].items(), key=lambda x: -x[1])
+    ):
+        flag_cols[idx % len(flag_cols)].metric(flag, f"{count:,}")
+
+    st.divider()
+    st.subheader(f"Broken terminals ({len(broken_df):,})")
+
+    # Filter
+    filter_cols = st.columns(3)
+    flag_filter = filter_cols[0].multiselect(
+        "Filter by broken flag",
+        [label for _, label in HANDLER_FLAGS],
+        key="broken-flag-filter",
+    )
+    if "location_name" in broken_df.columns:
+        loc_filter = filter_cols[1].multiselect(
+            "Location",
+            sorted(broken_df["location_name"].dropna().unique()),
+            key="broken-loc-filter",
+        )
+    else:
+        loc_filter = []
+    model_filter = []
+    if "terminal_model" in broken_df.columns:
+        model_filter = filter_cols[2].multiselect(
+            "Terminal model",
+            sorted(broken_df["terminal_model"].dropna().unique()),
+            key="broken-model-filter",
+        )
+
+    filtered = broken_df.copy()
+    if flag_filter:
+        mask = filtered[[f"{f}_broken" for f in flag_filter if f"{f}_broken" in filtered]].any(
+            axis=1
+        )
+        filtered = filtered[mask]
+    if loc_filter and "location_name" in filtered.columns:
+        filtered = filtered[filtered["location_name"].isin(loc_filter)]
+    if model_filter and "terminal_model" in filtered.columns:
+        filtered = filtered[filtered["terminal_model"].isin(model_filter)]
+
+    display_cols = [
+        c for c in [
+            "terminal_identifier", "instance_identifier", "location_no",
+            "location_name", "terminal_model", "firmware_version",
+            "broken_flag_count",
+        ] + [f"{label}_broken" for _, label in HANDLER_FLAGS]
+        if c in filtered.columns
+    ]
+    col_config = {}
+    for _, label in HANDLER_FLAGS:
+        col = f"{label}_broken"
+        if col in filtered.columns:
+            col_config[col] = st.column_config.CheckboxColumn(label)
+
+    st.dataframe(
+        filtered[display_cols].sort_values("broken_flag_count", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        height=500,
+        column_config=col_config,
+    )
+
+    st.download_button(
+        "📥 Download broken terminals as CSV",
+        data=filtered[display_cols].to_csv(index=False).encode("utf-8"),
+        file_name=f"dcc_broken_terminals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        type="primary",
+        use_container_width=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Disaster recovery — restore journal
 # ---------------------------------------------------------------------------
 
@@ -1076,6 +1202,7 @@ __all__ = [
     "render_campaign",
     "render_test",
     "render_results",
+    "render_broken_terminals",
     "render_recovery_banner",
     "ENVIRONMENTS",
 ]
