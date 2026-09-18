@@ -23,6 +23,52 @@ from fpdf import FPDF
 from .execution import TestResult
 from .report import cab_report
 
+# Unicode symbols used in the report → ASCII-safe replacements for Latin-1 fonts.
+_UNICODE_REPLACEMENTS = {
+    "\u2014": "--",      # em dash
+    "\u2013": "-",       # en dash
+    "\u2018": "'",       # left single quote
+    "\u2019": "'",       # right single quote
+    "\u201c": '"',       # left double quote
+    "\u201d": '"',       # right double quote
+    "\u2026": "...",     # ellipsis
+    "\u2192": "->",      # right arrow
+    "\u2190": "<-",      # left arrow
+    "\u2260": "!=",      # not equal
+    "\u2264": "<=",      # less than or equal
+    "\u2265": ">=",      # greater than or equal
+    "\u2713": "[v]",     # check mark
+    "\u2714": "[v]",     # heavy check mark
+    "\u2715": "[x]",     # cross mark
+    "\u2716": "[x]",     # heavy cross mark
+    "\u2717": "[x]",     # ballot x
+    "\u2718": "[x]",     # heavy ballot x
+    "\u2022": "*",       # bullet
+    "\u00b7": "*",       # middle dot
+    "\u2605": "*",       # star
+    "\u2606": "*",       # white star
+    "\u2610": "[ ]",     # ballot box
+    "\u2611": "[v]",     # ballot box with check
+    "\u2612": "[x]",     # ballot box with X
+    "\u2705": "[OK]",    # white heavy check mark
+    "\u274c": "[FAIL]",  # cross mark
+    "\u26d4": "[BLOCK]", # no entry
+    "\ud83d\udfe2": "[OK]",    # green circle
+    "\ud83d\udd34": "[FAIL]",  # red circle
+    "\ud83d\udfe1": "[REVIEW]", # yellow circle
+    "\ud83d\udfe0": "[!]",     # orange circle
+    "\u26a0": "[!]",     # warning sign
+    "\u2139": "[i]",     # information
+}
+
+
+def _sanitize(text: str) -> str:
+    """Replace Unicode symbols with ASCII equivalents for Latin-1 fonts."""
+    for char, replacement in _UNICODE_REPLACEMENTS.items():
+        text = text.replace(char, replacement)
+    # Catch any remaining non-Latin-1 characters
+    return text.encode("latin-1", "replace").decode("latin-1")
+
 
 class _CabPDF(FPDF):
     """Custom PDF with header/footer for the CAB report."""
@@ -36,7 +82,7 @@ class _CabPDF(FPDF):
     def header(self) -> None:
         self.set_font("Helvetica", "B", 9)
         self.set_text_color(100, 100, 100)
-        env = self._meta.get("environment", "?")
+        env = _sanitize(self._meta.get("environment", "?"))
         self.cell(0, 6, f"DCC Enablement Configuration - CAB Report [{env}]", align="L")
         self.cell(0, 6, f"SHA-256: {self._content_hash[:16]}...", align="R", new_x="LMARGIN", new_y="NEXT")
         self.line(10, self.get_y(), 200, self.get_y())
@@ -57,7 +103,7 @@ class _CabPDF(FPDF):
 def _render_markdown_to_pdf(pdf: _CabPDF, markdown: str) -> None:
     """Simple Markdown-to-PDF renderer for the structured CAB report."""
     for line in markdown.split("\n"):
-        stripped = line.strip()
+        stripped = _sanitize(line.strip())
 
         # Headings
         if stripped.startswith("# ") and not stripped.startswith("## "):
@@ -181,8 +227,10 @@ def generate_cab_pdf(
 
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(60, 60, 60)
-    pdf.cell(0, 6, f"Environment: {meta.get('environment', '?')}    Server: {meta.get('server', '?')}", align="C", new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, f"Generated: {meta.get('generated_at', '?')}    Login: {meta.get('login', '?')}", align="C", new_x="LMARGIN", new_y="NEXT")
+    env_line = _sanitize(f"Environment: {meta.get('environment', '?')}    Server: {meta.get('server', '?')}")
+    login_line = _sanitize(f"Generated: {meta.get('generated_at', '?')}    Login: {meta.get('login', '?')}")
+    pdf.cell(0, 6, env_line, align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, login_line, align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
 
     # Integrity box
