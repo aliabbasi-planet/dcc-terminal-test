@@ -490,11 +490,66 @@ def _section_d(positives: list[TestResult], meta: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Section E — rollback evidence (CAB Issue #6)
+# ---------------------------------------------------------------------------
+
+
+def _section_e(rollback_evidence: list) -> list[str]:
+    """Dedicated rollback cycle evidence: before → change applied → restored."""
+    lines = [
+        "",
+        "## Section E — Rollback evidence",
+        "",
+        "Proves the console can apply a live change and fully reverse it. Each test below ran "
+        "in LIVE mode (committed), captured the changed state, then executed a compensating "
+        "rollback, and finally verified the original value was restored.",
+    ]
+    if not rollback_evidence:
+        lines += [
+            "",
+            "_No rollback evidence tests were run. Use the 'Rollback evidence test' button "
+            "in the campaign or single-test UI to generate this section._",
+        ]
+        return lines
+
+    for idx, ev in enumerate(rollback_evidence, start=1):
+        proven = "PROVEN" if ev.full_cycle_proven else "NOT PROVEN"
+        lines += [
+            "",
+            f"### E{idx}. {ev.test_key} — Rollback cycle: **{proven}**",
+            "",
+            f"- **Target**: `{ev.target}`",
+            f"- **Environment**: {ev.environment}",
+            "",
+            "| Stage | Verified column value |",
+            "| --- | --- |",
+            f"| 1. Before (original) | {_cell(_clip(ev.state_before, 300))} |",
+            f"| 2. After live apply | {_cell(_clip(ev.state_after_apply, 300))} |",
+            f"| 3. After rollback | {_cell(_clip(ev.state_after_rollback, 300))} |",
+            "",
+            f"- **Change detected (step 1 ≠ step 2)**: {_yes_no(ev.change_detected)}",
+            f"- **Rollback successful**: {_yes_no(ev.rollback_successful)}",
+            f"- **Full cycle proven (step 1 == step 3)**: {_yes_no(ev.full_cycle_proven)}",
+        ]
+        if ev.full_cycle_proven:
+            lines.append(
+                "  The original value was restored exactly — the rollback mechanism is verified."
+            )
+        elif ev.error:
+            lines.append(f"  **Note**: {ev.error}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
 
 
-def cab_report(results: list[TestResult], meta: dict | None = None) -> str:
+def cab_report(
+    results: list[TestResult],
+    meta: dict | None = None,
+    rollback_evidence: list | None = None,
+) -> str:
     """Render the full CAB report as Markdown from a list of results."""
     meta = meta or {}
     positives = [r for r in results if not r.is_negative]
@@ -508,6 +563,8 @@ def cab_report(results: list[TestResult], meta: dict | None = None) -> str:
     lines += _section_b(positives)
     lines += _section_c(negatives)
     lines += _section_d(positives, meta)
+    lines += _section_e(rollback_evidence or [])
+    lines += _integrity_footer(meta)
     lines += [
         "",
         "---",
@@ -518,4 +575,45 @@ def cab_report(results: list[TestResult], meta: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["cab_report"]
+def _integrity_footer(meta: dict) -> list[str]:
+    """Append a report integrity hash so the content can be verified."""
+    import hashlib
+
+    content_hash = meta.get("content_hash")
+    if not content_hash:
+        return []
+    return [
+        "",
+        "## Report integrity",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        f"| Content SHA-256 | `{content_hash}` |",
+        f"| Environment | {meta.get('environment', '?')} |",
+        f"| Generated at | {meta.get('generated_at', '?')} |",
+        "",
+        "To verify this report was not modified, re-generate it from the same session data "
+        "and confirm the SHA-256 digest matches. The signed PDF version embeds this hash in "
+        "the document metadata for tamper detection.",
+    ]
+
+
+def cab_report_with_hash(
+    results: list[TestResult],
+    meta: dict | None = None,
+    rollback_evidence: list | None = None,
+) -> tuple[str, str]:
+    """Generate the CAB report and return (report_markdown, content_sha256)."""
+    import hashlib
+
+    meta = meta or {}
+    # First pass without hash to compute content
+    report = cab_report(results, meta, rollback_evidence)
+    content_hash = hashlib.sha256(report.encode("utf-8")).hexdigest()
+    # Second pass with hash embedded
+    meta["content_hash"] = content_hash
+    report = cab_report(results, meta, rollback_evidence)
+    return report, content_hash
+
+
+__all__ = ["cab_report", "cab_report_with_hash"]

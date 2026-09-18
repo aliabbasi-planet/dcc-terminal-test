@@ -303,3 +303,105 @@ def apply_rollback(
         result.change_persisted = result.state_after != result.restore_point
         result.transaction = f"COMMITTED then {trigger.upper()} ROLLED BACK"
     return outcome
+
+
+@dataclass
+class RollbackEvidenceResult:
+    """Full before→change→restore cycle for CAB Issue #6."""
+
+    test_key: str
+    target: str
+    environment: str
+    state_before: object
+    state_after_apply: object
+    state_after_rollback: object
+    change_detected: bool
+    rollback_successful: bool
+    full_cycle_proven: bool
+    live_result: TestResult
+    rollback_outcome: RollbackOutcome | None
+    error: str | None = None
+
+    def export(self) -> dict:
+        return {
+            "test_key": self.test_key,
+            "target": self.target,
+            "environment": self.environment,
+            "state_before": str(self.state_before)[:500] if self.state_before else None,
+            "state_after_apply": str(self.state_after_apply)[:500] if self.state_after_apply else None,
+            "state_after_rollback": (
+                str(self.state_after_rollback)[:500] if self.state_after_rollback else None
+            ),
+            "change_detected": self.change_detected,
+            "rollback_successful": self.rollback_successful,
+            "full_cycle_proven": self.full_cycle_proven,
+            "error": self.error,
+        }
+
+
+def run_rollback_evidence_test(
+    connection: DatabaseConnection,
+    definition: TestDefinition,
+    target_identifier: str,
+    config_value: str,
+    environment: str,
+    login: str,
+) -> RollbackEvidenceResult:
+    """Run a live apply + manual rollback to prove the full cycle for CAB.
+
+    Sequence:
+        1. Read state BEFORE
+        2. Execute procedure in LIVE mode (commits)
+        3. Read state AFTER APPLY
+        4. Immediately rollback (compensating UPDATE)
+        5. Read state AFTER ROLLBACK
+        6. Verify: before == after_rollback (full cycle proven)
+    """
+    # Step 1: capture before
+    state_before = read_state(connection, definition, target_identifier)
+
+    # Step 2: run live (commits)
+    live_result = run_test(
+        connection, definition, target_identifier, config_value,
+        simulation=False, environment=environment, login=login,
+    )
+    state_after_apply = live_result.state_after
+    change_detected = live_result.change_persisted
+
+    # Step 3: rollback if change was applied
+    rollback_outcome: RollbackOutcome | None = None
+    error: str | None = live_result.error
+    if change_detected and live_result.can_rollback:
+        rollback_outcome = apply_rollback(connection, definition, live_result, trigger="evidence")
+        state_after_rollback = read_state(connection, definition, target_identifier)
+    elif not change_detected and not error:
+        state_after_rollback = state_after_apply
+        error = "Procedure did not change the verified column — rollback not needed."
+    else:
+        state_after_rollback = read_state(connection, definition, target_identifier)
+
+    rollback_successful = (
+        rollback_outcome is not None and rollback_outcome.ok
+    ) if rollback_outcome else False
+    full_cycle = (
+        state_before is not None
+        and state_after_apply is not None
+        and state_after_rollback is not None
+        and str(state_before) == str(state_after_rollback)
+        and change_detected
+    )
+
+    return RollbackEvidenceResult(
+        test_key=definition.key,
+        target=target_identifier,
+        environment=environment,
+        state_before=state_before,
+        state_after_apply=state_after_apply,
+        state_after_rollback=state_after_rollback,
+        change_detected=change_detected,
+        rollback_successful=rollback_successful,
+        full_cycle_proven=full_cycle,
+        live_result=live_result,
+        rollback_outcome=rollback_outcome,
+        error=error,
+    )
