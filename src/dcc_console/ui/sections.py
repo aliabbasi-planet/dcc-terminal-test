@@ -15,9 +15,10 @@ from ..config import ENVIRONMENTS
 from ..coverage import compute_coverage, coverage_totals
 from ..execution import TestResult, apply_rollback, build_call, run_test
 from ..negatives import NegativeCase, default_negative_cases, run_negative, run_negative_battery
+from ..pdf_report import generate_cab_pdf
 from ..readiness import all_passed, capture_procedure_version, grant_script, run_readiness
 from ..reference import load_instances, load_locations, load_terminals
-from ..report import cab_report
+from ..report import cab_report_with_hash
 from ..state import add_result, connection, results
 
 STATUS_BADGES = {"PASS": "🟢", "FAIL": "🔴", "REVIEW": "🟡", "BLOCKED": "⛔"}
@@ -78,6 +79,8 @@ def _session_history_markdown() -> str:
 
 def _cab_meta(all_results: list[TestResult]) -> dict:
     """Assemble the header metadata block for the CAB report."""
+    from datetime import timezone
+
     conn = st.session_state.connection
     mode = "LIVE" if any(result.is_live for result in all_results) else "SIMULATION"
     return {
@@ -87,6 +90,7 @@ def _cab_meta(all_results: list[TestResult]) -> dict:
         "login": st.session_state.connected_login or "?",
         "mode": mode,
         "procedure_version": st.session_state.get("procedure_version"),
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
@@ -663,17 +667,32 @@ def _render_campaign_report(campaign: dict) -> None:
     )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    actions = st.columns(3)
+    meta = _cab_meta(entries)
+    cab_md, content_hash = cab_report_with_hash(entries, meta)
+    actions = st.columns(4)
     actions[0].download_button(
         "📋 CAB report (Markdown)",
-        data=cab_report(entries, _cab_meta(entries)),
+        data=cab_md,
         file_name=f"dcc_cab_campaign_{stamp}.md",
         mime="text/markdown",
         use_container_width=True,
         type="primary",
         key=f"campaign-cab-{campaign_id}",
     )
-    actions[1].download_button(
+    try:
+        pdf_bytes, _ = generate_cab_pdf(entries, meta)
+        actions[1].download_button(
+            "📕 CAB report (Signed PDF)",
+            data=pdf_bytes,
+            file_name=f"dcc_cab_campaign_{stamp}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            type="primary",
+            key=f"campaign-pdf-{campaign_id}",
+        )
+    except Exception as pdf_err:
+        actions[1].warning(f"PDF generation failed: {pdf_err}")
+    actions[2].download_button(
         "📄 Campaign report (Markdown)",
         data=campaign_markdown(campaign["name"], entries),
         file_name=f"dcc_campaign_{stamp}.md",
@@ -681,7 +700,7 @@ def _render_campaign_report(campaign: dict) -> None:
         use_container_width=True,
         key=f"campaign-md-{campaign_id}",
     )
-    actions[2].download_button(
+    actions[3].download_button(
         "📥 Campaign results (JSON)",
         data=json.dumps([result.export() for result in entries], indent=2, default=str),
         file_name=f"dcc_campaign_{stamp}.json",
@@ -689,6 +708,7 @@ def _render_campaign_report(campaign: dict) -> None:
         use_container_width=True,
         key=f"campaign-json-{campaign_id}",
     )
+    st.caption(f"Report integrity SHA-256: `{content_hash}`")
 
     st.markdown("**↩️ Campaign rollback**")
     outstanding = [result for result in entries if result.can_rollback]
@@ -873,14 +893,30 @@ def _render_cab_report_download(all_results: list[TestResult], stamp: str) -> No
             "NOT TESTED in the coverage matrix until you run them."
         )
 
-    st.download_button(
-        "📄 Download CAB validation report (Markdown)",
-        data=cab_report(all_results, _cab_meta(all_results)),
+    meta = _cab_meta(all_results)
+    cab_md, content_hash = cab_report_with_hash(all_results, meta)
+    dl_cols = st.columns(2)
+    dl_cols[0].download_button(
+        "📄 Download CAB report (Markdown)",
+        data=cab_md,
         file_name=f"dcc_cab_report_{stamp}.md",
         mime="text/markdown",
         use_container_width=True,
         type="primary",
     )
+    try:
+        pdf_bytes, _ = generate_cab_pdf(all_results, meta)
+        dl_cols[1].download_button(
+            "📕 Download CAB report (Signed PDF)",
+            data=pdf_bytes,
+            file_name=f"dcc_cab_report_{stamp}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            type="primary",
+        )
+    except Exception as pdf_err:
+        dl_cols[1].warning(f"PDF generation failed: {pdf_err}")
+    st.caption(f"Report integrity SHA-256: `{content_hash}`")
 
 
 def render_results() -> None:
