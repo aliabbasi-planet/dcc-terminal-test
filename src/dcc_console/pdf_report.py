@@ -100,6 +100,19 @@ class _CabPDF(FPDF):
         )
 
 
+def _safe_cell(pdf: _CabPDF, height: float, text: str) -> None:
+    """Write text via multi_cell, truncating if it would overflow the page width."""
+    usable = pdf.w - pdf.l_margin - pdf.r_margin - (pdf.x - pdf.l_margin)
+    if usable < 10:
+        pdf.set_x(pdf.l_margin)
+        usable = pdf.w - pdf.l_margin - pdf.r_margin
+    # Truncate text that would still overflow at the smallest font size
+    max_chars = int(usable / (pdf.font_size * 0.25))
+    if len(text) > max_chars > 0:
+        text = text[:max_chars] + "..."
+    pdf.multi_cell(0, height, text)
+
+
 def _render_markdown_to_pdf(pdf: _CabPDF, markdown: str) -> None:
     """Simple Markdown-to-PDF renderer for the structured CAB report."""
     for line in markdown.split("\n"):
@@ -110,48 +123,47 @@ def _render_markdown_to_pdf(pdf: _CabPDF, markdown: str) -> None:
             pdf.set_font("Helvetica", "B", 16)
             pdf.set_text_color(0, 0, 0)
             pdf.ln(4)
-            pdf.multi_cell(0, 8, stripped.lstrip("# "))
+            _safe_cell(pdf, 8, stripped.lstrip("# "))
             pdf.ln(2)
         elif stripped.startswith("## "):
             pdf.set_font("Helvetica", "B", 12)
             pdf.set_text_color(30, 60, 120)
             pdf.ln(3)
-            pdf.multi_cell(0, 7, stripped.lstrip("# "))
+            _safe_cell(pdf, 7, stripped.lstrip("# "))
             pdf.ln(1)
         elif stripped.startswith("### "):
             pdf.set_font("Helvetica", "B", 10)
             pdf.set_text_color(50, 50, 50)
             pdf.ln(2)
-            pdf.multi_cell(0, 6, stripped.lstrip("# "))
+            _safe_cell(pdf, 6, stripped.lstrip("# "))
             pdf.ln(1)
 
         # Table rows
         elif stripped.startswith("|") and "---" not in stripped:
-            pdf.set_font("Courier", "", 7)
+            pdf.set_font("Courier", "", 6)
             pdf.set_text_color(0, 0, 0)
             text = stripped.replace("\\|", "|")
-            pdf.multi_cell(0, 4, text)
+            _safe_cell(pdf, 3.5, text)
 
         # Code blocks
         elif stripped.startswith("```"):
             pass  # skip fences
         elif stripped.startswith("EXEC ") or stripped.startswith("SELECT "):
-            pdf.set_font("Courier", "", 7)
+            pdf.set_font("Courier", "", 6)
             pdf.set_text_color(0, 80, 0)
-            pdf.multi_cell(0, 4, stripped)
+            _safe_cell(pdf, 3.5, stripped)
 
         # Blockquotes
         elif stripped.startswith(">"):
             pdf.set_font("Helvetica", "I", 8)
             pdf.set_text_color(80, 80, 80)
-            pdf.multi_cell(0, 5, stripped.lstrip("> "))
+            _safe_cell(pdf, 5, stripped.lstrip("> "))
 
         # Bullet points
         elif stripped.startswith("- "):
             pdf.set_font("Helvetica", "", 8)
             pdf.set_text_color(0, 0, 0)
-            pdf.cell(5)
-            pdf.multi_cell(0, 5, f"  {stripped}")
+            _safe_cell(pdf, 5, f"  {stripped}")
 
         # Horizontal rule
         elif stripped == "---":
@@ -164,19 +176,19 @@ def _render_markdown_to_pdf(pdf: _CabPDF, markdown: str) -> None:
         elif stripped.startswith("_") and stripped.endswith("_"):
             pdf.set_font("Helvetica", "I", 8)
             pdf.set_text_color(100, 100, 100)
-            pdf.multi_cell(0, 5, stripped.strip("_"))
+            _safe_cell(pdf, 5, stripped.strip("_"))
 
         # Bold text
         elif stripped.startswith("**") and stripped.endswith("**"):
             pdf.set_font("Helvetica", "B", 9)
             pdf.set_text_color(0, 0, 0)
-            pdf.multi_cell(0, 5, stripped.strip("*"))
+            _safe_cell(pdf, 5, stripped.strip("*"))
 
         # Regular text
         elif stripped:
             pdf.set_font("Helvetica", "", 8)
             pdf.set_text_color(0, 0, 0)
-            pdf.multi_cell(0, 5, stripped)
+            _safe_cell(pdf, 5, stripped)
 
         # Empty lines
         else:
