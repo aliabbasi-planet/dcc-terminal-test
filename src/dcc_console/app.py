@@ -13,6 +13,7 @@ from dcc_console.ui import (
     render_connection,
     render_mode,
     render_readiness,
+    render_recovery_banner,
     render_results,
     render_terminals,
     render_test,
@@ -31,6 +32,7 @@ def main() -> None:
     init_state()
 
     st.title("🧪 DCC Enablement Configuration — Test Console")
+    render_recovery_banner()
     render_connection()
 
     if not st.session_state.db_connected:

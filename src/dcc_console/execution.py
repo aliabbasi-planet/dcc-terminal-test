@@ -11,7 +11,8 @@ import pandas as pd
 from .catalog import TestDefinition
 from .config import PROCEDURE
 from .database import DatabaseConnection
-from .rollback import RollbackOutcome, read_state, restore_state
+from .journal import get_journal
+from .rollback import RollbackOutcome, read_state, restore_state, restore_statement
 
 PERMISSION_DENIED_MARKER = "EXECUTE permission was denied"
 
@@ -50,6 +51,7 @@ class TestResult:
     proc_args: tuple[str, ...] = ()
     proposed_change_observed: bool = False
     is_negative: bool = False
+    journal_id: int | None = None
 
     @property
     def is_live(self) -> bool:
@@ -221,6 +223,25 @@ def run_test(
     grids: list[pd.DataFrame] = []
     messages: list[str] = []
     rollback_log: list[dict] = []
+    journal_id: int | None = None
+
+    # Write restore point to journal BEFORE live execution on UAT/PROD.
+    journal = get_journal()
+    if not simulation and journal.is_journaled(environment):
+        journal_id = journal.record_restore_point(
+            environment=environment,
+            server=connection.server,
+            database_name=connection.database,
+            login=login,
+            test_key=definition.key,
+            bit=definition.bit,
+            target_type=definition.target,
+            target=target_identifier,
+            config_value=config_value,
+            original_value=before,
+            restore_sql=restore_statement(definition),
+            campaign_id=campaign_id,
+        )
 
     try:
         output = connection.call_procedure(sql, params, rollback=simulation)
@@ -254,6 +275,13 @@ def run_test(
     else:
         transaction = "COMMITTED"
 
+    # Update journal: mark resolved if auto-rolled back or no change.
+    if journal_id is not None:
+        if not persisted:
+            journal.mark_not_needed(journal_id)
+        elif any(e.get("trigger") == "automatic" and e.get("ok") for e in rollback_log):
+            journal.mark_resolved(journal_id)
+
     return TestResult(
         id=f"{definition.bit}-{started.strftime('%H%M%S%f')}",
         test_key=definition.key,
@@ -283,6 +311,7 @@ def run_test(
         params=list(params),
         proc_args=definition.proc_args,
         proposed_change_observed=proposed_change_observed,
+        journal_id=journal_id,
     )
 
 
@@ -302,6 +331,8 @@ def apply_rollback(
         result.state_after = read_state(connection, definition, result.target)
         result.change_persisted = result.state_after != result.restore_point
         result.transaction = f"COMMITTED then {trigger.upper()} ROLLED BACK"
+        if result.journal_id is not None:
+            get_journal().mark_resolved(result.journal_id)
     return outcome
 
 

@@ -1000,6 +1000,75 @@ def render_results() -> None:
         st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# Disaster recovery — restore journal
+# ---------------------------------------------------------------------------
+
+
+def render_recovery_banner() -> None:
+    """Show a warning banner if there are PENDING journal entries from a crash."""
+    from ..journal import get_journal
+
+    journal = get_journal()
+    pending = journal.pending_entries()
+    if not pending:
+        return
+
+    envs = sorted({e["environment"] for e in pending})
+    st.error(
+        f"**Crash recovery**: {len(pending)} uncommitted live change(s) found "
+        f"in {', '.join(envs)}. These changes were committed to the database but "
+        "never rolled back because the app crashed. Connect to the affected "
+        "environment and use the recovery panel below to restore original values."
+    )
+    with st.expander(f"View {len(pending)} pending restore point(s)", expanded=True):
+        for entry in pending:
+            c1, c2, c3, c4 = st.columns([2, 2, 3, 1])
+            c1.markdown(f"**{entry['environment']}** · `{entry['target']}`")
+            c2.markdown(f"{entry['test_key']}")
+            c3.code(f"Original: {str(entry['original_value'])[:80]}", language=None)
+            if c4.button("↩️ Restore", key=f"recover-{entry['id']}"):
+                _recover_entry(entry)
+
+        if st.button(
+            "↩️ Restore ALL pending entries",
+            type="primary",
+            use_container_width=True,
+            key="recover-all",
+        ):
+            for entry in pending:
+                _recover_entry(entry)
+
+
+def _recover_entry(entry: dict) -> None:
+    """Execute the restore SQL from a journal entry."""
+    from ..journal import get_journal
+
+    conn = st.session_state.get("connection")
+    if conn is None or not hasattr(conn, "execute_write"):
+        st.warning(
+            f"Connect to {entry['environment']} ({entry['server']}/{entry['database_name']}) "
+            "first, then retry the recovery."
+        )
+        return
+
+    current_env = st.session_state.get("connected_env", "")
+    if current_env.upper() != entry["environment"].upper():
+        st.warning(
+            f"You are connected to {current_env} but this entry is for "
+            f"{entry['environment']}. Switch environments first."
+        )
+        return
+
+    try:
+        conn.execute_write(entry["restore_sql"], (entry["original_value"], entry["target"]))
+        get_journal().mark_resolved(entry["id"])
+        st.success(f"Restored {entry['target']} ({entry['test_key']})")
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Recovery failed for {entry['target']}: {exc}")
+
+
 __all__ = [
     "render_readiness",
     "render_mode",
@@ -1007,5 +1076,6 @@ __all__ = [
     "render_campaign",
     "render_test",
     "render_results",
+    "render_recovery_banner",
     "ENVIRONMENTS",
 ]
