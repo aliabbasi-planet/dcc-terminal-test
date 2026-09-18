@@ -255,7 +255,7 @@ def generate_cab_pdf(
     # Render the full markdown report
     _render_markdown_to_pdf(pdf, markdown)
 
-    pdf_bytes = pdf.output()
+    pdf_bytes = bytes(pdf.output())
     if output_path:
         Path(output_path).write_bytes(pdf_bytes)
 
