@@ -30,7 +30,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
 
 from .execution import TestResult
 from .report import cab_report
@@ -90,8 +90,27 @@ def _emit_run(paragraph, text: str, bold: bool, code: bool) -> None:
         run.font.size = Pt(9)
 
 
+def _add_markdown_text(paragraph, text: str) -> None:
+    """Render inline text, treating a wholly ``_..._`` span as italic.
+
+    Underscores are only treated as italic markers when they wrap the ENTIRE
+    string, so identifiers such as ``extra_config`` are never mangled.
+    """
+    if len(text) > 2 and text.startswith("_") and text.endswith("_"):
+        _add_rich_runs(paragraph, text[1:-1])
+        for run in paragraph.runs:
+            run.italic = True
+        return
+    _add_rich_runs(paragraph, text)
+
+
 def _unescape_cell(text: str) -> str:
-    return text.replace("\\|", "|").replace("`", "").strip()
+    value = text.replace("\\|", "|").replace("`", "").strip()
+    # A wholly italic cell (e.g. "_None._") should not show its markers. Only strip
+    # when BOTH ends are underscores, so identifiers like extra_config are untouched.
+    if len(value) > 2 and value.startswith("_") and value.endswith("_"):
+        value = value[1:-1]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +155,16 @@ def _parse_table_row(line: str) -> list[str]:
     return [_unescape_cell(c) for c in cells]
 
 
+def _rich_heading(document, text: str, level: int) -> None:
+    """Add a heading, honouring inline ``code``/``**bold**`` so markers don't leak.
+
+    Headings such as ``### A1. Bit 8 … — `APPLIED` `` carry backticks; rendering the
+    raw string would print them literally in a document that goes to reviewers.
+    """
+    heading = document.add_heading("", level=level)
+    _add_rich_runs(heading, text)
+
+
 def _render_markdown(document, markdown: str) -> None:
     """Render the canonical CAB Markdown into the Word document."""
     table_rows: list[list[str]] = []
@@ -176,23 +205,24 @@ def _render_markdown(document, markdown: str) -> None:
         if not stripped:
             continue
         if stripped.startswith("# ") and not stripped.startswith("## "):
-            document.add_heading(stripped[2:], level=0)
+            _rich_heading(document, stripped[2:], 0)
         elif stripped.startswith("## "):
-            document.add_heading(stripped[3:], level=1)
+            _rich_heading(document, stripped[3:], 1)
         elif stripped.startswith("### "):
-            document.add_heading(stripped[4:], level=2)
+            _rich_heading(document, stripped[4:], 2)
         elif stripped == "---":
             document.add_paragraph()
+        elif stripped.startswith("> "):
+            # Callout/blockquote: indent it rather than leaking the '>' marker.
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.left_indent = Inches(0.3)
+            _add_markdown_text(paragraph, stripped[2:])
         elif stripped.startswith("- "):
             paragraph = document.add_paragraph(style="List Bullet")
-            _add_rich_runs(paragraph, stripped[2:])
-        elif stripped.startswith("_") and stripped.endswith("_") and len(stripped) > 2:
-            paragraph = document.add_paragraph()
-            run = paragraph.add_run(stripped.strip("_"))
-            run.italic = True
+            _add_markdown_text(paragraph, stripped[2:])
         else:
             paragraph = document.add_paragraph()
-            _add_rich_runs(paragraph, stripped)
+            _add_markdown_text(paragraph, stripped)
 
     flush()
     if in_code:

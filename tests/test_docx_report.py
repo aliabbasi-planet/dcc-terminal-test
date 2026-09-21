@@ -96,3 +96,95 @@ def test_states_honest_integrity_limitation():
     text = "\n".join(p.text for p in doc.paragraphs)
     assert "deterrent" in text
     assert "SHA-256" in text
+
+
+# ---------------------------------------------------------------------------
+# per-step evidence completeness (Bit 8 procedure-managed rollback)
+# ---------------------------------------------------------------------------
+
+_SCRIPT = (
+    "UPDATE [cccintegrang].[handler] SET extra_config = "
+    "'<extra_config config_name=\"dccEnableCompletion\" config_value=\"false\"/>' "
+    "WHERE handler_id = 77"
+)
+
+
+def _all_text(doc: Document) -> str:
+    """Every rendered string: paragraphs plus native table cells."""
+    parts = [p.text for p in doc.paragraphs]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                parts.append(cell.text)
+    return "\n".join(parts)
+
+
+def mk_bit8_live(**overrides) -> TestResult:
+    """A full Bit 8 live run: SP script captured, rolled back, flag verified."""
+    return mk(
+        mode="LIVE", status="PASS", value="dccEnableCompletion",
+        transaction="COMMITTED then MANUAL ROLLED BACK (procedure script)",
+        change_persisted=False,
+        grids=[[{"rollback_script": _SCRIPT, "handler_name": "handler-A"}]],
+        rollback_log=[{"ok": True, "rows": 1, "sql": _SCRIPT, "trigger": "manual",
+                       "error": None, "at": "2026-09-21T20:48:00+00:00"}],
+        sp_rollback_scripts=[_SCRIPT], sp_managed=True,
+        sp_prior_states=[{"handler_name": "handler-A", "flag_value": "false"}],
+        sp_after_states=[{"handler_name": "handler-A", "flag_value": "true"}],
+        sp_restored_states=[{"handler_name": "handler-A", "flag_value": "false"}],
+        sp_flag_verified=True,
+        **overrides,
+    )
+
+
+def test_word_report_contains_every_required_evidence_item():
+    """Guards the Word export against silently dropping any reported step."""
+    data, _ = generate_cab_docx([mk_bit8_live()], dict(META))
+    text = _all_text(_open(data))
+    required = [
+        "Procedure parameters",
+        "Input JSON payload",
+        "Database code exercised",
+        "spApplyDCCEnablementConfiguration",       # 1 - the EXEC issued
+        "Verification read",                        # 2 - verification SELECT
+        "the procedure's OWN returned script",      # 3 - authoritative rollback
+        "UPDATE [cccintegrang].[handler]",          # the SP script text itself
+        "Rollback statements actually executed",    # 4 - what actually ran
+        "Before / applied change / after evidence",
+        "Procedure-managed bit",                    # honesty note
+        "Handler flag verification",                # per-handler proof
+        "After rollback",
+        "Verified:",
+        "handler-A",
+        "Procedure return code",
+        "Rollback verification",
+        "Database message stream",
+        "Procedure trace",
+        "Procedure result set",
+        "SHA-256",
+        "deterrent",
+        "Manual Attachments",
+    ]
+    for needle in required:
+        assert needle in text, f"Word report is missing required evidence: {needle}"
+
+
+def test_word_report_does_not_leak_markdown_markers():
+    """A CAB document must not show raw '>', backticks or '_italics_' markers."""
+    data, _ = generate_cab_docx([mk_bit8_live()], dict(META))
+    paragraphs = [p.text for p in _open(data).paragraphs]
+    assert not [t for t in paragraphs if t.strip().startswith(">")], "blockquote '>' leaked"
+    assert not [t for t in paragraphs if "```" in t], "code fence leaked"
+    assert not [t for t in paragraphs if "`" in t], "backtick leaked"
+    italic = [
+        t for t in paragraphs
+        if len(t.strip()) > 2 and t.strip().startswith("_") and t.strip().endswith("_")
+    ]
+    assert not italic, f"italic markers leaked: {italic[:2]}"
+
+
+def test_underscored_identifiers_survive_rendering():
+    """Italic handling must never mangle names like extra_config."""
+    text = _all_text(_open(generate_cab_docx([mk_bit8_live()], dict(META))[0]))
+    assert "extra_config" in text
+    assert "instance_identifier" in text
