@@ -366,6 +366,9 @@ def _db_code_block(result: TestResult) -> list[str]:
         "```",
     ]
 
+    sp_scripts = getattr(result, "sp_rollback_scripts", []) or []
+    sp_managed = getattr(result, "sp_managed", False)
+
     if definition is not None:
         verify = definition.verify
         read_sql = read_statement(definition)
@@ -379,15 +382,37 @@ def _db_code_block(result: TestResult) -> list[str]:
             f"-- verified column: {verify.table}.{verify.column}",
             read_sql,
             "```",
-            "",
-            "_3 · Compensating rollback statement (restores the captured pre-test value)_",
-            "",
-            "```sql",
-            f"-- bound params: (?1 = pre-test value = {_cell(_clip(result.state_before, 120))}, "
-            f"?2 = {_cell(result.target)})",
-            restore_sql,
-            "```",
         ]
+        if sp_managed:
+            lines += [
+                "",
+                "_3 · Compensating rollback — the procedure's OWN returned script "
+                "(authoritative)_",
+                "",
+                "This is a procedure-managed bit: the change is written to a related table "
+                f"(not `{verify.table}`), so the generic column-restore below does **not** "
+                "revert it. Rollback runs the `rollback_script` the procedure returned:",
+                "",
+                "```sql",
+            ]
+            lines += (sp_scripts or ["-- (no rollback_script captured for this call)"])
+            lines += [
+                "```",
+                "",
+                "_For reference only, the generic column-restore (NOT used for this bit): "
+                f"`{restore_sql}`_",
+            ]
+        else:
+            lines += [
+                "",
+                "_3 · Compensating rollback statement (restores the captured pre-test value)_",
+                "",
+                "```sql",
+                f"-- bound params: (?1 = pre-test value = "
+                f"{_cell(_clip(result.state_before, 120))}, ?2 = {_cell(result.target)})",
+                restore_sql,
+                "```",
+            ]
     else:
         lines += [
             "",
@@ -446,6 +471,16 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         f"| Duration | {result.duration_s}s |",
         "",
     ]
+    if getattr(result, "sp_managed", False):
+        lines += [
+            "> **Procedure-managed bit.** The value above is `[cccintegrang].[instance]."
+            "package_config`, which is **not** the column the procedure edits (the flag lives "
+            "in `[cccintegrang].[handler].extra_config`). So `Change persisted = no` here "
+            "reflects only that unrelated instance column — it does **not** mean the flag was "
+            "unchanged. Whether the change applied, and how it is rolled back, are taken from "
+            "the procedure's own `rollback_script` / result sets shown above.",
+            "",
+        ]
     lines += _return_code_note(result)
     lines += [
         "**Rollback verification**",

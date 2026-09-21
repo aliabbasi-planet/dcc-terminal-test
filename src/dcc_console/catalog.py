@@ -50,6 +50,11 @@ class TestDefinition:
     # A concise note surfaced in the CAB report when the mapping to the procedure
     # is inferred rather than confirmed by the procedure owner.
     assumption: str | None = None
+    # When True, the procedure changes a *related* table (not the `verify` row) and
+    # emits its own compensating `rollback_script`. For these bits the generic
+    # column read is context only; the change and its rollback are judged from the
+    # procedure's own output. See Bit 8 (handler.extra_config).
+    sp_managed: bool = False
 
     @property
     def json_field(self) -> str:
@@ -212,8 +217,9 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             bit=8,
             target="instance",
             summary=(
-                "Sets a single DCC handler flag inside the instance package configuration "
-                "for the selected instance."
+                "Sets a single DCC handler flag for the selected instance. The procedure "
+                "locates the instance's DCC handler and edits the flag inside "
+                "`[cccintegrang].[handler].extra_config`."
             ),
             business_meaning=(
                 "Handler flags switch individual DCC behaviours on an integration instance: "
@@ -223,8 +229,11 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "conversion on a transaction type the acquirer does not settle."
             ),
             mechanism=(
-                "The procedure edits the named boolean inside the instance's `package_config` "
-                "XML and writes the document back."
+                "The procedure resolves the instance's DCC handler row(s) and edits the named "
+                "boolean inside `[cccintegrang].[handler].extra_config`, writing the document "
+                "back. It also emits a `rollback_script` result set — its own compensating "
+                "`UPDATE` for the exact handler row(s) and prior value — which this tool "
+                "captures and uses to roll back (the change is NOT on the instance row)."
             ),
             value_label="Handler flag",
             value_options=(
@@ -242,12 +251,17 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "@Config_value",
                 "@is_simulation",
             ),
+            # NOTE: the flag lives in [cccintegrang].[handler].extra_config, not on the
+            # instance row. The instance.package_config read below is retained only as
+            # displayed context; because sp_managed=True, the change and its rollback are
+            # judged from the procedure's own rollback_script, not this column.
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
                 "instance_identifier",
                 "xml",
             ),
+            sp_managed=True,
             assumption=(
                 "`dccEnableRefund` is treated as a boolean handler flag set to 1, consistent "
                 "with the other dccEnable* flags. `dccFlagsEnabled` is also exercised as a "

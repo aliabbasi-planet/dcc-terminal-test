@@ -94,3 +94,39 @@ def restore_state(
         trigger=trigger,
         error=None if verified else "Update committed but the stored value still differs.",
     )
+
+
+def restore_via_scripts(
+    connection: DatabaseConnection,
+    scripts: list[str],
+    trigger: str,
+) -> RollbackOutcome:
+    """Roll back using the procedure's own returned compensating script(s).
+
+    For sp_managed bits (e.g. Bit 8) the change is on a related table the generic
+    verify column never sees, so the procedure emits its own `rollback_script`.
+    We run those verbatim — they are authored by the trusted procedure, target the
+    correct row(s) and prior value, and require no schema assumptions here.
+
+    Value-level re-verification of the flag is not attempted, because the affected
+    table/key is procedure-owned and varies; success is reported from rows affected.
+    """
+    joined = "\n".join(s for s in scripts if str(s).strip())
+    if not joined:
+        return RollbackOutcome(
+            ok=False, rows=0, sql="", trigger=trigger,
+            error="No procedure rollback script was captured for this result.",
+        )
+    try:
+        affected = connection.execute_batch(list(scripts))
+    except Exception as exc:
+        logger.error("Procedure rollback script failed: %s", exc)
+        return RollbackOutcome(ok=False, rows=0, sql=joined, trigger=trigger, error=str(exc))
+
+    return RollbackOutcome(
+        ok=affected > 0,
+        rows=affected,
+        sql=joined,
+        trigger=trigger,
+        error=None if affected > 0 else "Rollback script committed but affected 0 rows.",
+    )

@@ -115,6 +115,20 @@ class RestoreJournal:
         self._conn.commit()
         return cursor.lastrowid
 
+    def update_restore_sql(self, entry_id: int, restore_sql: str) -> None:
+        """Replace the recorded restore SQL for a pending entry.
+
+        Used for procedure-managed bits (e.g. Bit 8): the restore point written
+        before the call uses the generic column-restore, but the authoritative
+        rollback is the procedure's own returned script, only known after the
+        call. Updating it keeps crash recovery correct.
+        """
+        self._conn.execute(
+            "UPDATE restore_journal SET restore_sql = ? WHERE id = ?",
+            (restore_sql, entry_id),
+        )
+        self._conn.commit()
+
     def mark_resolved(self, entry_id: int) -> None:
         """Mark a journal entry as successfully rolled back."""
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")

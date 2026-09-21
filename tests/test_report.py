@@ -113,6 +113,25 @@ def test_section_a_shows_database_message_stream():
     assert "Trace: proposing dccEnable=true" in text
 
 
+def test_sp_managed_report_shows_procedure_rollback_script_as_authoritative():
+    result = mk(
+        mode="LIVE",
+        status="PASS",
+        change_persisted=False,
+        sp_managed=True,
+        sp_rollback_scripts=[
+            "UPDATE [cccintegrang].[handler] SET extra_config = '<x/>' WHERE handler = 'h1'"
+        ],
+    )
+    text = _report([result])
+    # The procedure's own script is presented as the authoritative rollback...
+    assert "the procedure's OWN returned script" in text
+    assert "UPDATE [cccintegrang].[handler]" in text
+    # ...and the misleading instance-column reading is explained, not hidden.
+    assert "Procedure-managed bit" in text
+    assert "does **not** mean the flag was" in text
+
+
 def test_section_a_renders_trace_rows_when_captured():
     result = mk(
         trace_status="CAPTURED",

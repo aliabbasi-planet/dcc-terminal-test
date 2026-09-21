@@ -46,7 +46,14 @@ def _state_label(result: TestResult, value: object) -> str:
 
 
 def _change_flag(result: TestResult) -> str:
-    """One-word summary of whether the verified column moved."""
+    """One-word summary of whether the change is applied/reverted."""
+    if result.sp_managed:
+        # The instance verify column never moves for these; judge by procedure signal.
+        if any(e.get("ok") for e in result.rollback_log):
+            return "reverted"
+        if result.has_sp_rollback:
+            return "changed"
+        return "unchanged"
     if result.state_before == result.state_after:
         return "unchanged"
     return "changed" if result.change_persisted else "reverted"
@@ -70,6 +77,17 @@ def _render_change_evidence(result: TestResult) -> None:
 
     flag = _change_flag(result)
     restored = any(e.get("ok") for e in result.rollback_log)
+
+    if result.sp_managed:
+        st.caption(
+            "⚠️ Procedure-managed change: the flag is written to a related table (e.g. "
+            "`[cccintegrang].[handler].extra_config`), which the instance column above does "
+            "**not** reflect — so the before/after values shown are context only. Whether the "
+            f"change is applied is judged from the procedure's own output (**{flag}**), and "
+            "rollback uses the procedure's returned script (see the Rollback panel)."
+        )
+        return
+
     if result.mode == "SIMULATION":
         st.caption(
             f"Verified column ended **{flag}**. Simulation transaction rolled back — the "
@@ -113,7 +131,8 @@ def _result_ledger(result: TestResult) -> str:
             f"PROC RESULT SETS   : {_clip(json.dumps(result.grids, default=str), 1800)}",
             f"RESTORE POINT KNOWN: {result.restore_point_known}",
             f"ROLLBACK LOG       : {result.rollback_log or 'no rollback performed'}",
-            f"ROLLBACK AVAILABLE : {result.can_rollback}",
+            f"ROLLBACK AVAILABLE : {result.rollback_available}",
+            f"SP ROLLBACK SCRIPT : {'; '.join(result.sp_rollback_scripts) or 'none'}",
         ]
     )
 
@@ -741,7 +760,7 @@ def _render_campaign_report(campaign: dict) -> None:
                     ),
                     "Error": _clip(result.error, 160) if result.error else "",
                     "Persisted": result.change_persisted,
-                    "Rollback available": result.can_rollback,
+                    "Rollback available": result.rollback_available,
                 }
                 for result in entries
             ]
@@ -808,7 +827,7 @@ def _render_campaign_report(campaign: dict) -> None:
     st.caption(f"Report integrity SHA-256: `{content_hash}`")
 
     st.markdown("**↩️ Campaign rollback**")
-    outstanding = [result for result in entries if result.can_rollback]
+    outstanding = [result for result in entries if result.rollback_available]
     if not any(result.is_live for result in entries):
         st.info(
             "Simulation campaign — every transaction was already rolled back, so there is "
@@ -853,10 +872,6 @@ def _render_rollback_panel(result: TestResult) -> None:
         return
 
     definition = TEST_CATALOG[result.test_key]
-    st.caption(
-        f"Restores the value captured before the test into "
-        f"`{definition.verify.qualified}` for {result.target_type} `{result.target}`."
-    )
 
     for entry in result.rollback_log:
         label = entry["trigger"].capitalize()
@@ -864,6 +879,41 @@ def _render_rollback_panel(result: TestResult) -> None:
             st.success(f"{label} rollback succeeded at {entry['at']} ({entry['rows']} row(s)).")
         else:
             st.error(f"{label} rollback failed at {entry['at']}: {entry['error']}")
+
+    # Procedure-managed bits (e.g. Bit 8): the change is on a related table the
+    # generic verify column never sees, so roll back with the procedure's OWN
+    # returned script rather than the generic column-restore.
+    if result.has_sp_rollback:
+        st.caption(
+            "Procedure-managed change: the flag lives in a related table (e.g. "
+            "`[cccintegrang].[handler].extra_config`), so rollback runs the compensating "
+            "`UPDATE` the procedure itself returned — not a write to the instance row."
+        )
+        with st.popover("Show the procedure's rollback script"):
+            st.code("\n\n".join(result.sp_rollback_scripts), language="sql")
+        already = any(e.get("ok") for e in result.rollback_log)
+        if already:
+            st.success(
+                "Rolled back using the procedure's own script. Re-run below if you need to "
+                "restore again."
+            )
+        else:
+            st.warning("This live change is still applied. Run the procedure's restore script.")
+        if st.button(
+            "↩️ Roll back this change (run the procedure's restore script)",
+            key=f"rb-sp-{result.id}",
+            type="primary",
+            use_container_width=True,
+        ):
+            with st.spinner("Running the procedure's rollback script…"):
+                apply_rollback(connection(), definition, result)
+            st.rerun()
+        return
+
+    st.caption(
+        f"Restores the value captured before the test into "
+        f"`{definition.verify.qualified}` for {result.target_type} `{result.target}`."
+    )
 
     if not result.restore_point_known:
         st.warning(
@@ -1051,7 +1101,7 @@ def render_results() -> None:
         )
         return
 
-    outstanding = [result for result in all_results if result.can_rollback]
+    outstanding = [result for result in all_results if result.rollback_available]
     negatives = [result for result in all_results if result.is_negative]
 
     summary = st.columns(6)

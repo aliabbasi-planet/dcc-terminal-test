@@ -138,6 +138,35 @@ class DatabaseConnection:
             connection.rollback()
             raise
 
+    def execute_batch(self, statements: list[str]) -> int:
+        """Run several parameterless statements in ONE transaction and commit.
+
+        Used for the procedure's own returned rollback scripts (complete UPDATE
+        text authored by the trusted procedure, no user input). All-or-nothing:
+        any failure rolls back the whole batch so a partial rollback is never
+        left committed. Returns the total number of rows affected.
+        """
+        connection = self._require_connection()
+        cursor = connection.cursor()
+        total = 0
+        try:
+            for statement in statements:
+                if not str(statement).strip():
+                    continue
+                cursor.execute(statement)
+                if cursor.rowcount and cursor.rowcount > 0:
+                    total += cursor.rowcount
+            cursor.close()
+            connection.commit()
+            return total
+        except Exception:
+            try:
+                cursor.close()
+            except Exception as close_error:
+                logger.debug("Cursor close suppressed: %s", close_error)
+            connection.rollback()
+            raise
+
     def call_procedure(self, sql: str, params: tuple, rollback: bool) -> ProcedureOutput:
         """Execute a procedure, drain every result set, then commit or roll back.
 
