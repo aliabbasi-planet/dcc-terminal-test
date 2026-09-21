@@ -37,13 +37,20 @@ reporting, and safe rollback testing.
 | Live mode | Requires typing the environment name, captures a restore point, commits, then offers rollback |
 | Rollback | Automatic on live failure, manual per result, bulk for everything outstanding, forced re-write available |
 | Configuration campaigns | Separate tab for running selected location, terminal, and instance tests sequentially, with campaign reports and campaign-only rollback |
-| Negative validation battery | 7 deliberately-invalid input cases that must be rejected by the procedure |
-| CAB reports | Markdown and signed PDF with SHA-256 integrity hash, coverage matrix, and per-test evidence |
+| Negative validation battery | 9 deliberately-invalid cases across three families — non-existent targets, invalid values, and duplicate writes |
+| Procedure messages | The procedure's `PRINT`/`fnDisplayTrace` output is captured from the message stream and shown in the app and report |
+| Return codes | Each call is wrapped as `EXEC @rc = proc …` so the procedure's integer return code is captured and reported |
+| CAB reports | Markdown, signed PDF, and signed Word (.docx) — all sharing one SHA-256 integrity hash, coverage matrix, and per-test evidence |
 | Disaster recovery | SQLite restore journal persists original values to disk before live UAT/PROD runs |
-| Exports | Results as JSON, session ledger as Markdown, CAB report as Markdown or signed PDF |
+| Exports | Results as JSON, session ledger as Markdown, CAB report as Markdown, signed PDF, or signed Word |
 
 Supported configuration bits: **1** DCC Xpress CO · **2** Config Download Version ·
 **4** Firmware Package · **8** DCC Handler Flags · **16** DCC Receipt Template.
+
+Config Download Version (bit 2) has exactly two values: `1` = **Standard** (baseline
+DCC configuration) and `2` = **ECB DCC** (European Central Bank conversion-rate
+variant). The console labels the stored numeric code with its name everywhere it is
+displayed, so a bare `1`/`2` is never shown without context.
 
 ---
 
@@ -139,10 +146,14 @@ terminal tests, locations for location tests, and instances for instance tests. 
 console runs every selected test for each target of its matching type in sequence, then
 shows per-campaign pass, fail, review, blocked, and pending-rollback totals.
 
-Enable **Include negative validation battery** to append 7 deliberately-invalid cases
-(non-existent instance, terminal, location; unknown flag; unknown function; unknown
-version; empty JSON). Each must be rejected by the procedure for the campaign to be
-CAB-grade. Negative cases are always forced to `@is_simulation = 1`.
+Enable **Include negative validation battery** to append 9 deliberately-invalid cases
+covering three scenario families: **non-existent** (instance, terminal, location),
+**invalid** (unknown flag, unknown function, unknown version, empty JSON), and
+**duplicate** (re-applying a handler flag and re-adding a location function that
+already exist). Each must be handled correctly by the procedure for the campaign to be
+CAB-grade — a rejection for non-existent/invalid input, and either a rejection or an
+idempotent no-op for duplicates. Negative cases are always forced to
+`@is_simulation = 1`.
 
 For a live campaign, **Roll back campaign live changes** restores every test row in that
 campaign which still differs from its captured restore point.
@@ -165,29 +176,55 @@ The console distinguishes *the procedure executed safely* from *the configuratio
 
 ## CAB validation reports
 
-The console generates Change Advisory Board evidence in two formats, both derived
-entirely from recorded run data — no figure is hand-entered.
+The console generates Change Advisory Board evidence in three formats — Markdown,
+signed PDF, and signed Word (.docx) — all derived entirely from recorded run data,
+with no figure hand-entered. All three are rendered from the same canonical content
+and therefore share one SHA-256 integrity hash.
 
 ### Report sections
 
 | Section | Content |
 |---|---|
-| **A** — Procedure execution evidence | Exact `EXEC` statement, input JSON, before/after verified column, procedure preview output, rollback verification |
+| **A** — Procedure execution evidence | The database code exercised (`EXEC`, the verification `SELECT`, the compensating `UPDATE`, and any rollback statements actually executed), input JSON, before/applied-change/after verified column, return code, procedure preview output, the verbatim database message stream, and rollback verification |
 | **B** — Coverage matrix | All 13 configuration areas with covered/blocked/not-tested state |
-| **C** — Negative validation | Each invalid-input case with the rejection evidence captured |
+| **C** — Negative validation | Every case across all three families (non-existent, invalid, duplicate) with the rejection evidence captured |
 | **D** — Capability & limitation analysis | Confirmed tested, placeholder-exercised, blocked, not tested, assumptions |
 | **E** — Rollback evidence | Full before → apply → restore cycle proving rollback works |
 | **Report integrity** | SHA-256 content hash for tamper detection |
 
-### Signed PDF
+### Procedure messages and trace
 
-The PDF version embeds the SHA-256 digest of the report content in the document
-metadata and prints it in the footer of every page. To verify a report was not
-modified, re-generate it from the same session data and compare digests.
+`db.fnDisplayTrace` is a **scalar string formatter** that the procedure calls inside
+`PRINT` statements. The trace is therefore SQL Server's message/info stream, not a
+table or result set. The console captures that stream via `cursor.messages` on every
+call — draining it inside the result-set loop, because some ODBC drivers clear the
+buffer on each `nextset()`. Both the raw message stream and the formatted trace appear
+in Section A, so a validation failure the procedure reports only via `PRINT` is still
+detected.
+
+### Signed PDF and signed Word
+
+Both embed the SHA-256 digest of the report content. The PDF puts it in the document
+metadata and the footer of every page; the Word document puts it in the core
+properties and on the cover page. To verify a report was not modified, re-generate it
+from the same session data and compare digests.
 
 This is **content-integrity verification**, not certificate-based digital signing.
 It proves the content is unmodified relative to a known hash; it does not prove
 authorship via PKI.
+
+The Word report additionally:
+
+- renders every section with **native Word tables** rather than monospace text;
+- applies Word **Restrict Editing** (read-only enforcement) to the generated body;
+- ends with an editable **Manual Attachments** region — placeholder subsections for
+  change-record references, manual test notes, screenshots, and reviewer sign-off.
+
+Content added under *Manual Attachments* is deliberately **outside** the hashed
+region, so hand-written additions never invalidate the signature. Note that Word's
+read-only enforcement is a **deterrent, not tamper-proofing** — a determined editor
+can remove it. The authenticity guarantee is the SHA-256, which changes if any
+generated content is altered.
 
 ### Procedure version pinning
 
@@ -317,6 +354,7 @@ recoverable.
 │   ├── config.py              # Environment settings
 │   ├── coverage.py            # 13-area coverage matrix computation
 │   ├── database.py            # pyodbc wrapper, explicit transaction control
+│   ├── docx_report.py         # Signed Word generator, native tables, manual attachments
 │   ├── execution.py           # build_call, run_test, classify, apply_rollback
 │   ├── journal.py             # SQLite disaster-recovery restore journal
 │   ├── negatives.py           # Negative validation battery
@@ -324,8 +362,9 @@ recoverable.
 │   ├── readiness.py           # Pre-flight probes, grant script, procedure hash
 │   ├── reference.py           # Instance, location and terminal queries
 │   ├── report.py              # CAB report generator (Sections A–E)
-│   ├── rollback.py            # Restore statement and verification
+│   ├── rollback.py            # Restore/read statements and verification
 │   ├── state.py               # Session-state helpers
+│   ├── trace.py               # fnDisplayTrace PRINT-stream interpretation
 │   └── ui/                    # sidebar.py, sections.py
 └── tests/                     # Catalogue, statement, coverage and rollback tests
 ```
@@ -354,8 +393,10 @@ python -m ruff check src tests
 
 The suite covers catalogue integrity, parameterisation of every generated statement
 including an injection attempt, verdict classification, coverage matrix computation,
-negative-case verdicts, CAB report structure, and rollback availability. No database
-connection is required to run it.
+negative-case verdicts across all three scenario families, the config-download version
+mapping, return-code wrapping, `fnDisplayTrace` message-stream interpretation, CAB
+report structure, signed Word generation (tables, integrity hash, protection, editable
+manual region), and rollback availability. No database connection is required to run it.
 
 ---
 
@@ -377,6 +418,8 @@ connection is required to run it.
 | Symptom | Cause and fix |
 |---|---|
 | `ModuleNotFoundError: No module named 'fpdf'` | Run `pip install -r requirements.txt` or `pip install -e .` |
+| `ModuleNotFoundError: No module named 'docx'` | The Word report needs `python-docx`. Run `pip install -r requirements.txt` or `pip install -e .` |
+| Word report button shows "Word generation failed" | `python-docx` missing or the document could not be built; the Markdown and PDF exports are unaffected |
 | `IM002 Data source name not found` | No ODBC driver. Use Docker, or `winget install Microsoft.msodbcsql18` |
 | `EXECUTE permission was denied on 'fnDisplayTrace'` | Run the grant script shown in section 1 as a DBA |
 | Every test returns ⛔ BLOCKED | Same permission issue; the procedure body never executes |
