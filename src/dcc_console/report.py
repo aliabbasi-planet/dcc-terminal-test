@@ -224,6 +224,48 @@ def _procedure_version(meta: dict) -> list[str]:
         "and line-ending conventions present in the artefact — a mismatch on those would carry "
         "no information about procedure correctness.",
     ]
+    lines += _trace_instrumentation(meta)
+    return lines
+
+
+def _trace_instrumentation(meta: dict) -> list[str]:
+    """Describe whether the procedure's trace function could be read."""
+    sig = meta.get("trace_signature")
+    lines = ["", "### Trace instrumentation", ""]
+    if not sig:
+        lines.append(
+            "_Trace availability was not recorded for this run. Re-run pre-flight readiness "
+            "so the report can state whether the procedure's internal trace was readable._"
+        )
+        return lines
+
+    usable = bool(sig.get("usable"))
+    lines += [
+        "| Attribute | Value |",
+        "| --- | --- |",
+        f"| Trace function | `{sig.get('function', '?')}` |",
+        f"| Exists | {_yes_no(bool(sig.get('exists')))} |",
+        f"| Table-valued | {sig.get('is_table_valued')} |",
+        f"| Parameters | {sig.get('parameter_count', 0)} |",
+        f"| Readable by this harness | {_yes_no(usable)} |",
+    ]
+    if sig.get("call_sql"):
+        lines += ["", "Call form used to read the trace:", "", "```sql", sig["call_sql"], "```"]
+    if usable:
+        lines += [
+            "",
+            "Because the trace is readable, a validation failure recorded only in the trace "
+            "**is** detected by the negative validation battery in Section C.",
+        ]
+    else:
+        lines += [
+            "",
+            f"**Trace not readable.** {sig.get('unavailable_reason') or 'No reason recorded.'}",
+            "",
+            "This is material to Section C: if the procedure records validation failures only "
+            "in its trace, a `NOT-REJECTED` verdict cannot be treated as a confirmed validation "
+            "gap until the trace can be read.",
+        ]
     return lines
 
 
@@ -337,9 +379,11 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         lines += ["", "**SQL error**", "", "```", result.error, "```"]
 
     if result.messages:
-        lines += ["", "**Server messages (procedure trace)**", "", "```"]
+        lines += ["", "**Server messages (PRINT / RAISERROR)**", "", "```"]
         lines += [str(message) for message in result.messages]
         lines.append("```")
+
+    lines += _trace_block(result)
 
     if result.grids:
         for gi, grid in enumerate(result.grids, start=1):
@@ -353,8 +397,47 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         lines += [
             "",
             "_Procedure returned no tabular result set for this call; rely on the server "
-            "messages/trace above and the before/after values._",
+            "messages, the procedure trace, and the before/after values._",
         ]
+    return lines
+
+
+_TRACE_STATUS_NOTE = {
+    "CAPTURED": None,
+    "EMPTY": (
+        "The trace function was called successfully but returned no rows for this "
+        "call. The procedure recorded nothing in its trace."
+    ),
+    "UNAVAILABLE": (
+        "The procedure trace could not be read for this run. It was attempted, not "
+        "skipped — the reason is stated below."
+    ),
+    "ERRORED": "The trace read raised an error; the reason is stated below.",
+    "NOT_ATTEMPTED": (
+        "The procedure trace was not read for this call because its signature had "
+        "not been discovered. Re-run pre-flight readiness to enable trace capture."
+    ),
+}
+
+
+def _trace_block(result: TestResult) -> list[str]:
+    """Render the fnDisplayTrace output, or explain why it is absent."""
+    status = getattr(result, "trace_status", "NOT_ATTEMPTED")
+    rows = getattr(result, "trace_rows", []) or []
+    reason = getattr(result, "trace_reason", None)
+
+    lines = ["", f"**Procedure trace (`fnDisplayTrace`) — {status}**", ""]
+    if rows:
+        lines += _records_to_table(rows)
+        if reason:
+            lines += ["", f"_{reason}_"]
+        return lines
+
+    note = _TRACE_STATUS_NOTE.get(status)
+    if note:
+        lines.append(note)
+    if reason:
+        lines += ["", f"_{reason}_"]
     return lines
 
 
@@ -409,13 +492,29 @@ def _section_b(positives: list[TestResult]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _negative_evidence(result: TestResult) -> str:
+    """Pick the strongest available rejection evidence for one negative case."""
+    if result.error:
+        return result.error
+    if result.messages:
+        return result.messages[0]
+    trace_text = getattr(result, "trace_text", "")
+    if trace_text:
+        return f"(from trace) {trace_text}"
+    status = getattr(result, "trace_status", "NOT_ATTEMPTED")
+    if status in {"UNAVAILABLE", "ERRORED", "NOT_ATTEMPTED"}:
+        return f"no error raised; trace {status.lower()}"
+    return "no error raised; trace returned no rows"
+
+
 def _section_c(negatives: list[TestResult]) -> list[str]:
     lines = [
         "",
         "## Section C — Negative validation",
         "",
-        "Deliberately invalid input. The pass condition is a **rejection** (a raised SQL "
-        "error or an ERROR trace). Silent acceptance of bad input is a finding.",
+        "Deliberately invalid input. The pass condition is a **rejection** — a raised SQL "
+        "error, a rejection marker in server messages, or a rejection recorded in the "
+        "procedure's own `fnDisplayTrace` output. Silent acceptance of bad input is a finding.",
     ]
     if not negatives:
         lines += [
@@ -427,28 +526,54 @@ def _section_c(negatives: list[TestResult]) -> list[str]:
         return lines
     lines += [
         "",
-        "| Negative case | Target | Value | Verdict | Evidence |",
-        "| --- | --- | --- | :---: | --- |",
+        "| Negative case | Target | Value | Verdict | Trace | Evidence |",
+        "| --- | --- | --- | :---: | :---: | --- |",
     ]
     for result in negatives:
-        evidence = result.error or (result.messages[0] if result.messages else "no error raised")
+        evidence = _negative_evidence(result)
+        trace_status = getattr(result, "trace_status", "NOT_ATTEMPTED")
         lines.append(
             f"| {result.test_key.replace('Negative — ', '')} | `{_cell(result.target)}` | "
-            f"`{_cell(result.value)}` | `{result.verdict_code}` | {_cell(_clip(evidence, 240))} |"
+            f"`{_cell(result.value)}` | `{result.verdict_code}` | {trace_status} | "
+            f"{_cell(_clip(evidence, 240))} |"
         )
 
     rejected = sum(1 for r in negatives if r.verdict_code == "REJECTED-AS-EXPECTED")
     not_rejected = sum(1 for r in negatives if r.verdict_code == "NOT-REJECTED")
+
+    # If the trace was never readable, a NOT-REJECTED verdict is not yet conclusive.
+    trace_blind = [
+        r
+        for r in negatives
+        if getattr(r, "trace_status", "NOT_ATTEMPTED")
+        in {"UNAVAILABLE", "ERRORED", "NOT_ATTEMPTED"}
+    ]
+
     if not_rejected > 0:
         lines += [
             "",
             f"**Finding**: {not_rejected} of {len(negatives)} negative case(s) returned "
             "`NOT-REJECTED` — the procedure did **not** raise a SQL exception and no "
-            "rejection marker was detected in the captured output. The procedure owner "
-            "should confirm whether validation failures are expected to be surfaced through "
-            "internal tracing (`fnDisplayTrace`), preview output, or exception handling. "
-            "Until confirmed, negative validation coverage cannot be claimed.",
+            "rejection marker was detected in the server messages, result sets, or trace "
+            "output that could be captured.",
         ]
+        if trace_blind:
+            lines += [
+                "",
+                f"**This finding is not yet conclusive for {len(trace_blind)} of those "
+                "case(s).** The procedure's internal trace could not be read for them, so a "
+                "rejection recorded only in the trace would not have been detected. Resolve "
+                "the trace availability reason shown in Section A, re-run the battery, and "
+                "re-assess before treating these as genuine validation gaps.",
+            ]
+        else:
+            lines += [
+                "",
+                "The trace was readable for every case above, so the absence of a rejection "
+                "marker is a genuine observation rather than a gap in instrumentation. The "
+                "procedure owner should confirm whether these inputs are expected to be "
+                "rejected. Until confirmed, negative validation coverage cannot be claimed.",
+            ]
     if rejected == len(negatives):
         lines += [
             "",

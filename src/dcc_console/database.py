@@ -138,21 +138,41 @@ class DatabaseConnection:
             raise
 
     def call_procedure(self, sql: str, params: tuple, rollback: bool) -> ProcedureOutput:
-        """Execute a procedure, drain every result set, then commit or roll back."""
+        """Execute a procedure, drain every result set, then commit or roll back.
+
+        Server messages (``PRINT``, ``RAISERROR`` severity <= 10) are drained
+        *inside* the result-set loop because some ODBC drivers clear
+        ``cursor.messages`` on each ``nextset()`` call.  Reading only once at
+        the end would silently lose any message emitted between result sets.
+        """
         connection = self._require_connection()
         cursor = connection.cursor()
         grids: list[pd.DataFrame] = []
         messages: list[str] = []
+        seen: set[str] = set()
+
+        def _drain_messages() -> None:
+            """Append any new messages, preserving order and skipping repeats."""
+            for entry in cursor.messages or []:
+                # pyodbc yields (sqlstate, message) tuples.
+                text = str(entry[1]) if len(entry) > 1 else str(entry)
+                if text not in seen:
+                    seen.add(text)
+                    messages.append(text)
+
         try:
             cursor.execute(sql, params)
+            _drain_messages()
             while True:
                 if cursor.description:
                     columns = [d[0] for d in cursor.description]
                     rows = [tuple(row) for row in cursor.fetchall()]
                     grids.append(pd.DataFrame(rows, columns=columns))
+                _drain_messages()
                 if not cursor.nextset():
                     break
-            messages = [str(message[1]) for message in (cursor.messages or [])]
+                _drain_messages()
+            _drain_messages()
         finally:
             cursor.close()
             if rollback:

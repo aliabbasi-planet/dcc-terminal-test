@@ -26,6 +26,7 @@ DEFAULTS: dict[str, Any] = {
     "session_history": [],
     "readiness": None,
     "procedure_version": None,
+    "trace_signature": None,
 }
 
 # Keys that must survive a disconnect so the sidebar keeps its selection.
@@ -81,6 +82,7 @@ def clear_reference_cache() -> None:
     st.session_state.locations = None
     st.session_state.readiness = None
     st.session_state.procedure_version = None
+    st.session_state.trace_signature = None
 
 
 def connection() -> DatabaseConnection:

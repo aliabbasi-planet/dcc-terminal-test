@@ -13,6 +13,7 @@ from .config import PROCEDURE
 from .database import DatabaseConnection
 from .journal import get_journal
 from .rollback import RollbackOutcome, read_state, restore_state, restore_statement
+from .trace import TraceSignature, read_trace
 
 PERMISSION_DENIED_MARKER = "EXECUTE permission was denied"
 
@@ -52,6 +53,19 @@ class TestResult:
     proposed_change_observed: bool = False
     is_negative: bool = False
     journal_id: int | None = None
+    trace_rows: list[dict] = field(default_factory=list)
+    trace_status: str = "NOT_ATTEMPTED"
+    trace_reason: str | None = None
+
+    @property
+    def trace_text(self) -> str:
+        """Flatten trace rows into one searchable blob."""
+        if not self.trace_rows:
+            return ""
+        parts: list[str] = []
+        for row in self.trace_rows:
+            parts.extend(str(v) for v in row.values() if v is not None)
+        return " ".join(parts)
 
     @property
     def is_live(self) -> bool:
@@ -214,6 +228,7 @@ def run_test(
     environment: str,
     login: str,
     campaign_id: str | None = None,
+    trace_signature: TraceSignature | None = None,
 ) -> TestResult:
     sql, params, rendered = build_call(definition, target_identifier, config_value, simulation)
 
@@ -250,12 +265,16 @@ def run_test(
         error = str(exc)
         connection.safe_rollback()
 
+    # Read the procedure's own trace output — this is where validation
+    # failures may surface instead of as a raised SQL exception.
+    trace = read_trace(connection, trace_signature)
+
     after = read_state(connection, definition, target_identifier)
     persisted = before != after
 
-    # The procedure's own simulation/preview result set (or a server message) is the
-    # evidence that the intended change was computed — CAB issue #1/#6.
-    proposed_change_observed = bool(grids) or bool(messages)
+    # The procedure's own simulation/preview result set, a server message, or its
+    # internal trace is the evidence that the intended change was computed.
+    proposed_change_observed = bool(grids) or bool(messages) or bool(trace.rows)
 
     # A failed live call must never leave a half-applied change behind.
     if not simulation and error and persisted and before is not None:
@@ -312,6 +331,9 @@ def run_test(
         proc_args=definition.proc_args,
         proposed_change_observed=proposed_change_observed,
         journal_id=journal_id,
+        trace_rows=trace.rows,
+        trace_status=trace.status,
+        trace_reason=trace.reason,
     )
 
 

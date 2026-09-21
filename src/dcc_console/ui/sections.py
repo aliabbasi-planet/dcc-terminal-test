@@ -21,6 +21,7 @@ from ..readiness import all_passed, capture_procedure_version, grant_script, run
 from ..reference import load_instances, load_locations, load_terminals
 from ..report import cab_report_with_hash
 from ..state import add_result, connection, results
+from ..trace import discover_trace_signature
 
 STATUS_BADGES = {"PASS": "🟢", "FAIL": "🔴", "REVIEW": "🟡", "BLOCKED": "⛔"}
 
@@ -55,6 +56,10 @@ def _result_ledger(result: TestResult) -> str:
             f"HARNESS STATUS     : {result.status}",
             f"SQL ERROR          : {result.error or 'none'}",
             f"SERVER MESSAGES    : {result.messages or 'none'}",
+            f"TRACE STATUS       : {getattr(result, 'trace_status', 'NOT_ATTEMPTED')}",
+            "TRACE ROWS         : "
+            f"{_clip(json.dumps(getattr(result, 'trace_rows', []), default=str), 1200)}",
+            f"TRACE REASON       : {getattr(result, 'trace_reason', None) or 'none'}",
             f"PROC RESULT SETS   : {_clip(json.dumps(result.grids, default=str), 1800)}",
             f"RESTORE POINT KNOWN: {result.restore_point_known}",
             f"ROLLBACK LOG       : {result.rollback_log or 'no rollback performed'}",
@@ -84,6 +89,7 @@ def _cab_meta(all_results: list[TestResult]) -> dict:
 
     conn = st.session_state.connection
     mode = "LIVE" if any(result.is_live for result in all_results) else "SIMULATION"
+    sig = st.session_state.get("trace_signature")
     return {
         "server": getattr(conn, "server", "?"),
         "database": getattr(conn, "database", "?"),
@@ -91,8 +97,14 @@ def _cab_meta(all_results: list[TestResult]) -> dict:
         "login": st.session_state.connected_login or "?",
         "mode": mode,
         "procedure_version": st.session_state.get("procedure_version"),
+        "trace_signature": sig.as_dict() if sig is not None else None,
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+
+
+def _trace_sig():
+    """Return the discovered trace signature from session state."""
+    return st.session_state.get("trace_signature")
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +125,7 @@ def render_readiness() -> bool:
                 connection(), st.session_state.connected_login
             )
             st.session_state.procedure_version = capture_procedure_version(connection())
+            st.session_state.trace_signature = discover_trace_signature(connection())
 
     outcomes = st.session_state.readiness
     controls = st.columns([1, 3])
@@ -123,6 +136,7 @@ def render_readiness() -> bool:
                 connection(), st.session_state.connected_login
             )
             st.session_state.procedure_version = capture_procedure_version(connection())
+            st.session_state.trace_signature = discover_trace_signature(connection())
         st.rerun()
 
     passed = sum(1 for outcome in outcomes if outcome.passed)
@@ -371,6 +385,7 @@ def render_test(simulation: bool, armed: bool) -> None:
                     case,
                     st.session_state.connected_env,
                     st.session_state.connected_login,
+                    trace_signature=_trace_sig(),
                 )
         else:
             with st.spinner(f"Executing {test_key}…"):
@@ -382,6 +397,7 @@ def render_test(simulation: bool, armed: bool) -> None:
                     simulation,
                     st.session_state.connected_env,
                     st.session_state.connected_login,
+                    trace_signature=_trace_sig(),
                 )
         add_result(result)
         st.rerun()
@@ -580,6 +596,7 @@ def render_campaign(simulation: bool, armed: bool) -> None:
                         st.session_state.connected_env,
                         st.session_state.connected_login,
                         campaign_id=campaign_id,
+                        trace_signature=_trace_sig(),
                     )
                     add_result(result)
                     completed += 1
@@ -593,6 +610,7 @@ def render_campaign(simulation: bool, armed: bool) -> None:
                 st.session_state.connected_env,
                 st.session_state.connected_login,
                 campaign_id=campaign_id,
+                trace_signature=_trace_sig(),
             )
             for r in neg_results:
                 add_result(r)
@@ -869,6 +887,7 @@ def _render_negative_battery() -> None:
                 st.session_state.connected_env,
                 st.session_state.connected_login,
                 cases=cases,
+                trace_signature=_trace_sig(),
             )
             for result in outcomes:
                 add_result(result)

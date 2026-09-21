@@ -22,6 +22,7 @@ from .catalog import TEST_CATALOG, TestDefinition
 from .database import DatabaseConnection
 from .execution import PERMISSION_DENIED_MARKER, TestResult, build_call
 from .rollback import read_state
+from .trace import TraceSignature, read_trace
 
 # Substrings that, seen in a server message or a returned grid, indicate the
 # procedure actively rejected the input rather than silently accepting it.
@@ -157,13 +158,24 @@ def build_negative_call(case: NegativeCase) -> tuple[str, tuple, str]:
     return sql, params, rendered
 
 
-def _looks_rejected(messages: list[str], grids: list[pd.DataFrame]) -> bool:
+def _looks_rejected(
+    messages: list[str],
+    grids: list[pd.DataFrame],
+    trace_text: str = "",
+) -> bool:
+    """True when a rejection marker appears in any captured output.
+
+    Includes the procedure's internal trace, because validation failures may
+    be recorded there rather than raised as a SQL exception.
+    """
     haystacks: list[str] = list(messages)
     for frame in grids:
         try:
             haystacks.append(frame.to_csv(index=False))
         except Exception:
             haystacks.append(str(frame))
+    if trace_text:
+        haystacks.append(trace_text)
     blob = " ".join(haystacks).lower()
     return any(marker in blob for marker in REJECTION_MARKERS)
 
@@ -174,6 +186,7 @@ def run_negative(
     environment: str,
     login: str,
     campaign_id: str | None = None,
+    trace_signature: TraceSignature | None = None,
 ) -> TestResult:
     """Execute one negative case; a rejection is the pass condition."""
     definition = case.definition
@@ -192,6 +205,10 @@ def run_negative(
         error = str(exc)
         connection.safe_rollback()
 
+    # Read the procedure's trace — a validation failure recorded only here
+    # would otherwise be mis-scored as NOT-REJECTED.
+    trace = read_trace(connection, trace_signature)
+
     after = read_state(connection, definition, case.target)
     persisted = before != after
 
@@ -200,7 +217,7 @@ def run_negative(
     elif error:
         # A raised exception is the clearest possible rejection.
         status = "PASS"
-    elif _looks_rejected(messages, grids):
+    elif _looks_rejected(messages, grids, trace.text):
         # The procedure reported the problem through its trace/result set.
         status = "PASS"
     elif persisted:
@@ -238,8 +255,11 @@ def run_negative(
         input_json=params[1] if len(params) > 1 else "",
         params=list(params),
         proc_args=definition.proc_args,
-        proposed_change_observed=bool(grids) or bool(messages),
+        proposed_change_observed=bool(grids) or bool(messages) or bool(trace.rows),
         is_negative=True,
+        trace_rows=trace.rows,
+        trace_status=trace.status,
+        trace_reason=trace.reason,
     )
 
 
@@ -249,10 +269,14 @@ def run_negative_battery(
     login: str,
     cases: list[NegativeCase] | None = None,
     campaign_id: str | None = None,
+    trace_signature: TraceSignature | None = None,
 ) -> list[TestResult]:
     battery = cases if cases is not None else default_negative_cases()
     return [
-        run_negative(connection, case, environment, login, campaign_id=campaign_id)
+        run_negative(
+            connection, case, environment, login,
+            campaign_id=campaign_id, trace_signature=trace_signature,
+        )
         for case in battery
     ]
 

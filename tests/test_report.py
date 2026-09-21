@@ -98,6 +98,104 @@ def test_section_a_shows_execution_evidence():
     assert '[{"instance_identifier":"I000000001"}]' in text
 
 
+def test_section_a_renders_trace_rows_when_captured():
+    result = mk(
+        trace_status="CAPTURED",
+        trace_rows=[{"step": "validate", "message": "instance ok"}],
+    )
+    text = _report([result])
+    assert "Procedure trace (`fnDisplayTrace`) — CAPTURED" in text
+    assert "instance ok" in text
+
+
+def test_section_a_explains_trace_unavailable_rather_than_omitting_it():
+    result = mk(
+        trace_status="UNAVAILABLE",
+        trace_reason="takes parameters this harness cannot supply",
+    )
+    text = _report([result])
+    assert "Procedure trace (`fnDisplayTrace`) — UNAVAILABLE" in text
+    assert "attempted, not" in text
+    assert "cannot supply" in text
+
+
+def test_trace_instrumentation_block_states_readability():
+    meta = dict(META)
+    meta["trace_signature"] = {
+        "function": "[db].[fnDisplayTrace]",
+        "exists": True,
+        "is_table_valued": True,
+        "parameter_count": 0,
+        "call_sql": "SELECT * FROM [db].[fnDisplayTrace]()",
+        "usable": True,
+        "unavailable_reason": None,
+    }
+    text = cab_report([mk()], meta)
+    assert "Trace instrumentation" in text
+    assert "SELECT * FROM [db].[fnDisplayTrace]()" in text
+    assert "**is** detected by the negative validation battery" in text
+
+
+def test_trace_instrumentation_warns_when_not_readable():
+    meta = dict(META)
+    meta["trace_signature"] = {
+        "function": "[db].[fnDisplayTrace]",
+        "exists": True,
+        "is_table_valued": True,
+        "parameter_count": 1,
+        "call_sql": None,
+        "usable": False,
+        "unavailable_reason": "takes parameters this harness cannot supply automatically",
+    }
+    text = cab_report([mk()], meta)
+    assert "Trace not readable" in text
+    assert "cannot be treated as a confirmed validation" in text
+
+
+def test_section_c_not_rejected_is_inconclusive_when_trace_unreadable():
+    neg = mk(
+        test_key="Negative — Invalid instance identifier",
+        is_negative=True,
+        status="REVIEW",
+        error=None,
+        messages=[],
+        trace_status="UNAVAILABLE",
+        trace_reason="signature unknown",
+    )
+    text = _report([mk(), neg])
+    assert "NOT-REJECTED" in text
+    assert "not yet conclusive" in text
+
+
+def test_section_c_not_rejected_is_conclusive_when_trace_readable():
+    neg = mk(
+        test_key="Negative — Invalid instance identifier",
+        is_negative=True,
+        status="REVIEW",
+        error=None,
+        messages=[],
+        trace_status="EMPTY",
+        trace_reason=None,
+    )
+    text = _report([mk(), neg])
+    assert "genuine observation rather than a gap in instrumentation" in text
+
+
+def test_section_c_shows_trace_sourced_evidence():
+    neg = mk(
+        test_key="Negative — Invalid instance identifier",
+        is_negative=True,
+        status="PASS",
+        error=None,
+        messages=[],
+        trace_status="CAPTURED",
+        trace_rows=[{"msg": "instance does not exist"}],
+    )
+    text = _report([mk(), neg])
+    assert "REJECTED-AS-EXPECTED" in text
+    assert "(from trace)" in text
+
+
 def test_simulation_wording_never_claims_a_persisted_change():
     text = _report([mk()])
     assert "SIMULATED-OK" in text
