@@ -10,25 +10,45 @@ from dcc_console.execution import (
     _extract_rollback_scripts,
     apply_rollback,
 )
-from dcc_console.rollback import restore_via_scripts
+from dcc_console.rollback import (
+    extract_flag_value,
+    flag_states_match,
+    read_sp_flag_states,
+    restore_via_scripts,
+)
 
 BIT8 = "Bit 8 — DCC Handler Flags (instance)"
 BIT2 = "Bit 2 — Config Download Version (terminal)"
 
 
 class FakeConn:
-    """Connection stub exposing only execute_batch."""
+    """Connection stub exposing execute_batch and query."""
 
-    def __init__(self, rows: int = 1, fail: bool = False) -> None:
+    def __init__(
+        self,
+        rows: int = 1,
+        fail: bool = False,
+        query_result=None,
+        query_fail: bool = False,
+    ) -> None:
         self.batches: list[list[str]] = []
         self._rows = rows
         self._fail = fail
+        self._query_result = query_result
+        self._query_fail = query_fail
 
     def execute_batch(self, statements: list[str]) -> int:
         self.batches.append(list(statements))
         if self._fail:
             raise RuntimeError("boom")
         return self._rows
+
+    def query(self, sql: str, params: tuple = ()):
+        if self._query_fail:
+            raise RuntimeError("read failed")
+        if self._query_result is None:
+            return pd.DataFrame([])
+        return self._query_result
 
 
 def make_result(**overrides) -> TestResult:
@@ -163,3 +183,92 @@ def test_apply_rollback_prefers_sp_script():
     assert conn.batches == [result.sp_rollback_scripts]
     assert "procedure script" in result.transaction
     assert result.rollback_log[-1]["ok"] is True
+
+
+# --- handler-level flag verification ---------------------------------------
+
+
+def test_extract_flag_value_variants():
+    xml = (
+        "<extra_config>"
+        '<extra_config config_name="amountConfirmationEnable" config_value="false"/>'
+        '<extra_config config_name="dccEnable" config_value="true"/>'
+        "</extra_config>"
+    )
+    assert extract_flag_value(xml, "dccEnable") == "true"
+    assert extract_flag_value(xml, "amountConfirmationEnable") == "false"
+    assert extract_flag_value(xml, "missing") is None
+    assert extract_flag_value("", "dccEnable") is None
+
+
+def test_flag_states_match():
+    prior = [{"handler_name": "h1", "flag_value": "false"}]
+    assert flag_states_match(prior, [{"handler_name": "h1", "flag_value": "false"}]) is True
+    assert flag_states_match(prior, [{"handler_name": "h1", "flag_value": "true"}]) is False
+    assert flag_states_match(prior, []) is False  # cannot confirm
+    assert flag_states_match(prior, [{"handler_name": "h2", "flag_value": "false"}]) is False
+
+
+def test_read_sp_flag_states_parses_each_handler():
+    df = pd.DataFrame([
+        {"handler_name": "h1", "extra_config": '<x config_name="dccEnable" config_value="true"/>'},
+        {"handler_name": "h2", "extra_config": '<x config_name="dccEnable" config_value="false"/>'},
+    ])
+    states = read_sp_flag_states(FakeConn(query_result=df), "I1", "dccEnable")
+    assert states == [
+        {"handler_name": "h1", "flag_value": "true"},
+        {"handler_name": "h2", "flag_value": "false"},
+    ]
+
+
+def test_read_sp_flag_states_returns_empty_on_read_failure():
+    assert read_sp_flag_states(FakeConn(query_fail=True), "I1", "dccEnable") == []
+
+
+def test_sp_flag_rows_merges_snapshots():
+    result = make_result(
+        sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
+        sp_after_states=[{"handler_name": "h1", "flag_value": "true"}],
+        sp_restored_states=[{"handler_name": "h1", "flag_value": "false"}],
+    )
+    assert result.sp_flag_rows == [
+        {"handler_name": "h1", "prior": "false", "after": "true", "restored": "false"}
+    ]
+
+
+def _restored_df(flag: str, value: str):
+    return pd.DataFrame([
+        {"handler_name": "h1", "extra_config": f'<x config_name="{flag}" config_value="{value}"/>'}
+    ])
+
+
+def test_apply_rollback_verifies_flag_restored():
+    conn = FakeConn(rows=1, query_result=_restored_df("dccEnableCompletion", "false"))
+    result = make_result(
+        journal_id=None, value="dccEnableCompletion",
+        sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
+    )
+    apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
+    assert result.sp_flag_verified is True
+    assert result.sp_restored_states == [{"handler_name": "h1", "flag_value": "false"}]
+
+
+def test_apply_rollback_flags_unverified_mismatch():
+    conn = FakeConn(rows=1, query_result=_restored_df("dccEnableCompletion", "true"))
+    result = make_result(
+        journal_id=None, value="dccEnableCompletion",
+        sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
+    )
+    apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
+    assert result.sp_flag_verified is False
+
+
+def test_apply_rollback_verification_unavailable_leaves_none_but_rollback_ok():
+    conn = FakeConn(rows=1, query_fail=True)
+    result = make_result(
+        journal_id=None, value="dccEnableCompletion",
+        sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
+    )
+    outcome = apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
+    assert outcome.ok is True  # rollback itself still committed (rows affected)
+    assert result.sp_flag_verified is None

@@ -349,6 +349,55 @@ def _return_code_note(result: TestResult) -> list[str]:
     ]
 
 
+def _sp_flag_verification_block(result: TestResult) -> list[str]:
+    """Handler-level before/after/restored evidence for procedure-managed bits.
+
+    Reads the named flag on every affected handler (via the procedure's own
+    instance_id/handler_type join), so CAB sees the change on the real column and
+    a clear restored-to-prior verdict — not the unrelated instance column.
+    """
+    rows = getattr(result, "sp_flag_rows", [])
+    if not rows:
+        return [
+            "_Handler-level flag verification was not available for this run (the read "
+            "returned no rows); rollback is confirmed by rows affected only._",
+            "",
+        ]
+    flag = _cell(result.value)
+    lines = [
+        f"**Handler flag verification — `{flag}` on `[cccintegrang].[handler].extra_config`**",
+        "",
+        "| Handler | Before (prior) | After enable | After rollback |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {_cell(row.get('handler_name'))} | {_cell(row.get('prior'))} | "
+            f"{_cell(row.get('after'))} | {_cell(row.get('restored'))} |"
+        )
+    lines.append("")
+
+    verified = getattr(result, "sp_flag_verified", None)
+    handler_count = len(rows)
+    if verified is True:
+        lines.append(
+            f"✓ **Verified:** `{flag}` returned to its pre-test value on {handler_count}/"
+            f"{handler_count} affected handler(s) after rollback."
+        )
+    elif verified is False:
+        lines.append(
+            "⚠️ **NOT verified:** at least one handler did not return to its pre-test "
+            f"`{flag}` value after rollback — investigate before closing the change."
+        )
+    else:
+        lines.append(
+            "_Rollback ran (confirmed by rows affected), but value-level verification "
+            "was unavailable — the after-rollback read returned nothing to compare._"
+        )
+    lines.append("")
+    return lines
+
+
 def _db_code_block(result: TestResult) -> list[str]:
     """Show the actual SQL used to read, change, and restore the verified column.
 
@@ -481,6 +530,7 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
             "the procedure's own `rollback_script` / result sets shown above.",
             "",
         ]
+        lines += _sp_flag_verification_block(result)
     lines += _return_code_note(result)
     lines += [
         "**Rollback verification**",

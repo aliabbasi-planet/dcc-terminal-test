@@ -14,6 +14,8 @@ from .database import DatabaseConnection
 from .journal import get_journal
 from .rollback import (
     RollbackOutcome,
+    flag_states_match,
+    read_sp_flag_states,
     read_state,
     restore_state,
     restore_statement,
@@ -69,6 +71,15 @@ class TestResult:
     sp_rollback_scripts: list[str] = field(default_factory=list)
     # True when this test's bit is procedure-managed (see TestDefinition.sp_managed).
     sp_managed: bool = False
+    # Handler-level flag verification (Bit 8): the named flag's value on every
+    # affected handler, read via the procedure's own instance_id/handler_type join,
+    # before the call, after the call, and after rollback. Additive CAB evidence.
+    sp_prior_states: list[dict] = field(default_factory=list)
+    sp_after_states: list[dict] = field(default_factory=list)
+    sp_restored_states: list[dict] = field(default_factory=list)
+    # True/False once a rollback has been verified against prior; None = not yet
+    # attempted or the verification read was unavailable.
+    sp_flag_verified: bool | None = None
 
     @property
     def trace_text(self) -> str:
@@ -111,6 +122,21 @@ class TestResult:
     def rollback_available(self) -> bool:
         """Either the generic column-restore or the procedure's own script applies."""
         return self.can_rollback or self.has_sp_rollback
+
+    @property
+    def sp_flag_rows(self) -> list[dict]:
+        """Per-handler prior/after/restored flag values for the CAB verification table."""
+        by_handler: dict[str, dict] = {}
+        for label, states in (
+            ("prior", self.sp_prior_states),
+            ("after", self.sp_after_states),
+            ("restored", self.sp_restored_states),
+        ):
+            for state in states:
+                name = state.get("handler_name")
+                row = by_handler.setdefault(name, {"handler_name": name})
+                row[label] = state.get("flag_value")
+        return list(by_handler.values())
 
     @property
     def verdict_code(self) -> str:
@@ -312,6 +338,13 @@ def run_test(
 
     before = read_state(connection, definition, target_identifier)
     started = datetime.now()
+
+    # Handler-level flag snapshot BEFORE the call (Bit 8 only). Read via the
+    # procedure's own join; additive evidence, never blocks the test.
+    sp_prior_states: list[dict] = []
+    if definition.sp_managed:
+        sp_prior_states = read_sp_flag_states(connection, target_identifier, config_value)
+
     error: str | None = None
     grids: list[pd.DataFrame] = []
     messages: list[str] = []
@@ -352,6 +385,12 @@ def run_test(
 
     after = read_state(connection, definition, target_identifier)
     persisted = before != after
+
+    # Handler-level flag snapshot AFTER the call (Bit 8 only) — shows the flag
+    # actually moved on the correct table, independent of the instance column.
+    sp_after_states: list[dict] = []
+    if definition.sp_managed:
+        sp_after_states = read_sp_flag_states(connection, target_identifier, config_value)
 
     # The procedure's own simulation/preview result set, a server message, or its
     # internal trace is the evidence that the intended change was computed.
@@ -437,6 +476,8 @@ def run_test(
         return_code=return_code,
         sp_rollback_scripts=sp_rollback_scripts,
         sp_managed=definition.sp_managed,
+        sp_prior_states=sp_prior_states,
+        sp_after_states=sp_after_states,
     )
 
 
@@ -459,6 +500,18 @@ def apply_rollback(
             result.transaction = (
                 f"COMMITTED then {trigger.upper()} ROLLED BACK (procedure script)"
             )
+            # Handler-level verification: read the flag back and compare to prior.
+            # Additive — a read problem leaves sp_flag_verified=None, never failing
+            # the rollback that already committed.
+            result.sp_restored_states = read_sp_flag_states(
+                connection, result.target, result.value
+            )
+            if result.sp_prior_states and result.sp_restored_states:
+                result.sp_flag_verified = flag_states_match(
+                    result.sp_prior_states, result.sp_restored_states
+                )
+            else:
+                result.sp_flag_verified = None
             if result.journal_id is not None:
                 get_journal().mark_resolved(result.journal_id)
         return outcome

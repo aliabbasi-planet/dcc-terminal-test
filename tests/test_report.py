@@ -132,6 +132,26 @@ def test_sp_managed_report_shows_procedure_rollback_script_as_authoritative():
     assert "does **not** mean the flag was" in text
 
 
+def test_sp_managed_report_shows_handler_flag_verification_table():
+    result = mk(
+        mode="LIVE",
+        status="PASS",
+        change_persisted=False,
+        sp_managed=True,
+        value="dccEnableCompletion",
+        sp_rollback_scripts=["UPDATE [cccintegrang].[handler] SET extra_config = '<x/>'"],
+        sp_prior_states=[{"handler_name": "handler-A", "flag_value": "false"}],
+        sp_after_states=[{"handler_name": "handler-A", "flag_value": "true"}],
+        sp_restored_states=[{"handler_name": "handler-A", "flag_value": "false"}],
+        sp_flag_verified=True,
+    )
+    text = _report([result])
+    assert "Handler flag verification" in text
+    assert "After rollback" in text
+    assert "handler-A" in text
+    assert "Verified:" in text
+
+
 def test_section_a_renders_trace_rows_when_captured():
     result = mk(
         trace_status="CAPTURED",

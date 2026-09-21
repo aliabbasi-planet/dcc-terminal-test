@@ -86,6 +86,12 @@ def _render_change_evidence(result: TestResult) -> None:
             f"change is applied is judged from the procedure's own output (**{flag}**), and "
             "rollback uses the procedure's returned script (see the Rollback panel)."
         )
+        if result.sp_flag_rows:
+            st.caption(
+                f"Handler-level `{result.value}` (read via the procedure's own join): "
+                "before → after enable → after rollback."
+            )
+            st.table(result.sp_flag_rows)
         return
 
     if result.mode == "SIMULATION":
@@ -893,10 +899,25 @@ def _render_rollback_panel(result: TestResult) -> None:
             st.code("\n\n".join(result.sp_rollback_scripts), language="sql")
         already = any(e.get("ok") for e in result.rollback_log)
         if already:
-            st.success(
-                "Rolled back using the procedure's own script. Re-run below if you need to "
-                "restore again."
-            )
+            if result.sp_flag_verified is True:
+                st.success(
+                    "Rolled back using the procedure's own script — verified that "
+                    f"`{result.value}` returned to its pre-test value on "
+                    f"{len(result.sp_flag_rows)} affected handler(s)."
+                )
+            elif result.sp_flag_verified is False:
+                st.error(
+                    f"Rollback ran, but `{result.value}` did NOT return to its pre-test "
+                    "value on every handler — investigate before closing the change."
+                )
+            else:
+                st.success(
+                    "Rolled back using the procedure's own script (confirmed by rows "
+                    "affected; value-level verification was unavailable)."
+                )
+            if result.sp_flag_rows:
+                with st.popover("Show handler flag verification"):
+                    st.table(result.sp_flag_rows)
         else:
             st.warning("This live change is still applied. Run the procedure's restore script.")
         if st.button(

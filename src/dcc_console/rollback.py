@@ -9,6 +9,7 @@ are bound as parameters.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -16,6 +17,19 @@ from .catalog import TestDefinition
 from .database import DatabaseConnection
 
 logger = logging.getLogger(__name__)
+
+# The handler types a Bit 8 call touches, taken verbatim from the procedure's own
+# selection query. Used only to READ the same rows back for verification evidence.
+HANDLER_TYPE_FILTER = (
+    "handlerTerminalRequester",
+    "handlerTerminalRequesterCale",
+    "handlerTerminalRequesterNexo",
+    "handlerTerminalRequesterPayAtTable",
+    "handlerTerminalRequesterServiceApi",
+    "handlerTerminalStandalone",
+)
+
+_CONFIG_VALUE_RE = re.compile(r'config_value="([^"]*)"')
 
 
 @dataclass
@@ -130,3 +144,78 @@ def restore_via_scripts(
         trigger=trigger,
         error=None if affected > 0 else "Rollback script committed but affected 0 rows.",
     )
+
+
+def extract_flag_value(extra_config: str, flag_name: str) -> str | None:
+    """Return the ``config_value`` for a named flag inside an ``extra_config`` XML string.
+
+    Parses defensively — no XML library, no attribute-order assumption: find the
+    element that declares ``config_name="<flag>"`` and read its ``config_value``.
+    Returns None if the flag is absent or the value can't be read. Value-agnostic,
+    so it works for boolean flags and any other stored value alike.
+    """
+    if not extra_config or not flag_name:
+        return None
+    needle = f'config_name="{flag_name}"'
+    for element in str(extra_config).split("<"):
+        if needle in element:
+            match = _CONFIG_VALUE_RE.search(element)
+            if match:
+                return match.group(1)
+    return None
+
+
+def read_sp_flag_states(
+    connection: DatabaseConnection,
+    instance_identifier: str,
+    flag_name: str,
+) -> list[dict]:
+    """Read the named flag's current value on every handler a Bit 8 call targets.
+
+    Uses the procedure's own handler<->instance join (``instance_id``) and the same
+    ``handler_type`` filter, so we inspect exactly the rows the procedure changes.
+    This is additive evidence only: any failure returns ``[]`` so a rollback is
+    never affected by a verification-read problem.
+    """
+    if not instance_identifier or not flag_name:
+        return []
+    placeholders = ", ".join(["?"] * len(HANDLER_TYPE_FILTER))
+    # Safe: only `?` placeholders are interpolated (fixed count); all values are bound.
+    sql = (
+        "SELECT h.handler_name, CONVERT(nvarchar(max), h.extra_config) AS extra_config "  # noqa: S608
+        "FROM [cccintegrang].[handler] h WITH (NOLOCK) "
+        "INNER JOIN [cccintegrang].[instance] i WITH (NOLOCK) ON i.instance_id = h.instance_id "
+        "INNER JOIN [cccintegrang].[handler_type] ht WITH (NOLOCK) "
+        "ON ht.handler_type_id = h.handler_type_id "
+        "WHERE CONVERT(nvarchar(50), i.instance_identifier) = ? "
+        f"AND ht.handler_type_identifier IN ({placeholders})"
+    )
+    try:
+        frame = connection.query(sql, (instance_identifier, *HANDLER_TYPE_FILTER))
+    except Exception as exc:
+        logger.warning("Handler flag verification read failed: %s", exc)
+        return []
+    states: list[dict] = []
+    for _, row in frame.iterrows():
+        states.append(
+            {
+                "handler_name": row.get("handler_name"),
+                "flag_value": extract_flag_value(row.get("extra_config"), flag_name),
+            }
+        )
+    return states
+
+
+def flag_states_match(prior: list[dict], restored: list[dict]) -> bool:
+    """True if every handler's flag value in ``restored`` equals its value in ``prior``.
+
+    Requires the same set of handlers on both sides; empty input is treated as
+    "cannot confirm" (False) so we never claim verification we didn't perform.
+    """
+    if not prior or not restored:
+        return False
+    prior_by_handler = {s["handler_name"]: s["flag_value"] for s in prior}
+    restored_by_handler = {s["handler_name"]: s["flag_value"] for s in restored}
+    if set(prior_by_handler) != set(restored_by_handler):
+        return False
+    return all(prior_by_handler[h] == restored_by_handler[h] for h in prior_by_handler)
