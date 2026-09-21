@@ -494,6 +494,21 @@ def apply_rollback(
     script; otherwise we fall back to the generic column-restore.
     """
     if result.sp_rollback_scripts:
+        # The procedure also returns a rollback_script under @is_simulation=1 as a
+        # PREVIEW. That simulated change was never committed, so running the script
+        # would be an unrequested write. Refuse rather than touch the database.
+        if not result.is_live:
+            return RollbackOutcome(
+                ok=False,
+                rows=0,
+                sql="",
+                trigger=trigger,
+                error=(
+                    "Refusing to run the procedure's rollback script for a SIMULATION "
+                    "result — the simulated change was never committed, so there is "
+                    "nothing to restore."
+                ),
+            )
         outcome = restore_via_scripts(connection, result.sp_rollback_scripts, trigger=trigger)
         result.rollback_log.append(outcome.as_dict())
         if outcome.ok:

@@ -263,6 +263,16 @@ def test_apply_rollback_flags_unverified_mismatch():
     assert result.sp_flag_verified is False
 
 
+def test_apply_rollback_refuses_to_run_sp_script_for_simulation():
+    """A simulation's rollback_script is a PREVIEW - running it would be a stray write."""
+    conn = FakeConn(rows=1)
+    result = make_result(journal_id=None, mode="SIMULATION")
+    outcome = apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
+    assert outcome.ok is False
+    assert "SIMULATION" in outcome.error
+    assert conn.batches == []  # nothing was executed against the database
+
+
 def test_apply_rollback_verification_unavailable_leaves_none_but_rollback_ok():
     conn = FakeConn(rows=1, query_fail=True)
     result = make_result(
