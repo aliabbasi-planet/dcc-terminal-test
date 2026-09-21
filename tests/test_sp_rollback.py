@@ -53,6 +53,34 @@ def test_bit8_is_sp_managed_and_bit2_is_not():
     assert TEST_CATALOG[BIT2].sp_managed is False
 
 
+def test_every_bit8_handler_flag_shares_the_sp_managed_rollback_path():
+    """dccEnable, dccEnableAuth, dccEnableCompletion, ... are options on the SAME
+    definition, so all inherit sp_managed — no flag gets a different rollback."""
+    definition = TEST_CATALOG[BIT8]
+    assert definition.sp_managed is True
+    for flag in (
+        "dccEnable", "dccEnableAuth", "dccEnableCompletion", "dccEnableNfc",
+        "dccEnableNfcSingleTap", "dccEnableRefund", "dccFlagsEnabled",
+    ):
+        assert flag in definition.value_options
+
+
+def test_build_call_is_flag_agnostic_for_bit8():
+    """The EXEC is identical across flags: only @Extra_Config_Name changes, and
+    @Config_value is always 1. Proves the rollback path cannot differ by flag."""
+    from dcc_console.execution import build_call
+
+    definition = TEST_CATALOG[BIT8]
+    sql_enable, params_enable, _ = build_call(definition, "I1", "dccEnable", simulation=False)
+    sql_compl, params_compl, _ = build_call(
+        definition, "I1", "dccEnableCompletion", simulation=False
+    )
+    assert sql_enable == sql_compl  # same EXEC template
+    assert params_enable[2] == "dccEnable"
+    assert params_compl[2] == "dccEnableCompletion"
+    assert params_enable[3] == 1 and params_compl[3] == 1  # @Config_value always 1
+
+
 # --- script extraction -----------------------------------------------------
 
 
