@@ -1,18 +1,25 @@
-"""Read the procedure's internal trace output via ``[db].[fnDisplayTrace]``.
+"""Interpret the procedure's internal trace output.
 
-The procedure under test depends on a trace function, but its signature is
-not documented here.  Rather than guessing a call form, this module
-*discovers* the signature from ``sys.parameters`` and
-``OBJECTPROPERTY(..., 'IsTableFunction')`` at readiness time, builds the
-matching call, and caches the result.
+Corrected model (confirmed with the procedure owner):
 
-Why this matters for CAB: if the procedure surfaces validation failures
-through its trace rather than by raising a SQL exception, then a negative
-test that is genuinely rejected would otherwise be scored ``NOT-REJECTED``
-purely because the harness was not reading the right place.
+    ``[db].[fnDisplayTrace]`` is a **scalar string formatter**. The stored
+    procedure calls it *inside* ``PRINT`` statements, e.g.::
 
-Every failure path records a *reason*, so the report can state that the
-trace was attempted and why it was unavailable — never silently skipped.
+        PRINT db.fnDisplayTrace(GETDATE(), 'validating instance')
+
+    So the trace "log" is SQL Server's **message / info stream**, NOT a table
+    and NOT a queryable result set. pyodbc exposes that stream as
+    ``cursor.messages``.
+
+Therefore the trace is captured by draining ``cursor.messages`` during the
+procedure call (see :meth:`DatabaseConnection.call_procedure`), and this
+module simply *interprets* those captured messages — it does not issue any
+separate query.  A prior version tried ``SELECT * FROM fnDisplayTrace(...)``;
+that was wrong because the function needs two arguments and returns a
+formatted string rather than a trace log.
+
+``discover_trace_signature`` remains only to confirm, for the report, that
+the function exists and is scalar — documenting the instrumentation model.
 """
 
 from __future__ import annotations
@@ -25,56 +32,56 @@ from .database import DatabaseConnection
 
 logger = logging.getLogger(__name__)
 
-# Parameter names that plausibly accept the current session id.
-_SPID_HINTS = ("spid", "session", "sessionid", "session_id", "connection")
-
-# Maximum trace rows retained per call.
 MAX_TRACE_ROWS = 200
 
 
 @dataclass(frozen=True)
 class TraceSignature:
-    """What we discovered about the trace function."""
+    """What we confirmed about the trace function, for the report."""
 
     exists: bool
-    is_table_valued: bool | None
-    parameters: tuple[dict, ...] = ()
-    call_sql: str | None = None
+    is_scalar: bool | None = None
+    parameter_count: int | None = None
     unavailable_reason: str | None = None
 
     @property
-    def usable(self) -> bool:
-        return self.exists and self.call_sql is not None
+    def confirmed_print_formatter(self) -> bool:
+        """True when the function exists and is scalar (the PRINT-formatter model)."""
+        return bool(self.exists) and bool(self.is_scalar)
 
     def as_dict(self) -> dict:
         return {
             "function": TRACE_FUNCTION,
             "exists": self.exists,
-            "is_table_valued": self.is_table_valued,
-            "parameter_count": len(self.parameters),
-            "parameters": [p.get("parameter") for p in self.parameters],
-            "call_sql": self.call_sql,
-            "usable": self.usable,
+            "is_scalar": self.is_scalar,
+            "parameter_count": self.parameter_count,
+            "confirmed_print_formatter": self.confirmed_print_formatter,
+            "capture_mechanism": (
+                "cursor.messages (SQL Server PRINT / info stream)"
+            ),
             "unavailable_reason": self.unavailable_reason,
         }
 
 
 @dataclass
 class TraceOutput:
-    """Trace rows captured for one procedure call."""
+    """Trace lines captured from the PRINT message stream for one call."""
 
     rows: list[dict] = field(default_factory=list)
-    status: str = "NOT_ATTEMPTED"
+    status: str = "NOT_CAPTURED"
     reason: str | None = None
 
     @property
     def text(self) -> str:
-        """Flatten every captured row into one searchable blob."""
         if not self.rows:
             return ""
         parts: list[str] = []
         for row in self.rows:
-            parts.extend(str(value) for value in row.values() if value is not None)
+            if "message" in row:
+                if row["message"] is not None:
+                    parts.append(str(row["message"]))
+            else:
+                parts.extend(str(v) for v in row.values() if v is not None)
         return " ".join(parts)
 
     def as_dict(self) -> dict:
@@ -82,154 +89,75 @@ class TraceOutput:
 
 
 def discover_trace_signature(connection: DatabaseConnection) -> TraceSignature:
-    """Inspect the trace function and build a call form for it."""
-    meta_sql = (
+    """Confirm the trace function exists and is a scalar formatter.
+
+    This is documentation only — it does not affect how the trace is captured
+    (that happens through the PRINT message stream during the call).
+    """
+    sql = (
         "SELECT "
         "  CASE WHEN OBJECT_ID(?) IS NULL THEN 0 ELSE 1 END AS fn_exists, "
-        "  OBJECTPROPERTY(OBJECT_ID(?), 'IsTableFunction')  AS is_tvf, "
-        "  OBJECTPROPERTY(OBJECT_ID(?), 'IsScalarFunction') AS is_scalar"
+        "  OBJECTPROPERTY(OBJECT_ID(?), 'IsScalarFunction') AS is_scalar, "
+        "  (SELECT COUNT(*) FROM sys.parameters "
+        "     WHERE object_id = OBJECT_ID(?) AND is_output = 0) AS param_count"
     )
     try:
-        meta = connection.query(meta_sql, (TRACE_FUNCTION, TRACE_FUNCTION, TRACE_FUNCTION))
+        frame = connection.query(sql, (TRACE_FUNCTION, TRACE_FUNCTION, TRACE_FUNCTION))
     except Exception as exc:
         return TraceSignature(
             exists=False,
-            is_table_valued=None,
             unavailable_reason=f"Could not inspect {TRACE_FUNCTION}: {exc}",
         )
 
-    if meta.empty or not bool(meta.iloc[0].get("fn_exists")):
+    if frame.empty or not bool(frame.iloc[0].get("fn_exists")):
         return TraceSignature(
             exists=False,
-            is_table_valued=None,
             unavailable_reason=(
-                f"{TRACE_FUNCTION} does not exist in this database, so procedure "
-                "trace output cannot be read."
+                f"{TRACE_FUNCTION} does not exist in this database. The procedure's "
+                "trace output would therefore not be formatted; check the deployment."
             ),
         )
 
-    row = meta.iloc[0]
-    is_tvf = bool(row.get("is_tvf"))
+    row = frame.iloc[0]
     is_scalar = bool(row.get("is_scalar"))
-
-    param_sql = (
-        "SELECT p.name AS parameter, TYPE_NAME(p.user_type_id) AS type_name, "
-        "       p.max_length, p.parameter_id "
-        "FROM sys.parameters AS p "
-        "WHERE p.object_id = OBJECT_ID(?) AND p.is_output = 0 "
-        "ORDER BY p.parameter_id"
-    )
-    try:
-        params_frame = connection.query(param_sql, (TRACE_FUNCTION,))
-    except Exception as exc:
-        return TraceSignature(
-            exists=True,
-            is_table_valued=is_tvf,
-            unavailable_reason=f"Could not read parameters of {TRACE_FUNCTION}: {exc}",
+    param_count = int(row.get("param_count") or 0)
+    reason = None
+    if not is_scalar:
+        reason = (
+            f"{TRACE_FUNCTION} exists but is not reported as a scalar function. The "
+            "expected model is a scalar formatter used inside PRINT; confirm with the "
+            "procedure owner."
         )
-
-    parameters = tuple(params_frame.to_dict("records")) if not params_frame.empty else ()
-    args = _build_arguments(parameters)
-
-    if args is None:
-        return TraceSignature(
-            exists=True,
-            is_table_valued=is_tvf,
-            parameters=parameters,
-            unavailable_reason=(
-                f"{TRACE_FUNCTION} takes parameters this harness cannot supply "
-                f"automatically ({', '.join(str(p.get('parameter')) for p in parameters)}). "
-                "Trace output is therefore not read. Provide the intended argument "
-                "values to enable it."
-            ),
-        )
-
-    arg_list = ", ".join(args)
-    if is_tvf:
-        call_sql = f"SELECT * FROM {TRACE_FUNCTION}({arg_list})"
-    elif is_scalar:
-        call_sql = f"SELECT {TRACE_FUNCTION}({arg_list}) AS trace_output"
-    else:
-        return TraceSignature(
-            exists=True,
-            is_table_valued=None,
-            parameters=parameters,
-            unavailable_reason=(
-                f"{TRACE_FUNCTION} is neither a table-valued nor a scalar function "
-                "according to OBJECTPROPERTY, so no call form could be built."
-            ),
-        )
-
     return TraceSignature(
         exists=True,
-        is_table_valued=is_tvf,
-        parameters=parameters,
-        call_sql=call_sql,
+        is_scalar=is_scalar,
+        parameter_count=param_count,
+        unavailable_reason=reason,
     )
 
 
-def _build_arguments(parameters: tuple[dict, ...]) -> list[str] | None:
-    """Return SQL argument expressions, or ``None`` if we cannot supply them.
+def trace_from_messages(messages: list[str]) -> TraceOutput:
+    """Build a TraceOutput from the captured PRINT message stream.
 
-    Only parameters we can fill safely are accepted: a session-id-looking
-    parameter receives ``@@SPID``; anything else is refused rather than
-    guessed, because passing a wrong value could return another session's
-    trace and corrupt the evidence.
+    Every ``PRINT db.fnDisplayTrace(...)`` line arrives as one server message,
+    so each message is one trace line.
     """
-    if not parameters:
-        return []
-
-    args: list[str] = []
-    for param in parameters:
-        raw_name = str(param.get("parameter") or "").lstrip("@").lower()
-        if any(hint in raw_name for hint in _SPID_HINTS):
-            args.append("@@SPID")
-        else:
-            return None
-    return args
-
-
-def read_trace(
-    connection: DatabaseConnection,
-    signature: TraceSignature | None,
-) -> TraceOutput:
-    """Execute the discovered trace call and return its rows."""
-    if signature is None:
+    if not messages:
         return TraceOutput(
-            status="NOT_ATTEMPTED",
-            reason="Trace signature was never discovered; re-run pre-flight readiness.",
+            status="EMPTY",
+            reason="The procedure emitted no PRINT/trace messages for this call.",
         )
-    if not signature.usable:
-        return TraceOutput(status="UNAVAILABLE", reason=signature.unavailable_reason)
-
-    try:
-        frame = connection.query(signature.call_sql)
-    except Exception as exc:
-        return TraceOutput(
-            status="ERRORED",
-            reason=f"Trace read failed: {exc}",
-        )
-
-    if frame.empty:
-        return TraceOutput(status="EMPTY", reason="The trace function returned no rows.")
-
-    rows = frame.head(MAX_TRACE_ROWS).to_dict("records")
-    truncated = len(frame) > MAX_TRACE_ROWS
-    return TraceOutput(
-        status="CAPTURED",
-        rows=rows,
-        reason=(
-            f"{len(frame)} row(s) returned; first {MAX_TRACE_ROWS} retained."
-            if truncated
-            else None
-        ),
-    )
+    rows = [{"line": i + 1, "message": m} for i, m in enumerate(messages[:MAX_TRACE_ROWS])]
+    reason = None
+    if len(messages) > MAX_TRACE_ROWS:
+        reason = f"{len(messages)} trace line(s); first {MAX_TRACE_ROWS} retained."
+    return TraceOutput(status="CAPTURED", rows=rows, reason=reason)
 
 
 __all__ = [
     "TraceSignature",
     "TraceOutput",
     "discover_trace_signature",
-    "read_trace",
+    "trace_from_messages",
     "MAX_TRACE_ROWS",
 ]

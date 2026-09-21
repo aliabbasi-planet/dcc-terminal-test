@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import pandas as pd
 import pyodbc
 
-from .config import CANDIDATE_ODBC_DRIVERS, CONNECT_TIMEOUT_S
+from .config import CANDIDATE_ODBC_DRIVERS, CONNECT_TIMEOUT_S, RETURN_CODE_COLUMN
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ class ProcedureOutput:
 
     grids: list[pd.DataFrame]
     messages: list[str]
+    return_code: int | None = None
 
 
 class DatabaseConnection:
@@ -150,6 +151,7 @@ class DatabaseConnection:
         grids: list[pd.DataFrame] = []
         messages: list[str] = []
         seen: set[str] = set()
+        return_code: int | None = None
 
         def _drain_messages() -> None:
             """Append any new messages, preserving order and skipping repeats."""
@@ -167,7 +169,16 @@ class DatabaseConnection:
                 if cursor.description:
                     columns = [d[0] for d in cursor.description]
                     rows = [tuple(row) for row in cursor.fetchall()]
-                    grids.append(pd.DataFrame(rows, columns=columns))
+                    frame = pd.DataFrame(rows, columns=columns)
+                    # The return-code sentinel is captured, never shown as preview.
+                    if list(columns) == [RETURN_CODE_COLUMN]:
+                        if not frame.empty and frame.iloc[0, 0] is not None:
+                            try:
+                                return_code = int(frame.iloc[0, 0])
+                            except (TypeError, ValueError):
+                                return_code = None
+                    else:
+                        grids.append(frame)
                 _drain_messages()
                 if not cursor.nextset():
                     break
@@ -179,7 +190,7 @@ class DatabaseConnection:
                 connection.rollback()
             else:
                 connection.commit()
-        return ProcedureOutput(grids=grids, messages=messages)
+        return ProcedureOutput(grids=grids, messages=messages, return_code=return_code)
 
     def safe_rollback(self) -> None:
         if self.connection is not None:

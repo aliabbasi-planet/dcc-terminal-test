@@ -22,6 +22,20 @@ def test_build_call_is_fully_parameterised(key):
 
 
 @pytest.mark.parametrize("key", TEST_KEYS)
+def test_build_call_wraps_return_code_capture(key):
+    definition = TEST_CATALOG[key]
+    value = definition.value_options[0] if definition.value_options else "SAMPLE"
+    sql, params, rendered = build_call(definition, "TARGET-1", value, simulation=True)
+
+    # Return code is captured without adding any parameter placeholders.
+    assert "DECLARE @dcc_rc INT" in sql
+    assert "EXEC @dcc_rc =" in sql
+    assert "SELECT @dcc_rc AS dcc_return_code" in sql
+    assert sql.count("?") == len(params)
+    assert "dcc_return_code" in rendered
+
+
+@pytest.mark.parametrize("key", TEST_KEYS)
 def test_target_travels_as_json_parameter(key):
     definition = TEST_CATALOG[key]
     value = definition.value_options[0] if definition.value_options else "SAMPLE"

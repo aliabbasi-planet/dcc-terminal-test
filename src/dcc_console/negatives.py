@@ -22,7 +22,7 @@ from .catalog import TEST_CATALOG, TestDefinition
 from .database import DatabaseConnection
 from .execution import PERMISSION_DENIED_MARKER, TestResult, build_call
 from .rollback import read_state
-from .trace import TraceSignature, read_trace
+from .trace import TraceSignature, trace_from_messages
 
 # Substrings that, seen in a server message or a returned grid, indicate the
 # procedure actively rejected the input rather than silently accepting it.
@@ -53,6 +53,10 @@ class NegativeCase:
     expected: str
     empty_payload: bool = False
     function_override: str | None = None
+    # Coverage bucket: "non-existent", "invalid", or "duplicate". Purely
+    # descriptive — it groups the battery so the report can show that all three
+    # scenario families are exercised (CAB point 7).
+    category: str = "invalid"
 
     @property
     def definition(self) -> TestDefinition:
@@ -86,6 +90,7 @@ def default_negative_cases(
             value="dccEnable",
             invalid_reason="instance_identifier that does not exist",
             expected="Procedure rejects the call (no such instance).",
+            category="non-existent",
         ),
         NegativeCase(
             name="Invalid terminal identifier",
@@ -94,6 +99,7 @@ def default_negative_cases(
             value="Standard",
             invalid_reason="terminal_identifier that does not exist",
             expected="Procedure rejects the call (no such terminal).",
+            category="non-existent",
         ),
         NegativeCase(
             name="Invalid location number",
@@ -102,6 +108,7 @@ def default_negative_cases(
             value="Add",
             invalid_reason="location_no that does not exist",
             expected="Procedure rejects the call (no such location).",
+            category="non-existent",
         ),
         NegativeCase(
             name="Invalid handler flag name",
@@ -110,6 +117,7 @@ def default_negative_cases(
             value="dccNotARealFlag",
             invalid_reason="Extra_Config_Name that is not a known handler flag",
             expected="Procedure rejects the unknown configuration name.",
+            category="invalid",
         ),
         NegativeCase(
             name="Invalid location function name",
@@ -119,6 +127,7 @@ def default_negative_cases(
             invalid_reason="extra_function_name that is not a known DCC function",
             expected="Procedure rejects the unknown extra_function name.",
             function_override="DCCNotARealFunction",
+            category="invalid",
         ),
         NegativeCase(
             name="Invalid config download version",
@@ -127,6 +136,38 @@ def default_negative_cases(
             value="NotAVersion",
             invalid_reason=version_reason,
             expected="Procedure rejects the unknown version description.",
+            category="invalid",
+        ),
+        NegativeCase(
+            name="Duplicate handler flag (re-apply already-set flag)",
+            base_key="Bit 8 — DCC Handler Flags (instance)",
+            target=valid_instance,
+            value="dccEnable",
+            invalid_reason=(
+                "re-applies a handler flag that is expected to already be set on the "
+                "instance — a duplicate write"
+            ),
+            expected=(
+                "Procedure should handle the duplicate gracefully: reject it as already "
+                "present or apply it idempotently (no net change). A silent partial change "
+                "or an unexpected error is a finding."
+            ),
+            category="duplicate",
+        ),
+        NegativeCase(
+            name="Duplicate location function (re-add existing node)",
+            base_key="Bit 1 — DCC Xpress CO (location extra_function)",
+            target=valid_location,
+            value="Add",
+            invalid_reason=(
+                "adds a DCCXpressCO extra_function node that is expected to already exist "
+                "on the location — a duplicate node"
+            ),
+            expected=(
+                "Procedure should not create a duplicate node: reject the duplicate or "
+                "no-op idempotently. Two identical nodes in extra_function is a finding."
+            ),
+            category="duplicate",
         ),
         NegativeCase(
             name="Missing target JSON (empty array)",
@@ -136,6 +177,7 @@ def default_negative_cases(
             invalid_reason="empty JSON target array — no target supplied",
             expected="Procedure rejects or no-ops the empty target set.",
             empty_payload=True,
+            category="invalid",
         ),
     ]
 
@@ -197,17 +239,20 @@ def run_negative(
     error: str | None = None
     grids: list[pd.DataFrame] = []
     messages: list[str] = []
+    return_code: int | None = None
 
     try:
         output = connection.call_procedure(sql, params, rollback=True)
         grids, messages = output.grids, output.messages
+        return_code = output.return_code
     except Exception as exc:
         error = str(exc)
         connection.safe_rollback()
 
-    # Read the procedure's trace — a validation failure recorded only here
-    # would otherwise be mis-scored as NOT-REJECTED.
-    trace = read_trace(connection, trace_signature)
+    # The procedure surfaces its trace via PRINT db.fnDisplayTrace(...); those
+    # lines arrive on the message stream captured above. A validation failure
+    # recorded only there would otherwise be mis-scored as NOT-REJECTED.
+    trace = trace_from_messages(messages)
 
     after = read_state(connection, definition, case.target)
     persisted = before != after
@@ -260,6 +305,7 @@ def run_negative(
         trace_rows=trace.rows,
         trace_status=trace.status,
         trace_reason=trace.reason,
+        return_code=return_code,
     )
 
 

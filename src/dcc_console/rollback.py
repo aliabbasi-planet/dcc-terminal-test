@@ -50,15 +50,20 @@ def restore_statement(definition: TestDefinition) -> str:
     )
 
 
-def read_state(connection: DatabaseConnection, definition: TestDefinition, identifier: str):
-    """Read the verified column for one row, or ``None`` if it cannot be read."""
+def read_statement(definition: TestDefinition) -> str:
+    """The exact SELECT used to read the verified column before/after a call."""
     verify = definition.verify
     # Identifiers are catalogue constants; the row key is a bound parameter.
-    sql = (
+    return (
         f"SELECT TOP (1) CONVERT(nvarchar(max), {verify.column}) "  # noqa: S608
         f"FROM {verify.table} "
         f"WHERE CONVERT(nvarchar(50), {verify.key}) = ?"
     )
+
+
+def read_state(connection: DatabaseConnection, definition: TestDefinition, identifier: str):
+    """Read the verified column for one row, or ``None`` if it cannot be read."""
+    sql = read_statement(definition)
     try:
         return connection.scalar(sql, (identifier,))
     except Exception as exc:

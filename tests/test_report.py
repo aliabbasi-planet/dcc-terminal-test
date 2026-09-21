@@ -92,79 +92,94 @@ def test_report_explains_why_digest_unavailable():
 
 def test_section_a_shows_execution_evidence():
     text = _report([mk()])
-    assert "EXEC statement actually issued" in text
+    assert "Database code exercised" in text
+    assert "the `EXEC` actually issued" in text
     assert "Input JSON payload" in text
-    assert "Before / proposed / after evidence" in text
+    assert "Before / applied change / after evidence" in text
     assert '[{"instance_identifier":"I000000001"}]' in text
+
+
+def test_section_a_shows_verification_and_rollback_sql():
+    text = _report([mk()])
+    # The catalogue-derived read + compensating UPDATE must appear as real SQL.
+    assert "Verification read" in text
+    assert "Compensating rollback statement" in text
+    assert "UPDATE" in text and "SELECT TOP (1)" in text
+
+
+def test_section_a_shows_database_message_stream():
+    text = _report([mk(messages=["Trace: proposing dccEnable=true"])])
+    assert "Database message stream" in text
+    assert "Trace: proposing dccEnable=true" in text
 
 
 def test_section_a_renders_trace_rows_when_captured():
     result = mk(
         trace_status="CAPTURED",
-        trace_rows=[{"step": "validate", "message": "instance ok"}],
+        trace_rows=[{"line": 1, "message": "instance ok"}],
     )
     text = _report([result])
-    assert "Procedure trace (`fnDisplayTrace`) — CAPTURED" in text
+    assert "Procedure trace — `fnDisplayTrace` PRINT output (CAPTURED)" in text
     assert "instance ok" in text
 
 
-def test_section_a_explains_trace_unavailable_rather_than_omitting_it():
+def test_section_a_explains_empty_trace_rather_than_omitting_it():
     result = mk(
-        trace_status="UNAVAILABLE",
-        trace_reason="takes parameters this harness cannot supply",
+        trace_status="EMPTY",
+        trace_reason=None,
     )
     text = _report([result])
-    assert "Procedure trace (`fnDisplayTrace`) — UNAVAILABLE" in text
-    assert "attempted, not" in text
-    assert "cannot supply" in text
+    assert "Procedure trace — `fnDisplayTrace` PRINT output (EMPTY)" in text
+    assert "no PRINT/trace messages" in text
 
 
-def test_trace_instrumentation_block_states_readability():
+def test_trace_instrumentation_block_confirms_print_formatter():
     meta = dict(META)
     meta["trace_signature"] = {
         "function": "[db].[fnDisplayTrace]",
         "exists": True,
-        "is_table_valued": True,
-        "parameter_count": 0,
-        "call_sql": "SELECT * FROM [db].[fnDisplayTrace]()",
-        "usable": True,
+        "is_scalar": True,
+        "parameter_count": 2,
+        "confirmed_print_formatter": True,
+        "capture_mechanism": "cursor.messages (SQL Server PRINT / info stream)",
         "unavailable_reason": None,
     }
     text = cab_report([mk()], meta)
     assert "Trace instrumentation" in text
-    assert "SELECT * FROM [db].[fnDisplayTrace]()" in text
-    assert "**is** detected by the negative validation battery" in text
+    assert "scalar string formatter" in text
+    assert "cursor.messages" in text
+    assert "still" in text and "negative validation battery" in text
 
 
-def test_trace_instrumentation_warns_when_not_readable():
+def test_trace_instrumentation_warns_when_not_scalar():
     meta = dict(META)
     meta["trace_signature"] = {
         "function": "[db].[fnDisplayTrace]",
         "exists": True,
-        "is_table_valued": True,
-        "parameter_count": 1,
-        "call_sql": None,
-        "usable": False,
-        "unavailable_reason": "takes parameters this harness cannot supply automatically",
+        "is_scalar": False,
+        "parameter_count": 2,
+        "confirmed_print_formatter": False,
+        "capture_mechanism": "cursor.messages (SQL Server PRINT / info stream)",
+        "unavailable_reason": "exists but is not reported as a scalar function",
     }
     text = cab_report([mk()], meta)
-    assert "Trace not readable" in text
-    assert "cannot be treated as a confirmed validation" in text
+    assert "Formatter not confirmed as scalar" in text
+    assert "Message capture still occurs" in text
 
 
-def test_section_c_not_rejected_is_inconclusive_when_trace_unreadable():
+def test_section_c_not_rejected_is_conclusive_because_stream_is_captured():
     neg = mk(
         test_key="Negative — Invalid instance identifier",
         is_negative=True,
         status="REVIEW",
         error=None,
         messages=[],
-        trace_status="UNAVAILABLE",
-        trace_reason="signature unknown",
+        trace_status="EMPTY",
+        trace_reason=None,
     )
     text = _report([mk(), neg])
     assert "NOT-REJECTED" in text
-    assert "not yet conclusive" in text
+    assert "PRINT/message stream is captured on every call" in text
 
 
 def test_section_c_not_rejected_is_conclusive_when_trace_readable():

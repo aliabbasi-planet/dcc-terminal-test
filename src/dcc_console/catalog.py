@@ -161,16 +161,17 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             ),
             business_meaning=(
                 "The config download version selects which configuration payload a terminal "
-                "pulls on its next TMS call. Moving a terminal to Standard aligns it with the "
-                "baseline DCC configuration. An incorrect version can push unsupported "
-                "settings to a live payment terminal and take it out of service."
+                "pulls on its next TMS call. The procedure supports two versions: `1` = "
+                "Standard (the baseline DCC configuration) and `2` = ECB DCC (the European "
+                "Central Bank conversion-rate variant). An incorrect version can push "
+                "unsupported settings to a live payment terminal and take it out of service."
             ),
             mechanism=(
-                "The procedure resolves the version description to its numeric code and "
-                "updates `configdownload_version` on the terminal row."
+                "The procedure resolves the version description (Standard / ECB DCC) to its "
+                "numeric code (1 / 2) and updates `configdownload_version` on the terminal row."
             ),
             value_label="Target version description",
-            value_options=("Standard", "Enhanced", "Legacy"),
+            value_options=("Standard", "ECB DCC"),
             proc_args=("@terminal_json", "@ConfigDownloadVersionDesc", "@is_simulation"),
             verify=VerifiedColumn(
                 "[cccintegrang].[emv_terminal]",

@@ -9,11 +9,11 @@ from datetime import datetime
 import pandas as pd
 
 from .catalog import TestDefinition
-from .config import PROCEDURE
+from .config import PROCEDURE, RETURN_CODE_COLUMN
 from .database import DatabaseConnection
 from .journal import get_journal
 from .rollback import RollbackOutcome, read_state, restore_state, restore_statement
-from .trace import TraceSignature, read_trace
+from .trace import TraceSignature, trace_from_messages
 
 PERMISSION_DENIED_MARKER = "EXECUTE permission was denied"
 
@@ -54,17 +54,22 @@ class TestResult:
     is_negative: bool = False
     journal_id: int | None = None
     trace_rows: list[dict] = field(default_factory=list)
-    trace_status: str = "NOT_ATTEMPTED"
+    trace_status: str = "NOT_CAPTURED"
     trace_reason: str | None = None
+    return_code: int | None = None
 
     @property
     def trace_text(self) -> str:
-        """Flatten trace rows into one searchable blob."""
+        """Flatten trace messages into one searchable blob."""
         if not self.trace_rows:
             return ""
         parts: list[str] = []
         for row in self.trace_rows:
-            parts.extend(str(v) for v in row.values() if v is not None)
+            if "message" in row:
+                if row["message"] is not None:
+                    parts.append(str(row["message"]))
+            else:
+                parts.extend(str(v) for v in row.values() if v is not None)
         return " ".join(parts)
 
     @property
@@ -201,10 +206,34 @@ def build_call(
     else:
         raise ValueError(f"Unsupported display_config bit: {bit}")
 
+    sql = _wrap_with_return_code(sql)
     rendered = sql
     for value in params:
         rendered = rendered.replace("?", repr(value), 1)
     return sql, params, rendered
+
+
+def _wrap_with_return_code(exec_sql: str) -> str:
+    """Wrap an ``EXEC proc ...`` so the procedure's integer return code is captured.
+
+    Turns ``EXEC <proc> ...`` into::
+
+        DECLARE @dcc_rc INT;
+        EXEC @dcc_rc = <proc> ...;
+        SELECT @dcc_rc AS dcc_return_code;
+
+    No parameter placeholders are added, so binding is unchanged. The trailing
+    SELECT is side-effect free and is stripped from the preview grids by the
+    database layer (recognised by the ``dcc_return_code`` sentinel column).
+    """
+    marker = f"EXEC {PROCEDURE}"
+    if marker not in exec_sql:
+        return exec_sql
+    captured = exec_sql.replace(marker, f"EXEC @dcc_rc = {PROCEDURE}", 1)
+    return (
+        f"DECLARE @dcc_rc INT;\n{captured};\n"
+        f"SELECT @dcc_rc AS {RETURN_CODE_COLUMN};"
+    )
 
 
 def classify(simulation: bool, error: str | None, persisted: bool) -> str:
@@ -237,6 +266,7 @@ def run_test(
     error: str | None = None
     grids: list[pd.DataFrame] = []
     messages: list[str] = []
+    return_code: int | None = None
     rollback_log: list[dict] = []
     journal_id: int | None = None
 
@@ -261,13 +291,15 @@ def run_test(
     try:
         output = connection.call_procedure(sql, params, rollback=simulation)
         grids, messages = output.grids, output.messages
+        return_code = output.return_code
     except Exception as exc:
         error = str(exc)
         connection.safe_rollback()
 
-    # Read the procedure's own trace output — this is where validation
-    # failures may surface instead of as a raised SQL exception.
-    trace = read_trace(connection, trace_signature)
+    # The procedure surfaces its trace via PRINT db.fnDisplayTrace(...); those
+    # lines arrive on the message stream, which we already captured above.
+    # Validation failures may surface here instead of as a raised SQL exception.
+    trace = trace_from_messages(messages)
 
     after = read_state(connection, definition, target_identifier)
     persisted = before != after
@@ -334,6 +366,7 @@ def run_test(
         trace_rows=trace.rows,
         trace_status=trace.status,
         trace_reason=trace.reason,
+        return_code=return_code,
     )
 
 

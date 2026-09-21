@@ -18,8 +18,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from .catalog import TEST_CATALOG
+from .config import configdownload_version_text
 from .coverage import compute_coverage, coverage_totals
 from .execution import TestResult
+from .rollback import read_statement, restore_statement
 
 _MAX_GRID_ROWS = 25
 _MAX_CELL = 200
@@ -35,6 +38,13 @@ def _clip(value: object, limit: int = 1200) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}… [{len(text) - limit} more characters]"
+
+
+def _state_cell(result: TestResult, value: object) -> str:
+    """Render a verified-column value; Bit 2 codes carry their version name."""
+    if result.bit == 2:
+        return configdownload_version_text(value)
+    return _clip(value, 400)
 
 
 def _records_to_table(records: list[dict]) -> list[str]:
@@ -229,42 +239,55 @@ def _procedure_version(meta: dict) -> list[str]:
 
 
 def _trace_instrumentation(meta: dict) -> list[str]:
-    """Describe whether the procedure's trace function could be read."""
+    """Describe how the procedure's trace is captured (PRINT / message stream)."""
     sig = meta.get("trace_signature")
     lines = ["", "### Trace instrumentation", ""]
+    lines += [
+        "The procedure emits its internal trace through "
+        "`PRINT [db].[fnDisplayTrace](GETDATE(), '<message>')`. `fnDisplayTrace` is a "
+        "**scalar string formatter**, so the trace is not a table or result set — it is "
+        "SQL Server's message / info stream. This harness captures that stream via "
+        "`cursor.messages` during every call and preserves it across all result sets, so "
+        "**the procedure's messages and logs are captured and shown** in both the "
+        "application and this report (Section A, per test).",
+    ]
     if not sig:
-        lines.append(
-            "_Trace availability was not recorded for this run. Re-run pre-flight readiness "
-            "so the report can state whether the procedure's internal trace was readable._"
-        )
+        lines += [
+            "",
+            "_The formatter signature was not recorded for this run. Re-run pre-flight "
+            "readiness so the report can also confirm the function exists and is scalar. "
+            "Message capture itself does not depend on this check._",
+        ]
         return lines
 
-    usable = bool(sig.get("usable"))
+    confirmed = bool(sig.get("confirmed_print_formatter"))
     lines += [
+        "",
         "| Attribute | Value |",
         "| --- | --- |",
         f"| Trace function | `{sig.get('function', '?')}` |",
         f"| Exists | {_yes_no(bool(sig.get('exists')))} |",
-        f"| Table-valued | {sig.get('is_table_valued')} |",
+        f"| Scalar function | {_yes_no(bool(sig.get('is_scalar')))} |",
         f"| Parameters | {sig.get('parameter_count', 0)} |",
-        f"| Readable by this harness | {_yes_no(usable)} |",
+        f"| Capture mechanism | {sig.get('capture_mechanism', 'cursor.messages')} |",
+        f"| Confirmed PRINT formatter | {_yes_no(confirmed)} |",
     ]
-    if sig.get("call_sql"):
-        lines += ["", "Call form used to read the trace:", "", "```sql", sig["call_sql"], "```"]
-    if usable:
+    if confirmed:
         lines += [
             "",
-            "Because the trace is readable, a validation failure recorded only in the trace "
-            "**is** detected by the negative validation battery in Section C.",
+            "Because the trace is captured from the message stream on every call, a "
+            "validation failure the procedure records **only** in its trace is still "
+            "detected by the negative validation battery in Section C.",
         ]
     else:
+        reason = sig.get("unavailable_reason") or "No reason recorded."
         lines += [
             "",
-            f"**Trace not readable.** {sig.get('unavailable_reason') or 'No reason recorded.'}",
+            f"**Formatter not confirmed as scalar.** {reason}",
             "",
-            "This is material to Section C: if the procedure records validation failures only "
-            "in its trace, a `NOT-REJECTED` verdict cannot be treated as a confirmed validation "
-            "gap until the trace can be read.",
+            "Message capture still occurs (it does not depend on the formatter's shape), "
+            "but the procedure owner should confirm the trace is emitted via `PRINT` so "
+            "that a `NOT-REJECTED` verdict in Section C can be trusted.",
         ]
     return lines
 
@@ -296,6 +319,99 @@ def _legend() -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _return_code_cell(result: TestResult) -> str:
+    code = getattr(result, "return_code", None)
+    return "not returned (null)" if code is None else f"`{code}`"
+
+
+def _return_code_note(result: TestResult) -> list[str]:
+    """Interpret the captured stored-procedure return code (CAB point 6)."""
+    code = getattr(result, "return_code", None)
+    if code is None:
+        return [
+            "_Return-code signalling: the call was wrapped as `EXEC @rc = proc …; SELECT "
+            "@rc` but no integer return code was produced. The procedure signals outcome "
+            "through raised exceptions and its PRINT/message stream, not a return code._",
+            "",
+        ]
+    if code == 0:
+        return [
+            f"_Return-code signalling: the procedure returned `{code}` (SQL Server's default "
+            "success code). Combined with the absence of a raised error, this indicates the "
+            "batch completed; it does not by itself prove a configuration change._",
+            "",
+        ]
+    return [
+        f"_Return-code signalling: the procedure returned a **non-zero** code `{code}`, which "
+        "typically indicates a coded failure/branch. Review against the procedure owner's "
+        "documented return-code contract._",
+        "",
+    ]
+
+
+def _db_code_block(result: TestResult) -> list[str]:
+    """Show the actual SQL used to read, change, and restore the verified column.
+
+    CAB point 3: the report must contain the DB code — not just prose — for the
+    call, the verification read, and the rollback, plus the DB messages.
+    """
+    definition = TEST_CATALOG.get(result.test_key)
+    lines = ["", "**Database code exercised**", ""]
+
+    lines += [
+        "_1 · Procedure call (the `EXEC` actually issued)_",
+        "",
+        "```sql",
+        result.sql,
+        "```",
+    ]
+
+    if definition is not None:
+        verify = definition.verify
+        read_sql = read_statement(definition)
+        restore_sql = restore_statement(definition)
+        lines += [
+            "",
+            "_2 · Verification read (before and after the call, bound key = "
+            f"`{_cell(result.target)}`)_",
+            "",
+            "```sql",
+            f"-- verified column: {verify.table}.{verify.column}",
+            read_sql,
+            "```",
+            "",
+            "_3 · Compensating rollback statement (restores the captured pre-test value)_",
+            "",
+            "```sql",
+            f"-- bound params: (?1 = pre-test value = {_cell(_clip(result.state_before, 120))}, "
+            f"?2 = {_cell(result.target)})",
+            restore_sql,
+            "```",
+        ]
+    else:
+        lines += [
+            "",
+            "_Verification/rollback SQL is catalogue-derived and is shown per positive test; "
+            "this row has no catalogue definition._",
+        ]
+
+    # If a rollback actually executed, show the exact statement, row count and result.
+    if result.rollback_log:
+        lines += ["", "_4 · Rollback statements actually executed_", ""]
+        for entry in result.rollback_log:
+            outcome = "succeeded" if entry.get("ok") else f"FAILED — {entry.get('error', '?')}"
+            lines += [
+                f"- **{entry.get('trigger', '?').capitalize()}** at {entry.get('at', '?')} · "
+                f"rows affected: {entry.get('rows', '?')} · {outcome}",
+                "",
+                "```sql",
+                str(entry.get("sql", "(not recorded)")),
+                "```",
+            ]
+
+    return lines
+
+
 def _evidence_block(index: int, result: TestResult) -> list[str]:
     lines = [
         "",
@@ -307,29 +423,31 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         f"- **Verdict**: `{result.verdict_code}` — {result.verdict_detail}",
         f"- **Procedure parameters**: {', '.join(result.proc_args) or '(see EXEC below)'}",
         "",
-        "**EXEC statement actually issued**",
-        "",
-        "```sql",
-        result.sql,
-        "```",
-        "",
         "**Input JSON payload**",
         "",
         "```json",
         _clip(result.input_json, 600) or "(none)",
         "```",
+    ]
+    lines += _db_code_block(result)
+    lines += [
         "",
-        "**Before / proposed / after evidence**",
+        "**Before / applied change / after evidence**",
         "",
         "| Verified column | Value |",
         "| --- | --- |",
-        f"| Before (restore point) | {_cell(_clip(result.state_before, 400))} |",
-        f"| After | {_cell(_clip(result.state_after, 400))} |",
+        f"| Before (restore point) | {_cell(_state_cell(result, result.state_before))} |",
+        f"| Applied change (value sent) | {_cell(result.value)} |",
+        f"| After | {_cell(_state_cell(result, result.state_after))} |",
         f"| Change persisted | {_yes_no(result.change_persisted)} |",
         f"| Procedure preview/trace returned | {_yes_no(result.proposed_change_observed)} |",
+        f"| Procedure return code | {_return_code_cell(result)} |",
         f"| Transaction | {result.transaction} |",
         f"| Duration | {result.duration_s}s |",
         "",
+    ]
+    lines += _return_code_note(result)
+    lines += [
         "**Rollback verification**",
         "",
     ]
@@ -376,10 +494,28 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         ]
 
     if result.error:
-        lines += ["", "**SQL error**", "", "```", result.error, "```"]
+        lines += [
+            "",
+            "**Database error returned**",
+            "",
+            "The procedure call raised the following SQL error (captured verbatim from the "
+            "driver and surfaced in the application as well):",
+            "",
+            "```",
+            result.error,
+            "```",
+        ]
 
     if result.messages:
-        lines += ["", "**Server messages (PRINT / RAISERROR)**", "", "```"]
+        lines += [
+            "",
+            "**Database message stream (verbatim `cursor.messages` capture)**",
+            "",
+            "The raw PRINT / info / RAISERROR lines the procedure emitted, exactly as "
+            "captured across every result set:",
+            "",
+            "```",
+        ]
         lines += [str(message) for message in result.messages]
         lines.append("```")
 
@@ -405,28 +541,24 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
 _TRACE_STATUS_NOTE = {
     "CAPTURED": None,
     "EMPTY": (
-        "The trace function was called successfully but returned no rows for this "
-        "call. The procedure recorded nothing in its trace."
+        "The procedure emitted no PRINT/trace messages for this call. Because the "
+        "message stream is always captured, this is a genuine observation (the "
+        "procedure said nothing), not an instrumentation gap."
     ),
-    "UNAVAILABLE": (
-        "The procedure trace could not be read for this run. It was attempted, not "
-        "skipped — the reason is stated below."
-    ),
-    "ERRORED": "The trace read raised an error; the reason is stated below.",
-    "NOT_ATTEMPTED": (
-        "The procedure trace was not read for this call because its signature had "
-        "not been discovered. Re-run pre-flight readiness to enable trace capture."
+    "NOT_CAPTURED": (
+        "No message stream was recorded for this call. Re-run so the PRINT output is "
+        "captured."
     ),
 }
 
 
 def _trace_block(result: TestResult) -> list[str]:
-    """Render the fnDisplayTrace output, or explain why it is absent."""
-    status = getattr(result, "trace_status", "NOT_ATTEMPTED")
+    """Render the fnDisplayTrace PRINT output captured from the message stream."""
+    status = getattr(result, "trace_status", "NOT_CAPTURED")
     rows = getattr(result, "trace_rows", []) or []
     reason = getattr(result, "trace_reason", None)
 
-    lines = ["", f"**Procedure trace (`fnDisplayTrace`) — {status}**", ""]
+    lines = ["", f"**Procedure trace — `fnDisplayTrace` PRINT output ({status})**", ""]
     if rows:
         lines += _records_to_table(rows)
         if reason:
@@ -501,10 +633,7 @@ def _negative_evidence(result: TestResult) -> str:
     trace_text = getattr(result, "trace_text", "")
     if trace_text:
         return f"(from trace) {trace_text}"
-    status = getattr(result, "trace_status", "NOT_ATTEMPTED")
-    if status in {"UNAVAILABLE", "ERRORED", "NOT_ATTEMPTED"}:
-        return f"no error raised; trace {status.lower()}"
-    return "no error raised; trace returned no rows"
+    return "no error raised; procedure emitted no trace messages"
 
 
 def _section_c(negatives: list[TestResult]) -> list[str]:
@@ -512,16 +641,21 @@ def _section_c(negatives: list[TestResult]) -> list[str]:
         "",
         "## Section C — Negative validation",
         "",
-        "Deliberately invalid input. The pass condition is a **rejection** — a raised SQL "
-        "error, a rejection marker in server messages, or a rejection recorded in the "
-        "procedure's own `fnDisplayTrace` output. Silent acceptance of bad input is a finding.",
+        "Deliberately invalid input across three scenario families — **non-existent** "
+        "targets, **invalid** values/names, and **duplicate** writes (re-applying a value "
+        "that already exists). The pass condition is a **rejection** — a raised SQL error, "
+        "a rejection marker in server messages, or a rejection recorded in the procedure's "
+        "own `fnDisplayTrace` output. Silent acceptance of bad input is a finding; for "
+        "duplicates, an idempotent no-op is acceptable but a second/partial write is a "
+        "finding.",
     ]
     if not negatives:
         lines += [
             "",
             "_No negative cases were run. Execute the negative battery so the validation "
-            "paths are evidenced (invalid instance/terminal/location, unknown flag, unknown "
-            "location function, unknown version, and empty target JSON)._",
+            "paths are evidenced: non-existent instance/terminal/location, invalid flag / "
+            "location-function / version, duplicate flag and duplicate location-function "
+            "writes, and empty target JSON._",
         ]
         return lines
     lines += [
@@ -531,7 +665,7 @@ def _section_c(negatives: list[TestResult]) -> list[str]:
     ]
     for result in negatives:
         evidence = _negative_evidence(result)
-        trace_status = getattr(result, "trace_status", "NOT_ATTEMPTED")
+        trace_status = getattr(result, "trace_status", "NOT_CAPTURED")
         lines.append(
             f"| {result.test_key.replace('Negative — ', '')} | `{_cell(result.target)}` | "
             f"`{_cell(result.value)}` | `{result.verdict_code}` | {trace_status} | "
@@ -541,39 +675,19 @@ def _section_c(negatives: list[TestResult]) -> list[str]:
     rejected = sum(1 for r in negatives if r.verdict_code == "REJECTED-AS-EXPECTED")
     not_rejected = sum(1 for r in negatives if r.verdict_code == "NOT-REJECTED")
 
-    # If the trace was never readable, a NOT-REJECTED verdict is not yet conclusive.
-    trace_blind = [
-        r
-        for r in negatives
-        if getattr(r, "trace_status", "NOT_ATTEMPTED")
-        in {"UNAVAILABLE", "ERRORED", "NOT_ATTEMPTED"}
-    ]
-
     if not_rejected > 0:
         lines += [
             "",
             f"**Finding**: {not_rejected} of {len(negatives)} negative case(s) returned "
             "`NOT-REJECTED` — the procedure did **not** raise a SQL exception and no "
-            "rejection marker was detected in the server messages, result sets, or trace "
-            "output that could be captured.",
+            "rejection marker was detected in the server messages, result sets, or "
+            "`fnDisplayTrace` PRINT output.",
+            "",
+            "Because the PRINT/message stream is captured on every call, the absence of a "
+            "rejection marker is a genuine observation rather than a gap in instrumentation. "
+            "The procedure owner should confirm whether these inputs are expected to be "
+            "rejected. Until confirmed, negative validation coverage cannot be claimed.",
         ]
-        if trace_blind:
-            lines += [
-                "",
-                f"**This finding is not yet conclusive for {len(trace_blind)} of those "
-                "case(s).** The procedure's internal trace could not be read for them, so a "
-                "rejection recorded only in the trace would not have been detected. Resolve "
-                "the trace availability reason shown in Section A, re-run the battery, and "
-                "re-assess before treating these as genuine validation gaps.",
-            ]
-        else:
-            lines += [
-                "",
-                "The trace was readable for every case above, so the absence of a rejection "
-                "marker is a genuine observation rather than a gap in instrumentation. The "
-                "procedure owner should confirm whether these inputs are expected to be "
-                "rejected. Until confirmed, negative validation coverage cannot be claimed.",
-            ]
     if rejected == len(negatives):
         lines += [
             "",

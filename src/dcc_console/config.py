@@ -17,6 +17,38 @@ PROCEDURE = "[cccai].[spApplyDCCEnablementConfiguration]"
 
 TRACE_FUNCTION = "[db].[fnDisplayTrace]"
 
+# Sentinel column name for the stored-procedure return code. The harness wraps
+# every call as ``EXEC @rc = proc ...; SELECT @rc AS dcc_return_code`` so it can
+# report whether the procedure signals via an integer return code. The database
+# layer recognises this column, captures the value, and does NOT treat it as a
+# preview result set.
+RETURN_CODE_COLUMN = "dcc_return_code"
+
+# Bit 2 — configdownload_version numeric code -> human description.
+# Confirmed mapping: 1 = Standard (baseline DCC), 2 = ECB DCC (European Central
+# Bank conversion-rate variant). These are the only two versions the procedure
+# supports; any other stored code is surfaced verbatim so it is not silently
+# mislabelled.
+CONFIGDOWNLOAD_VERSIONS: dict[int, str] = {
+    1: "Standard",
+    2: "ECB DCC",
+}
+
+
+def configdownload_version_text(code: object) -> str:
+    """Render a configdownload_version code as ``"<code> (<name>)"``.
+
+    Unknown or null codes are labelled explicitly rather than guessed.
+    """
+    if code is None or (isinstance(code, str) and not code.strip()):
+        return "(none)"
+    try:
+        numeric = int(code)
+    except (TypeError, ValueError):
+        return f"{code} (unrecognised)"
+    name = CONFIGDOWNLOAD_VERSIONS.get(numeric)
+    return f"{numeric} ({name})" if name else f"{numeric} (unknown version)"
+
 
 @dataclass(frozen=True)
 class Environment:

@@ -12,8 +12,9 @@ import streamlit as st
 from ..broken import HANDLER_FLAGS, broken_summary, compute_broken_flags, find_broken_terminals
 from ..campaign import campaign_markdown, campaign_results, campaign_summary, campaign_tests
 from ..catalog import TEST_CATALOG, TEST_KEYS
-from ..config import ENVIRONMENTS
+from ..config import ENVIRONMENTS, configdownload_version_text
 from ..coverage import compute_coverage, coverage_totals
+from ..docx_report import generate_cab_docx
 from ..execution import TestResult, apply_rollback, build_call, run_test
 from ..negatives import NegativeCase, default_negative_cases, run_negative, run_negative_battery
 from ..pdf_report import generate_cab_pdf
@@ -37,6 +38,54 @@ def _clip(value: object, limit: int = 1500) -> str:
     return f"{text[:limit]}... [{len(text) - limit} more characters]"
 
 
+def _state_label(result: TestResult, value: object) -> str:
+    """Human-readable state value; Bit 2 codes get their version name attached."""
+    if result.bit == 2:
+        return configdownload_version_text(value)
+    return _clip(value, 600)
+
+
+def _change_flag(result: TestResult) -> str:
+    """One-word summary of whether the verified column moved."""
+    if result.state_before == result.state_after:
+        return "unchanged"
+    return "changed" if result.change_persisted else "reverted"
+
+
+def _render_change_evidence(result: TestResult) -> None:
+    """Consolidated initial → applied → restored panel (CAB points 1 & 4).
+
+    Presents the three facts a reviewer needs side by side: the value before the
+    call, the change the procedure was asked to make, and the value afterwards
+    (including any restoration), plus how the transaction resolved.
+    """
+    st.markdown("**Before / applied change / after**")
+    cols = st.columns(3)
+    cols[0].caption("① Initial state")
+    cols[0].code(_state_label(result, result.state_before) or "(none)")
+    cols[1].caption("② Applied change")
+    cols[1].code(f"{result.test_key.split(' — ')[0]} → {result.value}")
+    cols[2].caption("③ State after")
+    cols[2].code(_state_label(result, result.state_after) or "(none)")
+
+    flag = _change_flag(result)
+    restored = any(e.get("ok") for e in result.rollback_log)
+    if result.mode == "SIMULATION":
+        st.caption(
+            f"Verified column ended **{flag}**. Simulation transaction rolled back — the "
+            "before/after values are read around a call that never committed."
+        )
+    elif flag == "reverted" or restored:
+        st.caption(
+            "Verified column was changed live and then **restored** to its initial value "
+            "(rollback executed). Net effect on the database: none."
+        )
+    elif flag == "changed":
+        st.caption("Verified column **changed** and the live change is still applied.")
+    else:
+        st.caption("Verified column **unchanged** — the live call did not move the value.")
+
+
 def _result_ledger(result: TestResult) -> str:
     """Return the factual record included in the downloadable session report."""
     return "\n".join(
@@ -54,9 +103,10 @@ def _result_ledger(result: TestResult) -> str:
             f"STATE AFTER        : {_clip(result.state_after)}",
             f"CHANGE PERSISTED   : {result.change_persisted}",
             f"HARNESS STATUS     : {result.status}",
+            f"RETURN CODE        : {getattr(result, 'return_code', None)}",
             f"SQL ERROR          : {result.error or 'none'}",
             f"SERVER MESSAGES    : {result.messages or 'none'}",
-            f"TRACE STATUS       : {getattr(result, 'trace_status', 'NOT_ATTEMPTED')}",
+            f"TRACE STATUS       : {getattr(result, 'trace_status', 'NOT_CAPTURED')}",
             "TRACE ROWS         : "
             f"{_clip(json.dumps(getattr(result, 'trace_rows', []), default=str), 1200)}",
             f"TRACE REASON       : {getattr(result, 'trace_reason', None) or 'none'}",
@@ -665,6 +715,13 @@ def _render_campaign_report(campaign: dict) -> None:
         st.info("No results are attached to this campaign.")
         return
 
+    failed = [r for r in entries if r.status == "FAIL"]
+    if failed:
+        st.error(
+            f"{len(failed)} test(s) raised a database error. See the **Error** column below "
+            "and the per-test detail for the verbatim message."
+        )
+
     st.dataframe(
         pd.DataFrame(
             [
@@ -675,6 +732,14 @@ def _render_campaign_report(campaign: dict) -> None:
                     "Value": result.value,
                     "Mode": result.mode,
                     "Status": f"{_badge(result.status)} {result.status}",
+                    "State before": _state_label(result, result.state_before),
+                    "State after": _state_label(result, result.state_after),
+                    "Changed?": _change_flag(result),
+                    "Return code": (
+                        "—" if getattr(result, "return_code", None) is None
+                        else str(result.return_code)
+                    ),
+                    "Error": _clip(result.error, 160) if result.error else "",
                     "Persisted": result.change_persisted,
                     "Rollback available": result.can_rollback,
                 }
@@ -688,7 +753,7 @@ def _render_campaign_report(campaign: dict) -> None:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     meta = _cab_meta(entries)
     cab_md, content_hash = cab_report_with_hash(entries, meta)
-    actions = st.columns(4)
+    actions = st.columns(5)
     actions[0].download_button(
         "📋 CAB report (Markdown)",
         data=cab_md,
@@ -711,7 +776,20 @@ def _render_campaign_report(campaign: dict) -> None:
         )
     except Exception as pdf_err:
         actions[1].warning(f"PDF generation failed: {pdf_err}")
-    actions[2].download_button(
+    try:
+        docx_bytes, _ = generate_cab_docx(entries, meta)
+        actions[2].download_button(
+            "📝 CAB report (Signed Word)",
+            data=docx_bytes,
+            file_name=f"dcc_cab_campaign_{stamp}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            type="primary",
+            key=f"campaign-docx-{campaign_id}",
+        )
+    except Exception as docx_err:
+        actions[2].warning(f"Word generation failed: {docx_err}")
+    actions[3].download_button(
         "📄 Campaign report (Markdown)",
         data=campaign_markdown(campaign["name"], entries),
         file_name=f"dcc_campaign_{stamp}.md",
@@ -719,7 +797,7 @@ def _render_campaign_report(campaign: dict) -> None:
         use_container_width=True,
         key=f"campaign-md-{campaign_id}",
     )
-    actions[3].download_button(
+    actions[4].download_button(
         "📥 Campaign results (JSON)",
         data=json.dumps([result.export() for result in entries], indent=2, default=str),
         file_name=f"dcc_campaign_{stamp}.json",
@@ -823,26 +901,24 @@ def _render_result(result: TestResult, expanded: bool) -> None:
     )
     with st.container():
         st.markdown(f"**{header}**")
-        facts = st.columns(5)
+        facts = st.columns(6)
         facts[0].metric("Bit", result.bit)
         facts[1].metric("Environment", result.environment or "?")
         facts[2].metric("Transaction", result.transaction)
         facts[3].metric("Persisted", "yes" if result.change_persisted else "no")
         facts[4].metric("Duration", f"{result.duration_s}s")
+        rc = getattr(result, "return_code", None)
+        facts[5].metric("Return code", "—" if rc is None else str(rc))
 
         if result.error:
-            st.error(result.error)
+            st.error(f"Database error: {result.error}")
 
         st.code(result.sql, language="sql")
 
-        state = st.columns(2)
-        state[0].markdown("**State before**")
-        state[0].code(_clip(result.state_before, 600))
-        state[1].markdown("**State after**")
-        state[1].code(_clip(result.state_after, 600))
+        _render_change_evidence(result)
 
         if result.messages:
-            st.markdown("**Server messages**")
+            st.markdown("**Server messages (`fnDisplayTrace` PRINT output)**")
             st.code("\n".join(result.messages))
 
         for index, frame in enumerate(result.grid_frames, start=1):
@@ -857,10 +933,12 @@ def _render_negative_battery() -> None:
     """Run the deliberately-invalid input battery — Section C evidence."""
     with st.expander("🧪 Negative validation battery (Section C evidence)"):
         st.caption(
-            "Sends deliberately invalid input (bad instance, terminal, location, flag name, "
-            "location function, version, and an empty target JSON). Every case runs with "
+            "Sends deliberately invalid input across three families — **non-existent** "
+            "targets (bad instance/terminal/location), **invalid** values (unknown flag, "
+            "location function, version, empty JSON), and **duplicate** writes (re-applying "
+            "a flag or location function that already exists). Every case runs with "
             "`@is_simulation = 1` and is rolled back. A **rejection** is the pass condition; "
-            "silent acceptance is a finding."
+            "silent acceptance is a finding (an idempotent no-op is acceptable for duplicates)."
         )
         cases = default_negative_cases(
             valid_terminal=st.session_state.selected_terminal or None
@@ -870,6 +948,7 @@ def _render_negative_battery() -> None:
                 [
                     {
                         "Case": case.name,
+                        "Scenario": case.category,
                         "Sends": f"{case.base_key.split(' — ')[0]} · {case.value}",
                         "Why invalid": case.invalid_reason,
                         "Expected": case.expected,
@@ -915,7 +994,7 @@ def _render_cab_report_download(all_results: list[TestResult], stamp: str) -> No
 
     meta = _cab_meta(all_results)
     cab_md, content_hash = cab_report_with_hash(all_results, meta)
-    dl_cols = st.columns(2)
+    dl_cols = st.columns(3)
     dl_cols[0].download_button(
         "📄 Download CAB report (Markdown)",
         data=cab_md,
@@ -936,6 +1015,18 @@ def _render_cab_report_download(all_results: list[TestResult], stamp: str) -> No
         )
     except Exception as pdf_err:
         dl_cols[1].warning(f"PDF generation failed: {pdf_err}")
+    try:
+        docx_bytes, _ = generate_cab_docx(all_results, meta)
+        dl_cols[2].download_button(
+            "📝 Download CAB report (Signed Word)",
+            data=docx_bytes,
+            file_name=f"dcc_cab_report_{stamp}.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            type="primary",
+        )
+    except Exception as docx_err:
+        dl_cols[2].warning(f"Word generation failed: {docx_err}")
     st.caption(f"Report integrity SHA-256: `{content_hash}`")
 
 
