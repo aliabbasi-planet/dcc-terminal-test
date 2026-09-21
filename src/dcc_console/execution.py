@@ -359,7 +359,9 @@ class RollbackEvidenceResult:
             "target": self.target,
             "environment": self.environment,
             "state_before": str(self.state_before)[:500] if self.state_before else None,
-            "state_after_apply": str(self.state_after_apply)[:500] if self.state_after_apply else None,
+            "state_after_apply": (
+                str(self.state_after_apply)[:500] if self.state_after_apply else None
+            ),
             "state_after_rollback": (
                 str(self.state_after_rollback)[:500] if self.state_after_rollback else None
             ),

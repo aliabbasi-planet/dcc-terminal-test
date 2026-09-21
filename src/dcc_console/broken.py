@@ -12,11 +12,14 @@ column names.
 
 from __future__ import annotations
 
+import logging
 import re
 
 import pandas as pd
 
 from .database import DatabaseConnection
+
+logger = logging.getLogger(__name__)
 
 MAX_ROWS = 2000
 
@@ -136,9 +139,9 @@ def find_broken_terminals(
                 how="left",
                 suffixes=("", "_inst"),
             )
-    except Exception:
-        # Instance join failed — still return terminal+location data
-        pass
+    except Exception as exc:
+        # Instance join failed — still return terminal+location data.
+        logger.debug("Instance flag enrichment skipped: %s", exc)
 
     return df
 

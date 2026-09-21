@@ -181,7 +181,7 @@ class RestoreJournal:
             "original_value", "restore_sql", "campaign_id",
             "status", "created_at", "resolved_at",
         ]
-        return dict(zip(cols, row))
+        return dict(zip(cols, row, strict=False))
 
 
 # Module-level singleton.  Initialised lazily by get_journal().

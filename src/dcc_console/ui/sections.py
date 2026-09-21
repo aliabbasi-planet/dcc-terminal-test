@@ -9,7 +9,7 @@ from uuid import uuid4
 import pandas as pd
 import streamlit as st
 
-from ..broken import broken_summary, compute_broken_flags, find_broken_terminals, HANDLER_FLAGS
+from ..broken import HANDLER_FLAGS, broken_summary, compute_broken_flags, find_broken_terminals
 from ..campaign import campaign_markdown, campaign_results, campaign_summary, campaign_tests
 from ..catalog import TEST_CATALOG, TEST_KEYS
 from ..config import ENVIRONMENTS

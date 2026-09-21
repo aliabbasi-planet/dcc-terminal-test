@@ -31,6 +31,13 @@ META = {
         "object": "[cccai].[spApplyDCCEnablementConfiguration]",
         "object_id": 42, "create_date": "2026-01-01", "modify_date": "2026-09-01",
         "definition_sha256": "deadbeef",
+        "definition_sha256_method": "SHA-256 over the UTF-8 bytes of sys.sql_modules.definition",
+        "sha256_server_utf16": "CAFEBABE",
+        "sha256_server_method": "HASHBYTES('SHA2_256', m.definition) over UTF-16LE bytes",
+        "definition_bytes": 12345,
+        "can_view_definition": True,
+        "is_encrypted": False,
+        "unavailable_reason": None,
     },
 }
 
@@ -52,7 +59,35 @@ def test_report_pins_procedure_version():
     text = _report([mk()])
     assert "Procedure version under test" in text
     assert "deadbeef" in text
-    assert "Definition SHA-256" in text
+    assert "SHA-256 (UTF-8, harness)" in text
+
+
+def test_report_shows_both_digests_and_states_methods():
+    text = _report([mk()])
+    assert "CAFEBABE" in text
+    assert "SHA-256 (UTF-16LE, server)" in text
+    assert "Digest methods" in text
+    assert "expected to differ" in text
+    assert "12345" in text  # definition_bytes
+
+
+def test_report_does_not_overclaim_artefact_correspondence():
+    text = _report([mk()])
+    assert "Correspondence to the deployment artefact" in text
+    assert "not** by this test harness" in text
+
+
+def test_report_explains_why_digest_unavailable():
+    meta = dict(META)
+    meta["procedure_version"] = dict(META["procedure_version"])
+    meta["procedure_version"]["definition_sha256"] = "unavailable"
+    meta["procedure_version"]["can_view_definition"] = False
+    meta["procedure_version"]["unavailable_reason"] = (
+        "The connected login lacks VIEW DEFINITION on the procedure."
+    )
+    text = cab_report([mk()], meta)
+    assert "Definition digest unavailable" in text
+    assert "lacks VIEW DEFINITION" in text
 
 
 def test_section_a_shows_execution_evidence():

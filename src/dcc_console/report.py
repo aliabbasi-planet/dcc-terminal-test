@@ -135,31 +135,95 @@ def _procedure_version(meta: dict) -> list[str]:
             "this section pins the exact procedure build that was validated._"
         )
         return lines
+
     sha = version.get("definition_sha256", "unavailable")
-    sha_available = sha and sha != "unavailable"
+    sha_available = bool(sha) and sha != "unavailable"
+    server_sha = version.get("sha256_server_utf16", "unavailable")
+    server_available = bool(server_sha) and server_sha != "unavailable"
+    def_bytes = version.get("definition_bytes")
+
     lines += [
+        "This section establishes the **three-part identity** of the procedure body that was "
+        "exercised: which object, when it was last deployed, and a digest that changes if the "
+        "body is edited.",
+        "",
         "| Attribute | Value |",
         "| --- | --- |",
         f"| Schema.object | `{version.get('object', '?')}` |",
         f"| Object ID | {version.get('object_id', '?')} |",
         f"| Created | {version.get('create_date', '?')} |",
-        f"| Last modified | {version.get('modify_date', '?')} |",
-        f"| Definition SHA-256 | `{sha}` |",
+        f"| **Last modified** | **{version.get('modify_date', '?')}** |",
+        f"| Definition length (bytes) | {def_bytes if def_bytes is not None else 'unavailable'} |",
+        f"| **SHA-256 (UTF-8, harness)** | `{sha}` |",
+        f"| SHA-256 (UTF-16LE, server) | `{server_sha}` |",
     ]
-    if sha_available:
+
+    lines += ["", "### Digest methods", ""]
+    method_utf8 = version.get("definition_sha256_method")
+    method_server = version.get("sha256_server_method")
+    if method_utf8:
+        lines.append(f"- **UTF-8 digest**: {method_utf8}")
+    if method_server:
+        lines.append(f"- **UTF-16LE digest**: {method_server}")
+
+    if sha_available and server_available:
         lines += [
             "",
-            "The definition hash lets a reviewer confirm the procedure body validated here is "
-            "byte-for-byte the one being promoted.",
+            "**The two digests are expected to differ.** They hash different byte encodings of "
+            "the same procedure text. The UTF-8 digest is the primary reference for this report. "
+            "The UTF-16LE digest is provided so a reviewer with only SSMS access can verify "
+            "independently by running:",
+            "",
+            "```sql",
+            "SELECT CONVERT(char(64), HASHBYTES('SHA2_256', m.definition), 2) AS sha256_utf16,",
+            "       DATALENGTH(m.definition)                                  AS definition_bytes",
+            "FROM sys.sql_modules AS m",
+            f"WHERE m.object_id = OBJECT_ID(N'{version.get('object', '?')}', N'P');",
+            "```",
         ]
-    else:
+    elif sha_available:
         lines += [
             "",
-            "The definition hash could not be computed — the connected login may lack "
-            "`VIEW DEFINITION` permission, or `OBJECT_DEFINITION()` returned NULL. Grant the "
-            "permission and re-run readiness to pin the exact procedure build. Without it, a "
-            "reviewer cannot verify which procedure body was tested.",
+            "The UTF-8 digest is the reference for this report. The server-side `HASHBYTES` "
+            "cross-check was not available for this run.",
         ]
+
+    if not sha_available:
+        reason = version.get("unavailable_reason") or (
+            "The definition could not be read from `sys.sql_modules`."
+        )
+        lines += [
+            "",
+            f"**Definition digest unavailable.** {reason}",
+            "",
+            "Without a digest, a reviewer cannot confirm which procedure body was tested. The "
+            "`object_id` and last-modified timestamp above still establish object identity and "
+            "deployment time.",
+        ]
+        if version.get("is_encrypted"):
+            lines.append(
+                "Because the procedure is encrypted, the appropriate evidence is the digest of "
+                "the deployment artefact from the release package, obtained from the change "
+                "record rather than from the database."
+            )
+
+    # Scope statement on artefact correspondence — deliberately does not overclaim.
+    lines += [
+        "",
+        "### Correspondence to the deployment artefact",
+        "",
+        "The procedure body validated here is pinned by `object_id`, last-modified timestamp, "
+        "and definition digest. If the procedure is altered after this run, the timestamp moves "
+        "and the digest changes — so this evidence proves the tested build is the build in the "
+        "environment at the time of test.",
+        "",
+        "Correspondence to the release artefact file is established by the deployment process "
+        "and change record, **not** by this test harness. A byte-for-byte comparison against a "
+        "`.sql` release file is not offered here because `sys.sql_modules.definition` stores only "
+        "the `CREATE` statement text, excluding batch separators, file headers, existence guards "
+        "and line-ending conventions present in the artefact — a mismatch on those would carry "
+        "no information about procedure correctness.",
+    ]
     return lines
 
 
@@ -577,8 +641,6 @@ def cab_report(
 
 def _integrity_footer(meta: dict) -> list[str]:
     """Append a report integrity hash so the content can be verified."""
-    import hashlib
-
     content_hash = meta.get("content_hash")
     if not content_hash:
         return []
