@@ -408,7 +408,18 @@ def render_test(simulation: bool, armed: bool) -> None:
         target = _target_picker(definition)
     with right:
         st.markdown(f"**{definition.value_label}**")
-        if definition.value_options:
+        if definition.add_remove_toggle:
+            action = st.selectbox("Action", ("Add", "Remove"), key="config_action")
+            if action == "Remove":
+                value = "Remove"
+            else:
+                template_name = st.text_input(
+                    definition.value_label,
+                    placeholder="exact value expected by the procedure",
+                    key="config_value_text",
+                ).strip()
+                value = f"Add:{template_name}" if template_name else ""
+        elif definition.value_options:
             value = st.selectbox(
                 definition.value_label, definition.value_options, key="config_value"
             )
@@ -605,7 +616,20 @@ def render_campaign(simulation: bool, armed: bool) -> None:
             definition.function_name
             or definition.key.split(" — ", 1)[-1].split(" (")[0]
         )
-        if definition.value_options:
+        if definition.add_remove_toggle:
+            entered = st.text_input(
+                f"{definition.value_label} for {short_name} (Add) — "
+                "comma-separated for multiple runs",
+                key=f"campaign-value-{definition.key}",
+                placeholder="exact value(s) expected by the procedure",
+            ).strip()
+            add_values = [f"Add:{v.strip()}" for v in entered.split(",") if v.strip()]
+            include_remove = st.checkbox(
+                f"Also run a Remove for {short_name}",
+                key=f"campaign-remove-{definition.key}",
+            )
+            values[definition.key] = add_values + (["Remove"] if include_remove else [])
+        elif definition.value_options:
             values[definition.key] = st.multiselect(
                 f"{definition.value_label} for {short_name} — one run per selected value",
                 definition.value_options,

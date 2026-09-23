@@ -55,6 +55,11 @@ class TestDefinition:
     # column read is context only; the change and its rollback are judged from the
     # procedure's own output. See Bit 8 (handler.extra_config).
     sp_managed: bool = False
+    # When True, an Add/Remove selector is rendered ahead of the `value_label`
+    # widget. Choosing "Remove" skips the value widget entirely and the procedure
+    # is called with that value NULLed out; choosing "Add" keeps the normal value
+    # widget so the tester still supplies it. See Bit 16 (DCC Receipt Template).
+    add_remove_toggle: bool = False
 
     @property
     def json_field(self) -> str:
@@ -287,13 +292,19 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             ),
             value_label="Template name",
             value_options=None,
-            proc_args=("@instance_json", "@printout_type_Template_DCC", "@is_simulation"),
+            proc_args=(
+                "@instance_json",
+                "@printout_type_Template_DCC",
+                "@add_bit16",
+                "@is_simulation",
+            ),
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
                 "instance_identifier",
                 "xml",
             ),
+            add_remove_toggle=True,
         ),
     )
 }

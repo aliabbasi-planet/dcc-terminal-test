@@ -256,9 +256,14 @@ def build_call(
     elif bit == 16:
         sql = (
             f"EXEC {PROCEDURE} @display_config = ?, @instance_json = ?, "
-            "@printout_type_Template_DCC = ?, @is_simulation = ?"
+            "@printout_type_Template_DCC = ?, @add_bit16 = ?, @is_simulation = ?"
         )
-        params = (bit, payload, config_value, sim)
+        if config_value == "Remove":
+            template_name, add_flag = None, 0
+        else:
+            _, _, template_name = config_value.partition(":")
+            add_flag = 1
+        params = (bit, payload, template_name, add_flag, sim)
     else:
         raise ValueError(f"Unsupported display_config bit: {bit}")
 
