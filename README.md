@@ -2,12 +2,12 @@
 
 A single-page Streamlit console for exercising the SQL Server stored procedure
 `[cccai].[spApplyDCCEnablementConfiguration]` against **DEV**, **UAT**, and **PROD**, with
-transaction-safe simulation, a real rollback path for live runs, and complete
-factual session reports for download.
+transaction-safe simulation, a real rollback path for live runs, CAB-grade evidence
+reports, and crash-resistant disaster recovery.
 
 This repository is published as `dcc-terminal_test-console` and contains the
-interactive console and test harness used for campaign orchestration and safe
-rollback testing.
+interactive console and test harness used for campaign orchestration, CAB validation
+reporting, and safe rollback testing.
 
 ---
 
@@ -17,7 +17,9 @@ rollback testing.
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [How a test runs](#how-a-test-runs)
+- [CAB validation reports](#cab-validation-reports)
 - [Rollback model](#rollback-model)
+- [Disaster recovery](#disaster-recovery)
 - [Project layout](#project-layout)
 - [Development](#development)
 - [Security notes](#security-notes)
@@ -34,11 +36,21 @@ rollback testing.
 | Simulation mode | `@is_simulation = 1` plus an enclosing transaction that is always rolled back |
 | Live mode | Requires typing the environment name, captures a restore point, commits, then offers rollback |
 | Rollback | Automatic on live failure, manual per result, bulk for everything outstanding, forced re-write available |
-| Configuration campaigns | Separate tab for running selected location, terminal, and instance tests sequentially, with a campaign report and campaign-only rollback |
-| Exports | Results as JSON and a factual session report as Markdown |
+| Configuration campaigns | Separate tab for running selected location, terminal, and instance tests sequentially, with campaign reports and campaign-only rollback |
+| Negative validation battery | 9 deliberately-invalid cases across three families — non-existent targets, invalid values, and duplicate writes |
+| Procedure messages | The procedure's `PRINT`/`fnDisplayTrace` output is captured from the message stream and shown in the app and report |
+| Return codes | Each call is wrapped as `EXEC @rc = proc …` so the procedure's integer return code is captured and reported |
+| CAB reports | Markdown, signed PDF, and signed Word (.docx) — all sharing one SHA-256 integrity hash, coverage matrix, and per-test evidence |
+| Disaster recovery | SQLite restore journal persists original values to disk before live UAT/PROD runs |
+| Exports | Results as JSON, session ledger as Markdown, CAB report as Markdown, signed PDF, or signed Word |
 
 Supported configuration bits: **1** DCC Xpress CO · **2** Config Download Version ·
 **4** Firmware Package · **8** DCC Handler Flags · **16** DCC Receipt Template.
+
+Config Download Version (bit 2) has exactly two values: `1` = **Standard** (baseline
+DCC configuration) and `2` = **ECB DCC** (European Central Bank conversion-rate
+variant). The console labels the stored numeric code with its name everywhere it is
+displayed, so a bare `1`/`2` is never shown without context.
 
 ---
 
@@ -66,7 +78,7 @@ Requires Python 3.10+ and an ODBC driver for SQL Server.
 ```bash
 python -m venv venv
 venv\Scripts\activate
-pip install .
+pip install -e .
 copy .env.example .env
 python -m dcc_console
 ```
@@ -82,6 +94,13 @@ winget install Microsoft.msodbcsql18
 ```
 
 or run `scripts\Install-OdbcDriver.ps1`.
+
+### Running on a custom port
+
+```powershell
+.\venv\Scripts\python.exe -m streamlit run src\dcc_console\app.py `
+  --server.port 8502 --server.headless=true --server.address=127.0.0.1
+```
 
 ---
 
@@ -99,6 +118,8 @@ UAT_DB_NAME=3CDB
 
 PROD_DB_SERVER=
 PROD_DB_NAME=3CDB
+
+STREAMLIT_SERVER_PORT=8502
 ```
 
 ---
@@ -106,12 +127,13 @@ PROD_DB_NAME=3CDB
 ## How a test runs
 
 1. **Select an environment** in the sidebar and connect with that environment's credentials.
-2. **Pre-flight readiness** probes five conditions. Tests stay locked until all pass,
-   or until you tick the explicit override.
+2. **Pre-flight readiness** probes five conditions and captures the procedure's SHA-256
+   definition hash. Tests stay locked until all pass, or until you tick the explicit override.
 3. **Choose a mode.** Live mode additionally requires typing `DEV`, `UAT`, or `PROD`.
 4. **Pick a target** — a terminal from the loaded list, or an instance or location.
 5. **Run.** The harness:
    - reads the declared verification column, which becomes the **restore point**;
+   - for live runs on UAT/PROD, writes the restore point to the disaster-recovery journal;
    - calls the procedure inside a transaction, draining every result set and server message;
    - rolls back (simulation) or commits (live);
    - re-reads the column and compares.
@@ -124,20 +146,92 @@ terminal tests, locations for location tests, and instances for instance tests. 
 console runs every selected test for each target of its matching type in sequence, then
 shows per-campaign pass, fail, review, blocked, and pending-rollback totals.
 
-Use **Download campaign report** to export its target-by-target factual result table.
+Enable **Include negative validation battery** to append 9 deliberately-invalid cases
+covering three scenario families: **non-existent** (instance, terminal, location),
+**invalid** (unknown flag, unknown function, unknown version, empty JSON), and
+**duplicate** (re-applying a handler flag and re-adding a location function that
+already exist). Each must be handled correctly by the procedure for the campaign to be
+CAB-grade — a rejection for non-existent/invalid input, and either a rejection or an
+idempotent no-op for duplicates. Negative cases are always forced to
+`@is_simulation = 1`.
+
 For a live campaign, **Roll back campaign live changes** restores every test row in that
-campaign which still differs from its captured restore point. Individual result rollback
-buttons and the global outstanding rollback control remain available as additional safety
-controls.
+campaign which still differs from its captured restore point.
 
 ### Verdicts
 
-| Status | Meaning |
+The console distinguishes *the procedure executed safely* from *the configuration changed*:
+
+| Verdict | Meaning |
 |---|---|
-| 🟢 PASS | Simulation left the column unchanged, or a live run persisted the change |
-| 🔴 FAIL | The call errored, or a simulation leaked a persistent change |
-| 🟡 REVIEW | A live run completed but changed nothing — the procedure accepted the call without acting |
-| ⛔ BLOCKED | The login lacked `EXECUTE`, so the procedure body never ran |
+| `SIMULATED-OK` | Procedure executed under `@is_simulation=1`; transaction rolled back; nothing persisted |
+| `APPLIED` | Live run committed and the verified column changed — configuration actually applied |
+| `REVIEW` | Live run completed without error but the verified column did not change |
+| `REJECTED-AS-EXPECTED` | A deliberately invalid input was rejected — validation path works |
+| `NOT-REJECTED` | A deliberately invalid input was **not** rejected — a finding to review |
+| `BLOCKED` | Login lacked `EXECUTE`; the procedure body never ran |
+| `FAIL` | The call raised an unexpected SQL error |
+
+---
+
+## CAB validation reports
+
+The console generates Change Advisory Board evidence in three formats — Markdown,
+signed PDF, and signed Word (.docx) — all derived entirely from recorded run data,
+with no figure hand-entered. All three are rendered from the same canonical content
+and therefore share one SHA-256 integrity hash.
+
+### Report sections
+
+| Section | Content |
+|---|---|
+| **A** — Procedure execution evidence | The database code exercised (`EXEC`, the verification `SELECT`, the compensating `UPDATE`, and any rollback statements actually executed), input JSON, before/applied-change/after verified column, return code, procedure preview output, the verbatim database message stream, and rollback verification |
+| **B** — Coverage matrix | All 13 configuration areas with covered/blocked/not-tested state |
+| **C** — Negative validation | Every case across all three families (non-existent, invalid, duplicate) with the rejection evidence captured |
+| **D** — Capability & limitation analysis | Confirmed tested, placeholder-exercised, blocked, not tested, assumptions |
+| **E** — Rollback evidence | Full before → apply → restore cycle proving rollback works |
+| **Report integrity** | SHA-256 content hash for tamper detection |
+
+### Procedure messages and trace
+
+`db.fnDisplayTrace` is a **scalar string formatter** that the procedure calls inside
+`PRINT` statements. The trace is therefore SQL Server's message/info stream, not a
+table or result set. The console captures that stream via `cursor.messages` on every
+call — draining it inside the result-set loop, because some ODBC drivers clear the
+buffer on each `nextset()`. Both the raw message stream and the formatted trace appear
+in Section A, so a validation failure the procedure reports only via `PRINT` is still
+detected.
+
+### Signed PDF and signed Word
+
+Both embed the SHA-256 digest of the report content. The PDF puts it in the document
+metadata and the footer of every page; the Word document puts it in the core
+properties and on the cover page. To verify a report was not modified, re-generate it
+from the same session data and compare digests.
+
+This is **content-integrity verification**, not certificate-based digital signing.
+It proves the content is unmodified relative to a known hash; it does not prove
+authorship via PKI.
+
+The Word report additionally:
+
+- renders every section with **native Word tables** rather than monospace text;
+- applies Word **Restrict Editing** (read-only enforcement) to the generated body;
+- ends with an editable **Manual Attachments** region — placeholder subsections for
+  change-record references, manual test notes, screenshots, and reviewer sign-off.
+
+Content added under *Manual Attachments* is deliberately **outside** the hashed
+region, so hand-written additions never invalidate the signature. Note that Word's
+read-only enforcement is a **deterrent, not tamper-proofing** — a determined editor
+can remove it. The authenticity guarantee is the SHA-256, which changes if any
+generated content is altered.
+
+### Procedure version pinning
+
+Pre-flight readiness captures `object_id`, `create_date`, `modify_date`, and a
+SHA-256 hash of the procedure body from `sys.sql_modules`. This pins the exact
+procedure build that was validated. The connected login needs `VIEW DEFINITION`
+permission for the hash to be computed.
 
 ---
 
@@ -151,7 +245,9 @@ several layers, all replaying the value captured **before** the test:
 | Automatic | A live call errors *and* the row already changed |
 | Manual | **Roll back this change** on any live result with a persisted change |
 | Bulk | **Roll back every outstanding live change** at the top of the results section |
+| Campaign | **Roll back this campaign's live changes** for one campaign's rows |
 | Forced | Re-writes the restore point even when no difference was detected |
+| Recovery | Restores from the disk journal after an app crash (UAT/PROD only) |
 
 Every live result renders the rollback panel unconditionally — including the restore
 point and the full rollback history — so the control is never hidden.
@@ -167,6 +263,70 @@ WHERE  CONVERT(nvarchar(50), <catalog.key>) = ?
 Table, column, key and cast come only from `catalog.py`. The value and row key are
 bound parameters, so a rollback cannot be redirected at another row or table.
 
+### What rollback is not
+
+Rollback is a **compensating write**, not a transaction undo. The sequence on a live
+failure is:
+
+```
+COMMIT (new value written)
+  → error detected
+    → UPDATE (old value written back)
+      → COMMIT
+```
+
+There is always a brief window where the new value exists in the database before it
+is reversed. If TMS pushes a config download to a terminal during that window, the
+terminal picks up the new setting; the database rollback does not undo that.
+
+---
+
+## Disaster recovery
+
+If the app or machine crashes mid-campaign, Streamlit session state is lost. Live
+changes are already committed but the restore points would be gone.
+
+The console defends against this with a **SQLite restore journal**.
+
+### How it works
+
+```
+BEFORE live test on UAT/PROD:
+  journal.record_restore_point()   ← SQLite WAL commit (survives crash)
+  call_procedure()                 ← if the app dies here...
+  connection.commit()              ← ...change is in the DB, journal has the original
+
+ON NEXT APP LAUNCH:
+  Red banner: "N uncommitted live change(s) found in UAT"
+  Connect to the affected environment → click Restore → original value recovered
+```
+
+### Design
+
+| Decision | Reason |
+|---|---|
+| SQLite, not a log file | ACID guarantees; survives partial writes and power loss |
+| WAL journal mode | Writes survive even if the process is killed mid-write |
+| DEV excluded | Recovery overhead is not worth it on a dev server; avoids stale restores |
+| `~/.dcc_console/restore_journal.db` | Outside the repo; persists across branches and clones |
+| Auto-purge after 30 days | Resolved entries do not accumulate |
+| Environment validation | Cannot roll back UAT entries while connected to PROD |
+
+### Journal lifecycle
+
+| Status | Meaning |
+|---|---|
+| `PENDING` | Live test started, original value saved, not yet rolled back |
+| `NO_CHANGE` | Procedure ran but did not change the verified column |
+| `RESOLVED` | Manual, automatic, campaign, or recovery rollback succeeded |
+
+### Important limitation
+
+Each test commits individually inside the campaign loop. There is no outer
+transaction wrapping a whole campaign. If a campaign of 3 instances crashes on the
+third, instances 1 and 2 remain committed — the journal is what makes them
+recoverable.
+
 ---
 
 ## Project layout
@@ -177,6 +337,8 @@ bound parameters, so a rollback cannot be redirected at another row or table.
 ├── docker-compose.yml         # Console container
 ├── Makefile                   # install / run / test / lint / docker targets
 ├── pyproject.toml             # Packaging, pinned deps, pytest and ruff config
+├── requirements.txt           # Runtime deps for pip-only installs
+├── requirements-dev.txt       # Test and lint deps
 ├── .env.example               # Non-secret template
 ├── docs/
 │   └── reports/               # Generated CAB and test reports
@@ -187,16 +349,24 @@ bound parameters, so a rollback cannot be redirected at another row or table.
 │   └── DccEnablementConfiguration_UatSimulation.sql
 ├── src/dcc_console/
 │   ├── app.py                 # Page composition
+│   ├── campaign.py            # Campaign planning and factual reporting
 │   ├── catalog.py             # Test definitions and verified columns
 │   ├── config.py              # Environment settings
-│   ├── database.py            # pyodbc wrapper, transaction control
+│   ├── coverage.py            # 13-area coverage matrix computation
+│   ├── database.py            # pyodbc wrapper, explicit transaction control
+│   ├── docx_report.py         # Signed Word generator, native tables, manual attachments
 │   ├── execution.py           # build_call, run_test, classify, apply_rollback
-│   ├── readiness.py           # Pre-flight probes and grant script
+│   ├── journal.py             # SQLite disaster-recovery restore journal
+│   ├── negatives.py           # Negative validation battery
+│   ├── pdf_report.py          # Signed PDF generator with SHA-256 integrity
+│   ├── readiness.py           # Pre-flight probes, grant script, procedure hash
 │   ├── reference.py           # Instance, location and terminal queries
-│   ├── rollback.py            # Restore statement and verification
+│   ├── report.py              # CAB report generator (Sections A–E)
+│   ├── rollback.py            # Restore/read statements and verification
 │   ├── state.py               # Session-state helpers
+│   ├── trace.py               # fnDisplayTrace PRINT-stream interpretation
 │   └── ui/                    # sidebar.py, sections.py
-└── tests/                     # Catalogue, statement and rollback tests
+└── tests/                     # Catalogue, statement, coverage and rollback tests
 ```
 
 The core modules are Streamlit-free, so they are unit-testable without a browser
@@ -222,8 +392,11 @@ python -m ruff check src tests
 ```
 
 The suite covers catalogue integrity, parameterisation of every generated statement
-including an injection attempt, verdict classification, and rollback availability.
-No database connection is required to run it.
+including an injection attempt, verdict classification, coverage matrix computation,
+negative-case verdicts across all three scenario families, the config-download version
+mapping, return-code wrapping, `fnDisplayTrace` message-stream interpretation, CAB
+report structure, signed Word generation (tables, integrity hash, protection, editable
+manual region), and rollback availability. No database connection is required to run it.
 
 ---
 
@@ -233,6 +406,8 @@ No database connection is required to run it.
 - Every SQL value is a bound parameter; identifiers come only from `catalog.py`.
 - Live mode needs a checkbox *and* the typed environment name.
 - A failed live run auto-restores its captured pre-test value.
+- The restore journal stores original column values on the local disk in
+  `~/.dcc_console/` — treat that directory as sensitive on shared machines.
 - The container runs as a non-root user (`uid 10001`).
 - `.env` is git-ignored; only `.env.example` is committed.
 
@@ -242,12 +417,15 @@ No database connection is required to run it.
 
 | Symptom | Cause and fix |
 |---|---|
+| `ModuleNotFoundError: No module named 'fpdf'` | Run `pip install -r requirements.txt` or `pip install -e .` |
+| `ModuleNotFoundError: No module named 'docx'` | The Word report needs `python-docx`. Run `pip install -r requirements.txt` or `pip install -e .` |
+| Word report button shows "Word generation failed" | `python-docx` missing or the document could not be built; the Markdown and PDF exports are unaffected |
 | `IM002 Data source name not found` | No ODBC driver. Use Docker, or `winget install Microsoft.msodbcsql18` |
 | `EXECUTE permission was denied on 'fnDisplayTrace'` | Run the grant script shown in section 1 as a DBA |
 | Every test returns ⛔ BLOCKED | Same permission issue; the procedure body never executes |
 | Live run returns 🟡 REVIEW | The procedure accepted the call but changed nothing — check the target and value |
+| Procedure SHA-256 shows `unavailable` | The login lacks `VIEW DEFINITION`; grant it and re-run readiness |
 | `ERR_CONNECTION_REFUSED` on port 8501 | The server stopped. Re-run `python -m dcc_console` and keep the terminal open |
+| Port already in use | `Get-NetTCPConnection -LocalPort 8501 \| Select OwningProcess -Unique \| ForEach { Stop-Process -Id $_.OwningProcess -Force }` |
 | UAT or PROD fields are empty | Set the matching `*_DB_SERVER` value in `.env` |
-
-## Terminal Commmand
-.\venv\Scripts\python.exe -m streamlit run src\dcc_console\app.py --server.port 8502 --server.headless=true --server.address=127.0.0.1
+| Red crash-recovery banner on startup | A previous live run on UAT/PROD was not rolled back. Connect to that environment and restore. |

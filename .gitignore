@@ -51,3 +51,12 @@ logs/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Cortex Code session artifacts
+.cortex/
+
+# Disaster-recovery restore journal (normally in ~/.dcc_console/, guarded here too)
+.dcc_console/
+restore_journal.db
+restore_journal.db-wal
+restore_journal.db-shm

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from .config import configdownload_version_text
 from .database import DatabaseConnection
 
 MAX_REFERENCE_ROWS = 500
@@ -50,7 +51,7 @@ def load_terminals(
     only_unlocked: bool,
     limit: int,
 ) -> pd.DataFrame:
-    return connection.query(
+    frame = connection.query(
         """
         SELECT TOP (?)
             t.terminal_identifier,
@@ -75,3 +76,13 @@ def load_terminals(
         """,
         (int(limit), 1 if only_online else 0, 1 if only_unlocked else 0),
     )
+    # Label the numeric configdownload_version using the single source of truth
+    # in config.py (1 = Standard, 2 = ECB DCC) so the picker never shows a bare,
+    # ambiguous code.
+    if "configdownload_version" in frame.columns:
+        frame.insert(
+            frame.columns.get_loc("configdownload_version") + 1,
+            "configdownload_version_desc",
+            frame["configdownload_version"].map(configdownload_version_text),
+        )
+    return frame

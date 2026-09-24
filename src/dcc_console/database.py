@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import pandas as pd
 import pyodbc
 
-from .config import CANDIDATE_ODBC_DRIVERS, CONNECT_TIMEOUT_S
+from .config import CANDIDATE_ODBC_DRIVERS, CONNECT_TIMEOUT_S, RETURN_CODE_COLUMN
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ class ProcedureOutput:
 
     grids: list[pd.DataFrame]
     messages: list[str]
+    return_code: int | None = None
 
 
 class DatabaseConnection:
@@ -137,29 +138,88 @@ class DatabaseConnection:
             connection.rollback()
             raise
 
+    def execute_batch(self, statements: list[str]) -> int:
+        """Run several parameterless statements in ONE transaction and commit.
+
+        Used for the procedure's own returned rollback scripts (complete UPDATE
+        text authored by the trusted procedure, no user input). All-or-nothing:
+        any failure rolls back the whole batch so a partial rollback is never
+        left committed. Returns the total number of rows affected.
+        """
+        connection = self._require_connection()
+        cursor = connection.cursor()
+        total = 0
+        try:
+            for statement in statements:
+                if not str(statement).strip():
+                    continue
+                cursor.execute(statement)
+                if cursor.rowcount and cursor.rowcount > 0:
+                    total += cursor.rowcount
+            cursor.close()
+            connection.commit()
+            return total
+        except Exception:
+            try:
+                cursor.close()
+            except Exception as close_error:
+                logger.debug("Cursor close suppressed: %s", close_error)
+            connection.rollback()
+            raise
+
     def call_procedure(self, sql: str, params: tuple, rollback: bool) -> ProcedureOutput:
-        """Execute a procedure, drain every result set, then commit or roll back."""
+        """Execute a procedure, drain every result set, then commit or roll back.
+
+        Server messages (``PRINT``, ``RAISERROR`` severity <= 10) are drained
+        *inside* the result-set loop because some ODBC drivers clear
+        ``cursor.messages`` on each ``nextset()`` call.  Reading only once at
+        the end would silently lose any message emitted between result sets.
+        """
         connection = self._require_connection()
         cursor = connection.cursor()
         grids: list[pd.DataFrame] = []
         messages: list[str] = []
+        seen: set[str] = set()
+        return_code: int | None = None
+
+        def _drain_messages() -> None:
+            """Append any new messages, preserving order and skipping repeats."""
+            for entry in cursor.messages or []:
+                # pyodbc yields (sqlstate, message) tuples.
+                text = str(entry[1]) if len(entry) > 1 else str(entry)
+                if text not in seen:
+                    seen.add(text)
+                    messages.append(text)
+
         try:
             cursor.execute(sql, params)
+            _drain_messages()
             while True:
                 if cursor.description:
                     columns = [d[0] for d in cursor.description]
                     rows = [tuple(row) for row in cursor.fetchall()]
-                    grids.append(pd.DataFrame(rows, columns=columns))
+                    frame = pd.DataFrame(rows, columns=columns)
+                    # The return-code sentinel is captured, never shown as preview.
+                    if list(columns) == [RETURN_CODE_COLUMN]:
+                        if not frame.empty and frame.iloc[0, 0] is not None:
+                            try:
+                                return_code = int(frame.iloc[0, 0])
+                            except (TypeError, ValueError):
+                                return_code = None
+                    else:
+                        grids.append(frame)
+                _drain_messages()
                 if not cursor.nextset():
                     break
-            messages = [str(message[1]) for message in (cursor.messages or [])]
+                _drain_messages()
+            _drain_messages()
         finally:
             cursor.close()
             if rollback:
                 connection.rollback()
             else:
                 connection.commit()
-        return ProcedureOutput(grids=grids, messages=messages)
+        return ProcedureOutput(grids=grids, messages=messages, return_code=return_code)
 
     def safe_rollback(self) -> None:
         if self.connection is not None:

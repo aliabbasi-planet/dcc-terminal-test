@@ -43,6 +43,23 @@ class TestDefinition:
     value_options: tuple[str, ...] | None
     proc_args: tuple[str, ...]
     verify: VerifiedColumn
+    # Fixed procedure constant that identifies this test within its display bit,
+    # e.g. the location extra_function name for Bit 1. Declared here (never built
+    # from user input) so the generated EXEC cannot be redirected to another node.
+    function_name: str | None = None
+    # A concise note surfaced in the CAB report when the mapping to the procedure
+    # is inferred rather than confirmed by the procedure owner.
+    assumption: str | None = None
+    # When True, the procedure changes a *related* table (not the `verify` row) and
+    # emits its own compensating `rollback_script`. For these bits the generic
+    # column read is context only; the change and its rollback are judged from the
+    # procedure's own output. See Bit 8 (handler.extra_config).
+    sp_managed: bool = False
+    # When True, an Add/Remove selector is rendered ahead of the `value_label`
+    # widget. Choosing "Remove" skips the value widget entirely and the procedure
+    # is called with that value NULLed out; choosing "Add" keeps the normal value
+    # widget so the tester still supplies it. See Bit 16 (DCC Receipt Template).
+    add_remove_toggle: bool = False
 
     @property
     def json_field(self) -> str:
@@ -80,6 +97,69 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             value_options=("Add", "Remove"),
             proc_args=("@location_json", "@extra_function_name", "@add", "@is_simulation"),
             verify=VerifiedColumn("[ccc].[location]", "extra_function", "location_no", "xml"),
+            function_name="DCCXpressCO",
+        ),
+        TestDefinition(
+            key="Bit 1 — DCC Xpress CO Delayed Terminal (location extra_function)",
+            bit=1,
+            target="location",
+            summary=(
+                "Adds or removes the `DCCXpressCODT` (Delayed Terminal) entry inside "
+                "`ccc.location.extra_function` for the selected location."
+            ),
+            business_meaning=(
+                "DCC Xpress CO Delayed Terminal governs the currency-conversion offer for "
+                "delayed/deferred terminal capture flows (for example unattended or store-and-"
+                "forward terminals). Enabling it opts those terminals at the location into the "
+                "offer; removing it withdraws them. An incorrect setting means delayed-capture "
+                "terminals either miss an entitled DCC offer or present one they should not."
+            ),
+            mechanism=(
+                "The procedure rewrites the location's `extra_function` XML document, adding "
+                "or dropping the node that represents DCCXpressCODT."
+            ),
+            value_label="Action",
+            value_options=("Add", "Remove"),
+            proc_args=("@location_json", "@extra_function_name", "@add", "@is_simulation"),
+            verify=VerifiedColumn("[ccc].[location]", "extra_function", "location_no", "xml"),
+            function_name="DCCXpressCODT",
+            assumption=(
+                "The Delayed Terminal variant is exercised through the same "
+                "`@extra_function_name` parameter as DCCXpressCO with `@add = 1`. The exact "
+                "node name `DCCXpressCODT` should be confirmed with the procedure owner before "
+                "this row is treated as a fully verified capability."
+            ),
+        ),
+        TestDefinition(
+            key="Bit 1 — DCC Xpress CO Fallback (location extra_function)",
+            bit=1,
+            target="location",
+            summary=(
+                "Adds or removes the `DCCXpressCOFallback` entry inside "
+                "`ccc.location.extra_function` for the selected location."
+            ),
+            business_meaning=(
+                "DCC Xpress CO Fallback controls whether the location may fall back to a "
+                "currency-conversion offer when the primary Xpress CO path is unavailable. "
+                "Enabling it keeps the offer available on the fallback route; removing it "
+                "suppresses conversion when the primary path cannot run. An incorrect setting "
+                "changes cardholder experience during degraded/fallback processing."
+            ),
+            mechanism=(
+                "The procedure rewrites the location's `extra_function` XML document, adding "
+                "or dropping the node that represents DCCXpressCOFallback."
+            ),
+            value_label="Action",
+            value_options=("Add", "Remove"),
+            proc_args=("@location_json", "@extra_function_name", "@add", "@is_simulation"),
+            verify=VerifiedColumn("[ccc].[location]", "extra_function", "location_no", "xml"),
+            function_name="DCCXpressCOFallback",
+            assumption=(
+                "The Fallback variant is exercised through the same `@extra_function_name` "
+                "parameter as DCCXpressCO with `@add = 1`. The exact node name "
+                "`DCCXpressCOFallback` should be confirmed with the procedure owner before "
+                "this row is treated as a fully verified capability."
+            ),
         ),
         TestDefinition(
             key="Bit 2 — Config Download Version (terminal)",
@@ -91,16 +171,17 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             ),
             business_meaning=(
                 "The config download version selects which configuration payload a terminal "
-                "pulls on its next TMS call. Moving a terminal to Standard aligns it with the "
-                "baseline DCC configuration. An incorrect version can push unsupported "
-                "settings to a live payment terminal and take it out of service."
+                "pulls on its next TMS call. The procedure supports two versions: `1` = "
+                "Standard (the baseline DCC configuration) and `2` = ECB DCC (the European "
+                "Central Bank conversion-rate variant). An incorrect version can push "
+                "unsupported settings to a live payment terminal and take it out of service."
             ),
             mechanism=(
-                "The procedure resolves the version description to its numeric code and "
-                "updates `configdownload_version` on the terminal row."
+                "The procedure resolves the version description (Standard / ECB DCC) to its "
+                "numeric code (1 / 2) and updates `configdownload_version` on the terminal row."
             ),
             value_label="Target version description",
-            value_options=("Standard", "Enhanced", "Legacy"),
+            value_options=("Standard", "ECB DCC"),
             proc_args=("@terminal_json", "@ConfigDownloadVersionDesc", "@is_simulation"),
             verify=VerifiedColumn(
                 "[cccintegrang].[emv_terminal]",
@@ -141,8 +222,9 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             bit=8,
             target="instance",
             summary=(
-                "Sets a single DCC handler flag inside the instance package configuration "
-                "for the selected instance."
+                "Sets a single DCC handler flag for the selected instance. The procedure "
+                "locates the instance's DCC handler and edits the flag inside "
+                "`[cccintegrang].[handler].extra_config`."
             ),
             business_meaning=(
                 "Handler flags switch individual DCC behaviours on an integration instance: "
@@ -152,8 +234,11 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "conversion on a transaction type the acquirer does not settle."
             ),
             mechanism=(
-                "The procedure edits the named boolean inside the instance's `package_config` "
-                "XML and writes the document back."
+                "The procedure resolves the instance's DCC handler row(s) and edits the named "
+                "boolean inside `[cccintegrang].[handler].extra_config`, writing the document "
+                "back. It also emits a `rollback_script` result set — its own compensating "
+                "`UPDATE` for the exact handler row(s) and prior value — which this tool "
+                "captures and uses to roll back (the change is NOT on the instance row)."
             ),
             value_label="Handler flag",
             value_options=(
@@ -162,6 +247,8 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "dccEnableCompletion",
                 "dccEnableNfc",
                 "dccEnableNfcSingleTap",
+                "dccEnableRefund",
+                "dccFlagsEnabled",
             ),
             proc_args=(
                 "@instance_json",
@@ -169,11 +256,23 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "@Config_value",
                 "@is_simulation",
             ),
+            # NOTE: the flag lives in [cccintegrang].[handler].extra_config, not on the
+            # instance row. The instance.package_config read below is retained only as
+            # displayed context; because sp_managed=True, the change and its rollback are
+            # judged from the procedure's own rollback_script, not this column.
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
                 "instance_identifier",
                 "xml",
+            ),
+            sp_managed=True,
+            assumption=(
+                "`dccEnableRefund` is treated as a boolean handler flag set to 1, consistent "
+                "with the other dccEnable* flags. `dccFlagsEnabled` is also exercised as a "
+                "boolean (`@Config_value = 1`); if it is in fact an integer bitmask its exact "
+                "numeric semantics must be confirmed with the procedure owner before that "
+                "value is treated as a fully verified capability."
             ),
         ),
         TestDefinition(
@@ -193,13 +292,19 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             ),
             value_label="Template name",
             value_options=None,
-            proc_args=("@instance_json", "@printout_type_Template_DCC", "@is_simulation"),
+            proc_args=(
+                "@instance_json",
+                "@printout_type_Template_DCC",
+                "@add_bit16",
+                "@is_simulation",
+            ),
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
                 "instance_identifier",
                 "xml",
             ),
+            add_remove_toggle=True,
         ),
     )
 }
