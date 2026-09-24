@@ -140,6 +140,50 @@ class TestResult:
                 row[label] = state.get("flag_value")
         return list(by_handler.values())
 
+    def _sp_join(self, field_key: str) -> object:
+        """Join one field of ``sp_flag_rows`` across handlers for single-value display.
+
+        A single affected handler (the common case) yields its raw value; multiple
+        handlers are joined as ``name: value`` pairs so nothing is silently dropped.
+        """
+        rows = self.sp_flag_rows
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return rows[0].get(field_key)
+        return "; ".join(f"{r.get('handler_name')}: {r.get(field_key)}" for r in rows)
+
+    @property
+    def sp_display_before(self) -> object:
+        """The real pre-call value on the related table (sp_managed bits only)."""
+        return self._sp_join("prior")
+
+    @property
+    def sp_display_after(self) -> object:
+        """The real post-call value on the related table (sp_managed bits only)."""
+        return self._sp_join("after")
+
+    @property
+    def sp_change_detected(self) -> bool | None:
+        """True/False once prior/after are both known; None if not read (cannot confirm)."""
+        rows = self.sp_flag_rows
+        if not rows:
+            return None
+        return any(r.get("prior") != r.get("after") for r in rows)
+
+    @property
+    def effective_change_persisted(self) -> bool:
+        """Change-persisted for display: the real related-table comparison for sp_managed
+
+        bits (where the generic verify column never moves), else the verify column's own
+        before/after comparison.
+        """
+        if self.sp_managed:
+            if self.sp_change_detected is not None:
+                return self.sp_change_detected
+            return self.has_sp_rollback
+        return self.change_persisted
+
     @property
     def verdict_code(self) -> str:
         """Precise, CAB-facing outcome that never implies a config was changed.
@@ -211,6 +255,7 @@ class TestResult:
         payload["can_rollback"] = self.can_rollback
         payload["verdict_code"] = self.verdict_code
         payload["verdict_detail"] = self.verdict_detail
+        payload["effective_change_persisted"] = self.effective_change_persisted
         return payload
 
 
@@ -537,6 +582,11 @@ def apply_rollback(
             result.sp_restored_states = read_sp_flag_states(
                 connection, result.target, sp_flag_name, column=definition.sp_column
             )
+            if result.sp_restored_states:
+                # The rollback succeeded: "after" now means "after rollback", so the
+                # Before/After evidence and change-persisted verdict reflect the
+                # value actually left in the database, not the pre-rollback one.
+                result.sp_after_states = result.sp_restored_states
             if result.sp_prior_states and result.sp_restored_states:
                 result.sp_flag_verified = flag_states_match(
                     result.sp_prior_states, result.sp_restored_states

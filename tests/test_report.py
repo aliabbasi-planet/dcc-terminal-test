@@ -127,12 +127,12 @@ def test_sp_managed_report_shows_procedure_rollback_script_as_authoritative():
     # The procedure's own script is presented as the authoritative rollback...
     assert "the procedure's OWN returned script" in text
     assert "UPDATE [cccintegrang].[handler]" in text
-    # ...and the misleading instance-column reading is explained, not hidden.
+    # ...and the real related-table source is explained.
     assert "Procedure-managed bit" in text
-    assert "does **not** mean the value was" in text
+    assert "[cccintegrang].[handler].extra_config" in text
 
 
-def test_sp_managed_report_shows_handler_flag_verification_table():
+def test_sp_managed_report_shows_real_before_after_and_change_persisted_yes():
     result = mk(
         mode="LIVE",
         status="PASS",
@@ -144,12 +144,17 @@ def test_sp_managed_report_shows_handler_flag_verification_table():
         sp_after_states=[{"handler_name": "handler-A", "flag_value": "true"}],
         sp_restored_states=[{"handler_name": "handler-A", "flag_value": "false"}],
         sp_flag_verified=True,
+        rollback_log=[{"trigger": "manual", "ok": True, "at": "2026-01-01T00:00:00", "rows": 1}],
     )
     text = _report([result])
-    assert "Handler-level verification" in text
-    assert "After rollback" in text
-    assert "handler-A" in text
-    assert "Verified:" in text
+    # The real handler-level values appear directly in Before/After, not package_config.
+    assert "| Before (restore point) | false |" in text
+    assert "| After | true |" in text
+    # And the change is reported as persisted, since it genuinely changed.
+    assert "| Change persisted | yes |" in text
+    # The now-redundant separate handler table is gone.
+    assert "Handler-level verification" not in text
+    assert "✓ **Verified:**" in text
 
 
 def test_section_a_renders_trace_rows_when_captured():

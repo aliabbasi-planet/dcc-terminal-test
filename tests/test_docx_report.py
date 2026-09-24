@@ -152,10 +152,8 @@ def test_word_report_contains_every_required_evidence_item():
         "Rollback statements actually executed",    # 4 - what actually ran
         "Before / applied change / after evidence",
         "Procedure-managed bit",                    # honesty note
-        "Handler-level verification",                # per-handler proof
-        "After rollback",
+        "[cccintegrang].[handler].extra_config",    # real column, shown directly
         "Verified:",
-        "handler-A",
         "Procedure return code",
         "Rollback verification",
         "Database message stream",

@@ -349,62 +349,6 @@ def _return_code_note(result: TestResult) -> list[str]:
     ]
 
 
-def _sp_flag_verification_block(result: TestResult) -> list[str]:
-    """Handler-level before/after/restored evidence for procedure-managed bits.
-
-    Reads the named flag (Bit 8) or the whole related document (Bit 16) on every
-    affected handler (via the procedure's own instance_id/handler_type join), so
-    CAB sees the change on the real column and a clear restored-to-prior verdict
-    — not the unrelated instance column.
-    """
-    rows = getattr(result, "sp_flag_rows", [])
-    definition = TEST_CATALOG.get(result.test_key)
-    sp_column = getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
-    uses_flag_name = (
-        getattr(definition, "sp_value_is_flag_name", True) if definition else True
-    )
-    label = _cell(result.value) if uses_flag_name else sp_column
-    if not rows:
-        return [
-            "_Handler-level verification was not available for this run (the read "
-            "returned no rows); rollback is confirmed by rows affected only._",
-            "",
-        ]
-    lines = [
-        f"**Handler-level verification — `{label}` on "
-        f"`[cccintegrang].[handler].{sp_column}`**",
-        "",
-        "| Handler | Before (prior) | After enable | After rollback |",
-        "| --- | --- | --- | --- |",
-    ]
-    for row in rows:
-        lines.append(
-            f"| {_cell(row.get('handler_name'))} | {_cell(row.get('prior'))} | "
-            f"{_cell(row.get('after'))} | {_cell(row.get('restored'))} |"
-        )
-    lines.append("")
-
-    verified = getattr(result, "sp_flag_verified", None)
-    handler_count = len(rows)
-    if verified is True:
-        lines.append(
-            f"✓ **Verified:** `{label}` returned to its pre-test value on {handler_count}/"
-            f"{handler_count} affected handler(s) after rollback."
-        )
-    elif verified is False:
-        lines.append(
-            "⚠️ **NOT verified:** at least one handler did not return to its pre-test "
-            f"`{label}` value after rollback — investigate before closing the change."
-        )
-    else:
-        lines.append(
-            "_Rollback ran (confirmed by rows affected), but value-level verification "
-            "was unavailable — the after-rollback read returned nothing to compare._"
-        )
-    lines.append("")
-    return lines
-
-
 def _db_code_block(result: TestResult) -> list[str]:
     """Show the actual SQL used to read, change, and restore the verified column.
 
@@ -511,38 +455,39 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         "```",
     ]
     lines += _db_code_block(result)
+    sp_managed = getattr(result, "sp_managed", False)
+    definition = TEST_CATALOG.get(result.test_key)
+    if sp_managed:
+        sp_column = (
+            getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
+        )
+        before_val, after_val = result.sp_display_before, result.sp_display_after
+    else:
+        before_val, after_val = result.state_before, result.state_after
     lines += [
         "",
         "**Before / applied change / after evidence**",
         "",
         "| Verified column | Value |",
         "| --- | --- |",
-        f"| Before (restore point) | {_cell(_state_cell(result, result.state_before))} |",
+        f"| Before (restore point) | {_cell(_state_cell(result, before_val))} |",
         f"| Applied change (value sent) | {_cell(result.value)} |",
-        f"| After | {_cell(_state_cell(result, result.state_after))} |",
-        f"| Change persisted | {_yes_no(result.change_persisted)} |",
+        f"| After | {_cell(_state_cell(result, after_val))} |",
+        f"| Change persisted | {_yes_no(result.effective_change_persisted)} |",
         f"| Procedure preview/trace returned | {_yes_no(result.proposed_change_observed)} |",
         f"| Procedure return code | {_return_code_cell(result)} |",
         f"| Transaction | {result.transaction} |",
         f"| Duration | {result.duration_s}s |",
         "",
     ]
-    if getattr(result, "sp_managed", False):
-        definition = TEST_CATALOG.get(result.test_key)
-        verify_ref = f"`{definition.verify.qualified}`" if definition else "the verified column"
-        sp_column = (
-            getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
-        )
+    if sp_managed:
         lines += [
-            f"> **Procedure-managed bit.** The value above is {verify_ref}, "
-            "which is **not** the column the procedure edits (the change lives "
-            f"in `[cccintegrang].[handler].{sp_column}`). So `Change persisted = no` here "
-            "reflects only that unrelated instance column — it does **not** mean the value "
-            "was unchanged. Whether the change applied, and how it is rolled back, are taken "
-            "from the procedure's own `rollback_script` / result sets shown above.",
+            "> **Procedure-managed bit.** Before/After above are read from "
+            f"`[cccintegrang].[handler].{sp_column}` — the table the procedure actually "
+            "edits — not the instance column used for other bits. Rollback uses the "
+            "procedure's own returned `rollback_script` (see below).",
             "",
         ]
-        lines += _sp_flag_verification_block(result)
     lines += _return_code_note(result)
     lines += [
         "**Rollback verification**",
@@ -569,6 +514,18 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
             for e in result.rollback_log
         ]
         lines += entries
+        if sp_managed:
+            verified = getattr(result, "sp_flag_verified", None)
+            if verified is True:
+                lines.append(
+                    f"- ✓ **Verified:** `{result.value}` returned to its pre-test value on "
+                    f"{len(result.sp_flag_rows)} affected handler(s) after rollback."
+                )
+            elif verified is False:
+                lines.append(
+                    "- ⚠️ **NOT verified:** at least one handler did not return to its "
+                    "pre-test value after rollback — investigate before closing the change."
+                )
     else:
         lines.append(
             "Live run — no rollback was performed. The change is committed to the database."

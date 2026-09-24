@@ -119,7 +119,12 @@ def _unescape_cell(text: str) -> str:
 
 
 def _flush_table(document, rows: list[list[str]]) -> None:
-    """Render collected Markdown table rows as a native Word table."""
+    """Render collected Markdown table rows as a native Word table.
+
+    Columns are fixed to equal width (autofit disabled) so a long value — e.g. the
+    raw XML now shown for sp_managed bits — wraps instead of squeezing the other
+    column down to nothing.
+    """
     if not rows:
         return
     header, *body = rows
@@ -137,7 +142,22 @@ def _flush_table(document, rows: list[list[str]]) -> None:
             value = row[idx] if idx < len(row) else ""
             cells[idx].text = ""
             _add_rich_runs(cells[idx].paragraphs[0], value)
+    _set_equal_column_widths(table, len(header))
     document.add_paragraph()
+
+
+_TABLE_WIDTH = Inches(6.5)
+
+
+def _set_equal_column_widths(table, column_count: int) -> None:
+    """Force every column to the same fixed width so Word wraps long text."""
+    table.autofit = False
+    col_width = Inches(_TABLE_WIDTH.inches / column_count)
+    for column in table.columns:
+        column.width = col_width
+    for row in table.rows:
+        for cell in row.cells:
+            cell.width = col_width
 
 
 def _flush_code(document, code_lines: list[str]) -> None:
