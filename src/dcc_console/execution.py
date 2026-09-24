@@ -71,9 +71,11 @@ class TestResult:
     sp_rollback_scripts: list[str] = field(default_factory=list)
     # True when this test's bit is procedure-managed (see TestDefinition.sp_managed).
     sp_managed: bool = False
-    # Handler-level flag verification (Bit 8): the named flag's value on every
-    # affected handler, read via the procedure's own instance_id/handler_type join,
-    # before the call, after the call, and after rollback. Additive CAB evidence.
+    # Handler-level flag verification (sp_managed bits: Bit 8's handler flags, Bit
+    # 16's receipt template): the named flag's value (or the whole document, for
+    # Bit 16) on every affected handler, read via the procedure's own
+    # instance_id/handler_type join, before the call, after the call, and after
+    # rollback. Additive CAB evidence.
     sp_prior_states: list[dict] = field(default_factory=list)
     sp_after_states: list[dict] = field(default_factory=list)
     sp_restored_states: list[dict] = field(default_factory=list)
@@ -344,11 +346,15 @@ def run_test(
     before = read_state(connection, definition, target_identifier)
     started = datetime.now()
 
-    # Handler-level flag snapshot BEFORE the call (Bit 8 only). Read via the
-    # procedure's own join; additive evidence, never blocks the test.
+    # Handler-level snapshot BEFORE the call (sp_managed bits only: Bit 8's flags,
+    # Bit 16's receipt template). Read via the procedure's own join; additive
+    # evidence, never blocks the test.
     sp_prior_states: list[dict] = []
     if definition.sp_managed:
-        sp_prior_states = read_sp_flag_states(connection, target_identifier, config_value)
+        sp_flag_name = config_value if definition.sp_value_is_flag_name else None
+        sp_prior_states = read_sp_flag_states(
+            connection, target_identifier, sp_flag_name, column=definition.sp_column
+        )
 
     error: str | None = None
     grids: list[pd.DataFrame] = []
@@ -391,19 +397,23 @@ def run_test(
     after = read_state(connection, definition, target_identifier)
     persisted = before != after
 
-    # Handler-level flag snapshot AFTER the call (Bit 8 only) — shows the flag
-    # actually moved on the correct table, independent of the instance column.
+    # Handler-level snapshot AFTER the call (sp_managed bits only) — shows the
+    # value actually moved on the correct table, independent of the instance column.
     sp_after_states: list[dict] = []
     if definition.sp_managed:
-        sp_after_states = read_sp_flag_states(connection, target_identifier, config_value)
+        sp_flag_name = config_value if definition.sp_value_is_flag_name else None
+        sp_after_states = read_sp_flag_states(
+            connection, target_identifier, sp_flag_name, column=definition.sp_column
+        )
 
     # The procedure's own simulation/preview result set, a server message, or its
     # internal trace is the evidence that the intended change was computed.
     proposed_change_observed = bool(grids) or bool(messages) or bool(trace.rows)
 
     # Capture the procedure's own compensating UPDATE(s). For sp_managed bits the
-    # change is on a related table (e.g. handler.extra_config) that the generic
-    # verify column never sees, so these scripts are the authoritative rollback.
+    # change is on a related table (e.g. handler.extra_config, handler.receipt_config)
+    # that the generic verify column never sees, so these scripts are the
+    # authoritative rollback.
     sp_rollback_scripts = _extract_rollback_scripts(grids)
 
     # For sp_managed bits the generic before/after read is not the column the
@@ -494,9 +504,9 @@ def apply_rollback(
 ) -> RollbackOutcome:
     """Restore the pre-test value and refresh the result in place.
 
-    For procedure-managed bits (Bit 8) the change is on a related table the generic
-    verify column never sees, so we prefer the procedure's own returned rollback
-    script; otherwise we fall back to the generic column-restore.
+    For procedure-managed bits (Bit 8, Bit 16) the change is on a related table the
+    generic verify column never sees, so we prefer the procedure's own returned
+    rollback script; otherwise we fall back to the generic column-restore.
     """
     if result.sp_rollback_scripts:
         # The procedure also returns a rollback_script under @is_simulation=1 as a
@@ -520,11 +530,12 @@ def apply_rollback(
             result.transaction = (
                 f"COMMITTED then {trigger.upper()} ROLLED BACK (procedure script)"
             )
-            # Handler-level verification: read the flag back and compare to prior.
+            # Handler-level verification: read the value back and compare to prior.
             # Additive — a read problem leaves sp_flag_verified=None, never failing
             # the rollback that already committed.
+            sp_flag_name = result.value if definition.sp_value_is_flag_name else None
             result.sp_restored_states = read_sp_flag_states(
-                connection, result.target, result.value
+                connection, result.target, sp_flag_name, column=definition.sp_column
             )
             if result.sp_prior_states and result.sp_restored_states:
                 result.sp_flag_verified = flag_states_match(

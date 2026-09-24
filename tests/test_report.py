@@ -129,7 +129,7 @@ def test_sp_managed_report_shows_procedure_rollback_script_as_authoritative():
     assert "UPDATE [cccintegrang].[handler]" in text
     # ...and the misleading instance-column reading is explained, not hidden.
     assert "Procedure-managed bit" in text
-    assert "does **not** mean the flag was" in text
+    assert "does **not** mean the value was" in text
 
 
 def test_sp_managed_report_shows_handler_flag_verification_table():
@@ -146,7 +146,7 @@ def test_sp_managed_report_shows_handler_flag_verification_table():
         sp_flag_verified=True,
     )
     text = _report([result])
-    assert "Handler flag verification" in text
+    assert "Handler-level verification" in text
     assert "After rollback" in text
     assert "handler-A" in text
     assert "Verified:" in text

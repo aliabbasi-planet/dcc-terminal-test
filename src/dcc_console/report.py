@@ -352,20 +352,27 @@ def _return_code_note(result: TestResult) -> list[str]:
 def _sp_flag_verification_block(result: TestResult) -> list[str]:
     """Handler-level before/after/restored evidence for procedure-managed bits.
 
-    Reads the named flag on every affected handler (via the procedure's own
-    instance_id/handler_type join), so CAB sees the change on the real column and
-    a clear restored-to-prior verdict — not the unrelated instance column.
+    Reads the named flag (Bit 8) or the whole related document (Bit 16) on every
+    affected handler (via the procedure's own instance_id/handler_type join), so
+    CAB sees the change on the real column and a clear restored-to-prior verdict
+    — not the unrelated instance column.
     """
     rows = getattr(result, "sp_flag_rows", [])
+    definition = TEST_CATALOG.get(result.test_key)
+    sp_column = getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
+    uses_flag_name = (
+        getattr(definition, "sp_value_is_flag_name", True) if definition else True
+    )
+    label = _cell(result.value) if uses_flag_name else sp_column
     if not rows:
         return [
-            "_Handler-level flag verification was not available for this run (the read "
+            "_Handler-level verification was not available for this run (the read "
             "returned no rows); rollback is confirmed by rows affected only._",
             "",
         ]
-    flag = _cell(result.value)
     lines = [
-        f"**Handler flag verification — `{flag}` on `[cccintegrang].[handler].extra_config`**",
+        f"**Handler-level verification — `{label}` on "
+        f"`[cccintegrang].[handler].{sp_column}`**",
         "",
         "| Handler | Before (prior) | After enable | After rollback |",
         "| --- | --- | --- | --- |",
@@ -381,13 +388,13 @@ def _sp_flag_verification_block(result: TestResult) -> list[str]:
     handler_count = len(rows)
     if verified is True:
         lines.append(
-            f"✓ **Verified:** `{flag}` returned to its pre-test value on {handler_count}/"
+            f"✓ **Verified:** `{label}` returned to its pre-test value on {handler_count}/"
             f"{handler_count} affected handler(s) after rollback."
         )
     elif verified is False:
         lines.append(
             "⚠️ **NOT verified:** at least one handler did not return to its pre-test "
-            f"`{flag}` value after rollback — investigate before closing the change."
+            f"`{label}` value after rollback — investigate before closing the change."
         )
     else:
         lines.append(
@@ -521,13 +528,18 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         "",
     ]
     if getattr(result, "sp_managed", False):
+        definition = TEST_CATALOG.get(result.test_key)
+        verify_ref = f"`{definition.verify.qualified}`" if definition else "the verified column"
+        sp_column = (
+            getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
+        )
         lines += [
-            "> **Procedure-managed bit.** The value above is `[cccintegrang].[instance]."
-            "package_config`, which is **not** the column the procedure edits (the flag lives "
-            "in `[cccintegrang].[handler].extra_config`). So `Change persisted = no` here "
-            "reflects only that unrelated instance column — it does **not** mean the flag was "
-            "unchanged. Whether the change applied, and how it is rolled back, are taken from "
-            "the procedure's own `rollback_script` / result sets shown above.",
+            f"> **Procedure-managed bit.** The value above is {verify_ref}, "
+            "which is **not** the column the procedure edits (the change lives "
+            f"in `[cccintegrang].[handler].{sp_column}`). So `Change persisted = no` here "
+            "reflects only that unrelated instance column — it does **not** mean the value "
+            "was unchanged. Whether the change applied, and how it is rolled back, are taken "
+            "from the procedure's own `rollback_script` / result sets shown above.",
             "",
         ]
         lines += _sp_flag_verification_block(result)

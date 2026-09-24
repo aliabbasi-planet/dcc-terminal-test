@@ -152,7 +152,7 @@ def test_word_report_contains_every_required_evidence_item():
         "Rollback statements actually executed",    # 4 - what actually ran
         "Before / applied change / after evidence",
         "Procedure-managed bit",                    # honesty note
-        "Handler flag verification",                # per-handler proof
+        "Handler-level verification",                # per-handler proof
         "After rollback",
         "Verified:",
         "handler-A",

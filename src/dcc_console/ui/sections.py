@@ -79,16 +79,24 @@ def _render_change_evidence(result: TestResult) -> None:
     restored = any(e.get("ok") for e in result.rollback_log)
 
     if result.sp_managed:
+        definition = TEST_CATALOG.get(result.test_key)
+        sp_column = (
+            getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
+        )
+        uses_flag_name = (
+            getattr(definition, "sp_value_is_flag_name", True) if definition else True
+        )
         st.caption(
-            "⚠️ Procedure-managed change: the flag is written to a related table (e.g. "
-            "`[cccintegrang].[handler].extra_config`), which the instance column above does "
+            "⚠️ Procedure-managed change: the value is written to a related table (e.g. "
+            f"`[cccintegrang].[handler].{sp_column}`), which the instance column above does "
             "**not** reflect — so the before/after values shown are context only. Whether the "
             f"change is applied is judged from the procedure's own output (**{flag}**), and "
             "rollback uses the procedure's returned script (see the Rollback panel)."
         )
         if result.sp_flag_rows:
+            label = result.value if uses_flag_name else sp_column
             st.caption(
-                f"Handler-level `{result.value}` (read via the procedure's own join): "
+                f"Handler-level `{label}` (read via the procedure's own join): "
                 "before → after enable → after rollback."
             )
             st.table(result.sp_flag_rows)
@@ -910,13 +918,14 @@ def _render_rollback_panel(result: TestResult) -> None:
         else:
             st.error(f"{label} rollback failed at {entry['at']}: {entry['error']}")
 
-    # Procedure-managed bits (e.g. Bit 8): the change is on a related table the
-    # generic verify column never sees, so roll back with the procedure's OWN
+    # Procedure-managed bits (e.g. Bit 8, Bit 16): the change is on a related table
+    # the generic verify column never sees, so roll back with the procedure's OWN
     # returned script rather than the generic column-restore.
     if result.has_sp_rollback:
+        sp_column = getattr(definition, "sp_column", "extra_config")
         st.caption(
-            "Procedure-managed change: the flag lives in a related table (e.g. "
-            "`[cccintegrang].[handler].extra_config`), so rollback runs the compensating "
+            "Procedure-managed change: the value lives in a related table (e.g. "
+            f"`[cccintegrang].[handler].{sp_column}`), so rollback runs the compensating "
             "`UPDATE` the procedure itself returned — not a write to the instance row."
         )
         with st.popover("Show the procedure's rollback script"):
