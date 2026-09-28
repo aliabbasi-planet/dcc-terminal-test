@@ -7,6 +7,7 @@ import logging
 import streamlit as st
 
 from dcc_console.config import ENVIRONMENTS, PROCEDURE
+from dcc_console.remediation.tab import render_remediation
 from dcc_console.state import init_state
 from dcc_console.ui import (
     render_broken_terminals,
@@ -58,7 +59,9 @@ def main() -> None:
     st.divider()
     render_terminals()
     st.divider()
-    test_tab, campaign_tab, broken_tab = st.tabs(["Single test", "Campaigns", "Broken Terminals"])
+    test_tab, campaign_tab, broken_tab, remediation_tab = st.tabs(
+        ["Single test", "Campaigns", "Broken Terminals", "DCC Remediation"]
+    )
     with test_tab:
         render_test(simulation, confirmed and ready)
         st.divider()
@@ -67,6 +70,8 @@ def main() -> None:
         render_campaign(simulation, confirmed and ready)
     with broken_tab:
         render_broken_terminals()
+    with remediation_tab:
+        render_remediation()
 
 
 if __name__ == "__main__":

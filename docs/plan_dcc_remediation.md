@@ -1,6 +1,7 @@
 # DCC Remediation & Analytics — Implementation Plan
 
-Status: **DRAFT for approval**. No branch/code created until this is agreed.
+Status: **APPROVED — phases 1-3 + 8 delivered** (read-only identify/analytics on
+`feature/dcc-remediation`). See §13 for what is live vs deferred.
 Author: Cortex Code · Target branch: `feature/dcc-remediation` (from `main`)
 New code location: `src/dcc_console/remediation/` (new package; existing tabs untouched)
 
@@ -274,3 +275,39 @@ Branched after PR #3 (`bugfix/package_config`) merged. Relevant deltas:
   will not omit. Overruling §7.2 must be an explicit, recorded decision.
 - Data-engineering best practice would schedule §5 as a task; app-triggered is
   per your choice and carries the runtime-grants tradeoff noted.
+
+---
+
+## 13. Implementation status (this iteration)
+
+**Delivered and verified against Snowflake (`DEV_CORE_AAB.DCC_REMEDIATION`):**
+- Schema executed live: `FLAG_REFERENCE` (14 seeded rows), `HEALTH_DAILY_SNAPSHOT`,
+  `APP_FIX_LOG`, and views `V_CURRENT_BROKEN` / `V_FIX_HISTORY` / `V_REMEDIATION_KPIS`.
+- Snapshot loaded from `CORTEX_TERMINAL_MAINTENANCE`: **12,654** broken terminals
+  today; `V_CURRENT_BROKEN` returns them as `ACTIONABLE`. Refresh MERGE proven
+  idempotent (re-run updated 12,654 / inserted 0).
+- New package `src/dcc_console/remediation/`: `mapping.py`, `snapshot.py`,
+  `worklist.py`, `analytics.py`, `fixlog.py` (pure, unit-tested — 25 tests),
+  `sf_connection.py` (SSO), `tab.py` (read-only identify/analyse/filter + refresh).
+- Third tab **"DCC Remediation"** wired into `app.py`. `snowflake-connector-python`
+  added to requirements. Suite: **210 pass**, ruff clean.
+
+**Correction found during validation (schema hardened):** the original
+`001_schema.sql` omitted two *fixable* checks — `PRINTOUTTYPETEMPLATEDCC_CHECK_C`
+(Bit 16) and `CONFIGDOWNLOAD_VERSION_CHECK_C` (Bit 2). Both are now columns in the
+snapshot and in the refresh; the file is corrected. Without this, ~1,400
+template/config-only broken terminals were invisible to the worklist.
+
+**Grain decision (recorded):** the maintenance table is ~1.7 rows/terminal, but
+terminal→instance is 1:1 among broken rows, so the snapshot is grouped to
+`TERMINAL_IDENTIFIER` with `MAX` of each normalized broken flag (broken if any
+source row is broken). Location-scoped fixes (Bit 1) will group by `LOCATION_NO`
+in the fixer. Broken = `BASE = 1 AND COALESCE(CHECK, 1) = 1` (in scope, failing/unknown).
+
+**Deferred (needs confirmations before building — unchanged from §2/§7):**
+- Phase 6 live one-by-one fixer (needs SQL Server auth method + live-fix RBAC
+  allowlist), reusing `execution.run_test` / `apply_rollback` and `fixlog.build_insert`.
+- Phase 5 recovery-integrity P0s (§7.2). Phase 7 unified SSO login page.
+- Phase 9 logging/alerts/runbook/version stamp/health checks.
+- `sql/remediation/003_refresh_snapshot.sql` is generated from `snapshot.py`
+  (do not hand-edit). `runbook_recovery.md` not yet written (phase 9).

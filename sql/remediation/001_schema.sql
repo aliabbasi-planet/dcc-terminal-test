@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS DEV_CORE_AAB.DCC_REMEDIATION.HEALTH_DAILY_SNAPSHOT (
     DCCXPRESSCOFALLBACK_CHECK_O            INTEGER,
     DCCMERCHANT_NO_CHECK_O                 INTEGER,
     FIRMWARE_VERSION_CHECK                 INTEGER,
+    PRINTOUTTYPETEMPLATEDCC_CHECK_C        INTEGER,        -- Bit 16 (receipt template) — fixable
+    CONFIGDOWNLOAD_VERSION_CHECK_C         INTEGER,        -- Bit 2 (config download version) — fixable
     IS_DCC_BROKEN        BOOLEAN      NOT NULL,           -- always TRUE here (broken-only), kept explicit
     SOURCE_LAST_ALTERED  TIMESTAMP_NTZ,                   -- freshness of the maintenance table at capture
     CAPTURED_AT          TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
