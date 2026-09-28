@@ -168,21 +168,31 @@ def extract_flag_value(extra_config: str, flag_name: str) -> str | None:
 def read_sp_flag_states(
     connection: DatabaseConnection,
     instance_identifier: str,
-    flag_name: str,
+    flag_name: str | None,
+    column: str = "extra_config",
 ) -> list[dict]:
-    """Read the named flag's current value on every handler a Bit 8 call targets.
+    """Read the current handler-level value on every handler an sp_managed call targets.
 
     Uses the procedure's own handler<->instance join (``instance_id``) and the same
     ``handler_type`` filter, so we inspect exactly the rows the procedure changes.
+    ``column`` is always one of the catalogue's own fixed constants (``extra_config``
+    for Bit 8, ``receipt_config`` for Bit 16) — never built from user input.
+
+    When ``flag_name`` is given, the named ``config_name``/``config_value`` pair is
+    extracted from the document (Bit 8's boolean handler flags). When it is
+    ``None``, the whole document is returned as-is (Bit 16's receipt template,
+    which is not a named flag lookup).
+
     This is additive evidence only: any failure returns ``[]`` so a rollback is
     never affected by a verification-read problem.
     """
-    if not instance_identifier or not flag_name:
+    if not instance_identifier:
         return []
     placeholders = ", ".join(["?"] * len(HANDLER_TYPE_FILTER))
-    # Safe: only `?` placeholders are interpolated (fixed count); all values are bound.
+    # Safe: `column` is a catalogue constant (never user input); only `?`
+    # placeholders are interpolated (fixed count) with bound values.
     sql = (
-        "SELECT h.handler_name, CONVERT(nvarchar(max), h.extra_config) AS extra_config "  # noqa: S608
+        f"SELECT h.handler_name, CONVERT(nvarchar(max), h.{column}) AS {column} "  # noqa: S608
         "FROM [cccintegrang].[handler] h WITH (NOLOCK) "
         "INNER JOIN [cccintegrang].[instance] i WITH (NOLOCK) ON i.instance_id = h.instance_id "
         "INNER JOIN [cccintegrang].[handler_type] ht WITH (NOLOCK) "
@@ -193,14 +203,16 @@ def read_sp_flag_states(
     try:
         frame = connection.query(sql, (instance_identifier, *HANDLER_TYPE_FILTER))
     except Exception as exc:
-        logger.warning("Handler flag verification read failed: %s", exc)
+        logger.warning("Handler-level verification read failed: %s", exc)
         return []
     states: list[dict] = []
     for _, row in frame.iterrows():
+        raw = row.get(column)
+        value = extract_flag_value(raw, flag_name) if flag_name else raw
         states.append(
             {
                 "handler_name": row.get("handler_name"),
-                "flag_value": extract_flag_value(row.get("extra_config"), flag_name),
+                "flag_value": value,
             }
         )
     return states

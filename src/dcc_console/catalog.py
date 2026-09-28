@@ -53,8 +53,18 @@ class TestDefinition:
     # When True, the procedure changes a *related* table (not the `verify` row) and
     # emits its own compensating `rollback_script`. For these bits the generic
     # column read is context only; the change and its rollback are judged from the
-    # procedure's own output. See Bit 8 (handler.extra_config).
+    # procedure's own output. See Bit 8 (handler.extra_config) and Bit 16
+    # (handler.receipt_config).
     sp_managed: bool = False
+    # For sp_managed bits, the column on [cccintegrang].[handler] the procedure
+    # actually edits. Declared here (never built from user input) so the
+    # handler-level verification read cannot be redirected to another column.
+    sp_column: str = "extra_config"
+    # True when the catalogue value IS the name of a flag to look up inside the
+    # sp_column XML document (config_name="<value>"), as for Bit 8's handler
+    # flags. False when the value is not a lookup key and the whole document is
+    # the relevant evidence, as for Bit 16's receipt template.
+    sp_value_is_flag_name: bool = True
     # When True, an Add/Remove selector is rendered ahead of the `value_label`
     # widget. Choosing "Remove" skips the value widget entirely and the procedure
     # is called with that value NULLed out; choosing "Add" keeps the normal value
@@ -267,6 +277,7 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "xml",
             ),
             sp_managed=True,
+            sp_column="extra_config",
             assumption=(
                 "`dccEnableRefund` is treated as a boolean handler flag set to 1, consistent "
                 "with the other dccEnable* flags. `dccFlagsEnabled` is also exercised as a "
@@ -279,7 +290,11 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             key="Bit 16 — DCC Receipt Template (instance)",
             bit=16,
             target="instance",
-            summary="Sets the DCC printout/receipt template on the selected instance.",
+            summary=(
+                "Sets the DCC printout/receipt template for the selected instance. The "
+                "procedure locates the instance's DCC handler and edits the template inside "
+                "`[cccintegrang].[handler].receipt_config`."
+            ),
             business_meaning=(
                 "The receipt template controls the wording and layout of the DCC disclosure "
                 "printed for the cardholder. Card scheme rules require the exchange rate, "
@@ -287,8 +302,12 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "incorrect template is a compliance breach, not just a cosmetic defect."
             ),
             mechanism=(
-                "The procedure stores the named template against the instance's printout "
-                "configuration inside `package_config`."
+                "The procedure resolves the instance's DCC handler row(s) and rewrites the "
+                "`[cccintegrang].[handler].receipt_config` XML document with the named "
+                "template (or clears it, for Remove). It also emits a `rollback_script` "
+                "result set — its own compensating `UPDATE` for the exact handler row(s) and "
+                "prior value — which this tool captures and uses to roll back (the change is "
+                "NOT on the instance row)."
             ),
             value_label="Template name",
             value_options=None,
@@ -298,6 +317,10 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "@add_bit16",
                 "@is_simulation",
             ),
+            # NOTE: the template lives in [cccintegrang].[handler].receipt_config, not on
+            # the instance row. The instance.package_config read below is retained only as
+            # displayed context; because sp_managed=True, the change and its rollback are
+            # judged from the procedure's own rollback_script, not this column.
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
@@ -305,6 +328,9 @@ TEST_CATALOG: dict[str, TestDefinition] = {
                 "xml",
             ),
             add_remove_toggle=True,
+            sp_managed=True,
+            sp_column="receipt_config",
+            sp_value_is_flag_name=False,
         ),
     )
 }

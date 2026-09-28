@@ -48,10 +48,12 @@ def _state_label(result: TestResult, value: object) -> str:
 def _change_flag(result: TestResult) -> str:
     """One-word summary of whether the change is applied/reverted."""
     if result.sp_managed:
-        # The instance verify column never moves for these; judge by procedure signal.
+        # The instance verify column never moves for these; judge by the real
+        # related-table comparison (sp_change_detected), falling back to the
+        # procedure's own rollback_script signal when that read is unavailable.
         if any(e.get("ok") for e in result.rollback_log):
             return "reverted"
-        if result.has_sp_rollback:
+        if result.sp_change_detected or result.has_sp_rollback:
             return "changed"
         return "unchanged"
     if result.state_before == result.state_after:
@@ -68,30 +70,31 @@ def _render_change_evidence(result: TestResult) -> None:
     """
     st.markdown("**Before / applied change / after**")
     cols = st.columns(3)
+    if result.sp_managed:
+        before_val, after_val = result.sp_display_before, result.sp_display_after
+    else:
+        before_val, after_val = result.state_before, result.state_after
     cols[0].caption("① Initial state")
-    cols[0].code(_state_label(result, result.state_before) or "(none)")
+    cols[0].code(_state_label(result, before_val) or "(none)")
     cols[1].caption("② Applied change")
     cols[1].code(f"{result.test_key.split(' — ')[0]} → {result.value}")
     cols[2].caption("③ State after")
-    cols[2].code(_state_label(result, result.state_after) or "(none)")
+    cols[2].code(_state_label(result, after_val) or "(none)")
 
     flag = _change_flag(result)
     restored = any(e.get("ok") for e in result.rollback_log)
 
     if result.sp_managed:
-        st.caption(
-            "⚠️ Procedure-managed change: the flag is written to a related table (e.g. "
-            "`[cccintegrang].[handler].extra_config`), which the instance column above does "
-            "**not** reflect — so the before/after values shown are context only. Whether the "
-            f"change is applied is judged from the procedure's own output (**{flag}**), and "
-            "rollback uses the procedure's returned script (see the Rollback panel)."
+        definition = TEST_CATALOG.get(result.test_key)
+        sp_column = (
+            getattr(definition, "sp_column", "extra_config") if definition else "extra_config"
         )
-        if result.sp_flag_rows:
-            st.caption(
-                f"Handler-level `{result.value}` (read via the procedure's own join): "
-                "before → after enable → after rollback."
-            )
-            st.table(result.sp_flag_rows)
+        st.caption(
+            f"Values above are read from `[cccintegrang].[handler].{sp_column}` — the table "
+            "the procedure actually edits — not the instance column shown for other bits. "
+            f"Verdict: **{flag}**. Rollback uses the procedure's returned script (see the "
+            "Rollback panel)."
+        )
         return
 
     if result.mode == "SIMULATION":
@@ -125,7 +128,7 @@ def _result_ledger(result: TestResult) -> str:
             f"DURATION           : {result.duration_s} s",
             f"STATE BEFORE       : {_clip(result.state_before)}",
             f"STATE AFTER        : {_clip(result.state_after)}",
-            f"CHANGE PERSISTED   : {result.change_persisted}",
+            f"CHANGE PERSISTED   : {result.effective_change_persisted}",
             f"HARNESS STATUS     : {result.status}",
             f"RETURN CODE        : {getattr(result, 'return_code', None)}",
             f"SQL ERROR          : {result.error or 'none'}",
@@ -910,13 +913,14 @@ def _render_rollback_panel(result: TestResult) -> None:
         else:
             st.error(f"{label} rollback failed at {entry['at']}: {entry['error']}")
 
-    # Procedure-managed bits (e.g. Bit 8): the change is on a related table the
-    # generic verify column never sees, so roll back with the procedure's OWN
+    # Procedure-managed bits (e.g. Bit 8, Bit 16): the change is on a related table
+    # the generic verify column never sees, so roll back with the procedure's OWN
     # returned script rather than the generic column-restore.
     if result.has_sp_rollback:
+        sp_column = getattr(definition, "sp_column", "extra_config")
         st.caption(
-            "Procedure-managed change: the flag lives in a related table (e.g. "
-            "`[cccintegrang].[handler].extra_config`), so rollback runs the compensating "
+            "Procedure-managed change: the value lives in a related table (e.g. "
+            f"`[cccintegrang].[handler].{sp_column}`), so rollback runs the compensating "
             "`UPDATE` the procedure itself returned — not a write to the instance row."
         )
         with st.popover("Show the procedure's rollback script"):
