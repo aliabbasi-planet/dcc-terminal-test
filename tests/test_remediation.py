@@ -17,15 +17,18 @@ from dcc_console.remediation import (
     ddl,
     fixlog,
     mapping,
+    parse_schema_fqn,
     snapshot,
+    suggest,
 )
 from dcc_console.remediation import analytics as an
 from dcc_console.remediation import worklist as wl
 
 # A concrete tenant used across builder tests, plus a *different* one to prove the
-# schema is not hardcoded anywhere.
+# schema is not hardcoded anywhere, plus one that uses the team's shared fix log.
 OBJS = RemediationObjects("DEV_CORE_AAB")
 OTHER = RemediationObjects("DEV_CORE_XYZ", "MY_SCHEMA")
+SHARED = RemediationObjects("DEV_CORE_XYZ", "MY_SCHEMA", "DEV_CORE_AAB", "DCC_REMEDIATION")
 
 # --------------------------------------------------------------------------- #
 # RemediationObjects (multi-tenant)
@@ -58,6 +61,29 @@ def test_objects_trim_whitespace():
     obj = RemediationObjects("  DEV_CORE_AAB  ", "  DCC_REMEDIATION ")
     assert obj.database == "DEV_CORE_AAB"
     assert obj.schema == "DCC_REMEDIATION"
+
+
+def test_objects_without_shared_schema_keep_the_log_in_their_own_schema():
+    assert OTHER.shared_fqn == OTHER.schema_fqn
+    assert OTHER.uses_shared_log is False
+    assert OTHER.operators_table == "DEV_CORE_XYZ.MY_SCHEMA.FIX_OPERATORS"
+
+
+def test_objects_with_shared_schema_route_only_log_and_allowlist_there():
+    assert SHARED.snapshot_table == "DEV_CORE_XYZ.MY_SCHEMA.HEALTH_DAILY_SNAPSHOT"
+    assert SHARED.v_current_broken == "DEV_CORE_XYZ.MY_SCHEMA.V_CURRENT_BROKEN"
+    assert SHARED.fix_log_table == "DEV_CORE_AAB.DCC_REMEDIATION.APP_FIX_LOG"
+    assert SHARED.operators_table == "DEV_CORE_AAB.DCC_REMEDIATION.FIX_OPERATORS"
+    assert SHARED.uses_shared_log is True
+    with pytest.raises(ValueError):
+        RemediationObjects("DEV_CORE_AAB", "DCC_REMEDIATION", "bad;db", "X")
+
+
+def test_parse_schema_fqn_validates_both_parts():
+    assert parse_schema_fqn(" DEV_CORE_AAB.DCC_REMEDIATION ") == ("DEV_CORE_AAB", "DCC_REMEDIATION")
+    for bad in ("DEV_CORE_AAB", "a.b.c", "a;b.c", ".x", ""):
+        with pytest.raises(ValueError):
+            parse_schema_fqn(bad)
 
 
 # --------------------------------------------------------------------------- #
@@ -321,37 +347,112 @@ def test_fixlog_insert_validates_mode_and_outcome():
         fixlog.build_insert(bad_outcome, OBJS)
 
 
-def test_recent_fix_query_shape():
-    sql, params = fixlog.build_recent_fix_query(OBJS)
-    assert "MAX(APPLIED_AT)" in sql
+def test_last_live_outcome_query_shape():
+    sql = fixlog.build_last_live_outcome_query(OBJS)
     assert "TERMINAL_IDENTIFIER = %s" in sql
     assert "CHECK_COLUMN = %s" in sql
-    assert params == []
+    assert "ENVIRONMENT = %s" in sql
+    assert "OUTCOME IN ('APPLIED', 'ROLLED_BACK')" in sql  # a rollback re-opens a fix
+    assert sql.strip().endswith("LIMIT 1")
+
+
+def test_fixlog_accepts_new_outcomes_and_audit_columns():
+    for outcome in ("SIMULATED", "NOT_FOUND", "SKIPPED_ALREADY_OK", "ROLLED_BACK"):
+        record = {**_valid_fix_record(), "OUTCOME": outcome, "SQL_LOGIN": "svc", "NOTES": "n"}
+        sql, params = fixlog.build_insert(record, OBJS)
+        assert "SQL_LOGIN" in sql and "NOTES" in sql
+        assert outcome in params
+
+
+def test_fixlog_history_and_operator_queries_use_the_shared_log():
+    history = fixlog.build_terminal_history_query(SHARED, limit=10)
+    assert SHARED.fix_log_table in history
+    assert "TERMINAL_IDENTIFIER = %s" in history
+    assert history.strip().endswith("LIMIT 10")
+    operator = fixlog.build_operator_check_query(SHARED)
+    assert SHARED.operators_table in operator
+    assert "CURRENT_USER()" in operator  # identity comes from the SSO session
 
 
 # --------------------------------------------------------------------------- #
-# ddl (per-user schema initialiser)
+# ddl (per-user schema + shared fix log)
 # --------------------------------------------------------------------------- #
 
 
-def test_ddl_create_statements_cover_all_objects():
-    statements = ddl.build_create_statements(OBJS)
-    assert len(statements) == 7
+def test_ddl_initialise_covers_all_objects_in_dependency_order():
+    statements = ddl.build_initialise_statements(OBJS)
     joined = "\n".join(statements)
     assert f"CREATE SCHEMA IF NOT EXISTS {OBJS.schema_fqn}" in joined
-    for table in ("HEALTH_DAILY_SNAPSHOT", "APP_FIX_LOG", "FLAG_REFERENCE"):
+    for table in ("HEALTH_DAILY_SNAPSHOT", "APP_FIX_LOG", "FLAG_REFERENCE", "FIX_OPERATORS"):
         assert f"{OBJS.schema_fqn}.{table}" in joined
     for view in ("V_CURRENT_BROKEN", "V_FIX_HISTORY", "V_REMEDIATION_KPIS"):
         assert f"{OBJS.schema_fqn}.{view}" in joined
-    # Snapshot DDL must declare every tracked check column.
     for col in mapping.TRACKED_CHECK_COLUMNS:
         assert f"{col} INTEGER" in joined
+    # The fix log must exist before the views that read it.
+    log_at = next(
+        i for i, s in enumerate(statements) if "TABLE IF NOT EXISTS" in s and "APP_FIX_LOG" in s
+    )
+    view_at = next(i for i, s in enumerate(statements) if "V_CURRENT_BROKEN AS" in s)
+    assert log_at < view_at
+    assert ddl.build_initialise_statements(OBJS, include_shared=False) == (
+        ddl.build_create_statements(OBJS)
+    )
 
 
 def test_ddl_uses_given_schema_only():
-    joined = "\n".join(ddl.build_create_statements(OTHER))
+    joined = "\n".join(ddl.build_initialise_statements(OTHER))
     assert "DEV_CORE_XYZ.MY_SCHEMA" in joined
     assert "DEV_CORE_AAB" not in joined
+
+
+def test_ddl_shared_log_is_read_by_own_views_and_created_only_in_shared_schema():
+    own = "\n".join(ddl.build_create_statements(SHARED))
+    assert f"{SHARED.schema_fqn}.V_CURRENT_BROKEN" in own
+    assert SHARED.fix_log_table in own  # views read the team log
+    assert "TABLE IF NOT EXISTS DEV_CORE_AAB" not in own
+    shared = "\n".join(ddl.build_shared_statements(SHARED))
+    assert SHARED.fix_log_table in shared and SHARED.operators_table in shared
+    assert "DEV_CORE_XYZ" not in shared
+
+
+def test_ddl_upgrades_existing_fix_log_and_seeds_first_operator():
+    shared = ddl.build_shared_statements(OBJS)
+    for name, _ in ddl.FIX_LOG_ADDED_COLUMNS:
+        assert f"ADD COLUMN IF NOT EXISTS {name}" in "\n".join(shared)
+    seed = next(s for s in shared if s.startswith("INSERT INTO"))
+    assert "CURRENT_USER()" in seed and "WHERE NOT EXISTS" in seed
+
+
+def test_view_reads_only_the_latest_snapshot_date():
+    view = next(s for s in ddl.build_create_statements(OBJS) if "V_CURRENT_BROKEN AS" in s)
+    assert "SNAPSHOT_DATE = (SELECT MAX(SNAPSHOT_DATE)" in view
+    assert "ORDER BY SNAPSHOT_DATE DESC" not in view  # no per-terminal "latest row" fallback
+
+
+def test_view_counts_only_prod_live_verified_resolutions_per_check():
+    view = next(s for s in ddl.build_create_statements(OBJS) if "V_CURRENT_BROKEN AS" in s)
+    assert "ENVIRONMENT = 'PROD'" in view
+    assert "MODE = 'LIVE'" in view and "VERIFIED = TRUE" in view
+    assert "OUTCOME IN ('APPLIED', 'SKIPPED_ALREADY_OK')" in view
+    # Latest live outcome per (terminal, check): a later rollback re-opens the check.
+    assert "'ROLLED_BACK'" in view
+    assert "PARTITION BY TERMINAL_IDENTIFIER, CHECK_COLUMN" in view
+    for col in mapping.FIXABLE_CHECK_COLUMNS:
+        assert f"ARRAY_CONTAINS('{col}'::VARIANT, FIXED_CHECKS)" in view
+    assert ddl.VIEW_MARKER_COLUMN in view
+    assert "CONVERT_TIMEZONE('UTC', APPLIED_AT)" in view
+
+
+def test_kpis_separate_prod_fixes_from_rehearsals():
+    kpis = next(s for s in ddl.build_create_statements(OBJS) if "V_REMEDIATION_KPIS AS" in s)
+    assert "AS TOTAL_LIVE_FIXES" in kpis and "AS REHEARSAL_FIXES" in kpis
+    assert "NOT ENVIRONMENT = 'PROD'" in kpis
+
+
+def test_snapshot_stores_source_load_time_in_utc():
+    merge = snapshot.build_refresh_merge(OBJS)
+    assert "CONVERT_TIMEZONE('UTC', LAST_ALTERED)::TIMESTAMP_NTZ" in merge
 
 
 def test_ddl_seed_has_all_flags_from_mapping():
@@ -363,9 +464,66 @@ def test_ddl_seed_has_all_flags_from_mapping():
     assert "'DCCXpressCOFallback'" in seed
 
 
-def test_ddl_objects_present_query_uses_information_schema():
-    sql = ddl.build_objects_present_query(OTHER)
+def test_ddl_objects_present_query_checks_own_and_shared_schemas():
+    sql = ddl.build_objects_present_query(SHARED)
     assert "DEV_CORE_XYZ.INFORMATION_SCHEMA.TABLES" in sql
     assert "TABLE_SCHEMA = 'MY_SCHEMA'" in sql
-    for table in ddl.TABLE_NAMES:
+    assert "DEV_CORE_AAB.INFORMATION_SCHEMA.TABLES" in sql
+    assert "TABLE_SCHEMA = 'DCC_REMEDIATION'" in sql
+    for table in ddl.OWN_TABLES + ddl.SHARED_TABLES:
         assert f"'{table}'" in sql
+    assert f"COLUMN_NAME = '{ddl.VIEW_MARKER_COLUMN}'" in sql
+
+
+@pytest.mark.parametrize(
+    ("row", "ready", "missing"),
+    [
+        ({"OWN_TABLES": 2, "SHARED_TABLES": 2, "FIX_LOG_COLUMNS": 2, "VIEW_CURRENT": 1}, True, 0),
+        # The 2026-09-28 schema: tables exist, but no allowlist, new columns or new view.
+        ({"OWN_TABLES": 2, "SHARED_TABLES": 1, "FIX_LOG_COLUMNS": 0, "VIEW_CURRENT": 0}, False, 2),
+        ({"OWN_TABLES": 0, "SHARED_TABLES": 0, "FIX_LOG_COLUMNS": 0, "VIEW_CURRENT": 0}, False, 3),
+        ({"OWN_TABLES": None}, False, 3),
+    ],
+)
+def test_schema_status(row, ready, missing):
+    status = ddl.schema_status(row)
+    assert status.ready is ready
+    assert len(status.missing) == missing
+
+
+# --------------------------------------------------------------------------- #
+# shared-target worklist + Bit 16 suggestions
+# --------------------------------------------------------------------------- #
+
+
+def test_shared_target_query_validates_and_binds():
+    sql = wl.build_shared_target_query("INSTANCE_IDENTIFIER", "HANDLER_DCCENABLE_CHECK_O", OBJS)
+    assert "INSTANCE_IDENTIFIER = %s AND HANDLER_DCCENABLE_CHECK_O = 1" in sql
+    with pytest.raises(ValueError):
+        wl.build_shared_target_query("MERCHANT_NAME; DROP", "HANDLER_DCCENABLE_CHECK_O", OBJS)
+    with pytest.raises(ValueError):
+        wl.build_shared_target_query("LOCATION_NO", "NOT_A_CHECK", OBJS)
+
+
+def test_template_suggestions_bind_profile_and_skip_missing_levels():
+    full = suggest.build_template_suggestion_queries(
+        {"TERMINAL_BRAND_NAME": "PAX", "TERMINAL_MODEL_NAME": "A920", "ACQUIRER_NAME": "Elavon"}
+    )
+    assert [len(q.params) for q in full] == [3, 2]
+    assert full[0].params == ["PAX", "A920", "Elavon"]
+    assert "%s" in full[0].sql and "PAX" not in full[0].sql
+    no_acquirer = suggest.build_template_suggestion_queries(
+        {"TERMINAL_BRAND_NAME": "PAX", "TERMINAL_MODEL_NAME": "A920", "ACQUIRER_NAME": None}
+    )
+    assert [len(q.params) for q in no_acquirer] == [2]
+    assert suggest.build_template_suggestion_queries({}) == []
+    assert MAINTENANCE_SOURCE in suggest.build_known_templates_query()
+
+
+def test_template_suggestion_summary_has_shares():
+    import pandas as pd
+
+    frame = pd.DataFrame({"TEMPLATE": ["Planet_PAX", "Six_PAX"], "TERMINALS": [95, 5]})
+    ranked = suggest.summarise(frame)
+    assert ranked[0].template == "Planet_PAX" and ranked[0].share == pytest.approx(0.95)
+    assert suggest.summarise(None) == []

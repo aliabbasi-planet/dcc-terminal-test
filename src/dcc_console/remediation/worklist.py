@@ -17,6 +17,7 @@ from . import RemediationObjects
 from .mapping import (
     DIMENSION_COLUMNS,
     FIXABLE_CHECK_COLUMNS,
+    IDENTIFIER_COLUMNS,
     TRACKED_CHECK_COLUMNS,
 )
 
@@ -112,3 +113,24 @@ def build_terminal_detail_query(objs: RemediationObjects) -> tuple[str, list]:
     """
     sql = f"SELECT * FROM {objs.v_current_broken} WHERE TERMINAL_IDENTIFIER = %s"  # noqa: S608
     return sql, []
+
+
+def build_shared_target_query(
+    target_column: str, check_column: str, objs: RemediationObjects, limit: int = 500
+) -> str:
+    """Listed terminals one fix covers: same instance/location/terminal, broken on the check.
+
+    A Bit 8/16 call changes a whole instance and a Bit 1 call a whole location, so one
+    call can repair several listed terminals. The caller binds ``[target_identifier]``;
+    both column names are validated against the mapping allowlists first.
+    """
+    if target_column not in IDENTIFIER_COLUMNS:
+        raise ValueError(f"Unknown identifier column: {target_column!r}")
+    if check_column not in TRACKED_CHECK_COLUMNS:
+        raise ValueError(f"Unknown check column: {check_column!r}")
+    capped = max(1, min(int(limit), _MAX_LIMIT))
+    return (
+        f"SELECT * FROM {objs.v_current_broken}\n"  # noqa: S608
+        f"WHERE {target_column} = %s AND {check_column} = 1\n"
+        f"ORDER BY TERMINAL_IDENTIFIER\nLIMIT {capped}"
+    )

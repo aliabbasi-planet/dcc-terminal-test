@@ -71,7 +71,7 @@ def main() -> None:
     with broken_tab:
         render_broken_terminals()
     with remediation_tab:
-        render_remediation()
+        render_remediation(armed_live=not simulation and confirmed and ready)
 
 
 if __name__ == "__main__":

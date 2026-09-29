@@ -45,24 +45,61 @@ def validate_identifier(value: str, kind: str) -> str:
     return trimmed
 
 
+def parse_schema_fqn(value: str) -> tuple[str, str]:
+    """Split and validate ``DATABASE.SCHEMA`` (e.g. the shared fix-log location)."""
+    parts = (value or "").strip().split(".")
+    if len(parts) != 2:
+        raise ValueError(f"Expected DATABASE.SCHEMA, got {value!r}")
+    return (
+        validate_identifier(parts[0], "shared database"),
+        validate_identifier(parts[1], "shared schema"),
+    )
+
+
 @dataclass(frozen=True)
 class RemediationObjects:
     """Fully-qualified names for one tenant's remediation schema.
 
     Built from the user's chosen database (+ schema); every builder takes an
     instance so the same code serves any ``DEV_CORE_<x>``.
+
+    The fix log and the live-fix operator allowlist can live in a *shared* schema
+    (``shared_database``/``shared_schema``) so a team has one audit trail and one
+    re-fix guard, while each user keeps their own snapshot and views. When no
+    shared schema is given they live in the user's own schema.
     """
 
     database: str
     schema: str = "DCC_REMEDIATION"
+    shared_database: str | None = None
+    shared_schema: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "database", validate_identifier(self.database, "database"))
         object.__setattr__(self, "schema", validate_identifier(self.schema, "schema"))
+        object.__setattr__(
+            self,
+            "shared_database",
+            validate_identifier(self.shared_database or self.database, "shared database"),
+        )
+        object.__setattr__(
+            self,
+            "shared_schema",
+            validate_identifier(self.shared_schema or self.schema, "shared schema"),
+        )
 
     @property
     def schema_fqn(self) -> str:
         return f"{self.database}.{self.schema}"
+
+    @property
+    def shared_fqn(self) -> str:
+        return f"{self.shared_database}.{self.shared_schema}"
+
+    @property
+    def uses_shared_log(self) -> bool:
+        """True when the fix log lives outside the user's own schema."""
+        return self.shared_fqn.upper() != self.schema_fqn.upper()
 
     @property
     def snapshot_table(self) -> str:
@@ -70,7 +107,11 @@ class RemediationObjects:
 
     @property
     def fix_log_table(self) -> str:
-        return f"{self.schema_fqn}.APP_FIX_LOG"
+        return f"{self.shared_fqn}.APP_FIX_LOG"
+
+    @property
+    def operators_table(self) -> str:
+        return f"{self.shared_fqn}.FIX_OPERATORS"
 
     @property
     def flag_reference_table(self) -> str:
@@ -92,3 +133,8 @@ class RemediationObjects:
 # Convenience default (the schema created during initial development). The tab
 # always constructs objects from the live connection instead of relying on this.
 DEFAULT_OBJECTS = RemediationObjects("DEV_CORE_AAB")
+
+# Team-wide fix log + operator allowlist (decision 2026-09-29: named group, shared
+# log). Owned by role DATA_SCIENTIST; teammates on another role need the grants in
+# docs/plan_dcc_remediation.md §15.
+DEFAULT_SHARED_SCHEMA = "DEV_CORE_AAB.DCC_REMEDIATION"

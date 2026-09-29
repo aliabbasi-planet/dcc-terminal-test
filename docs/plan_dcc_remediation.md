@@ -334,7 +334,82 @@ Per-user prerequisites (RBAC, outside the app): each user's role needs **read** 
 `PROD_PRESENTATION.CORTEX.CORTEX_TERMINAL_MAINTENANCE` (+ its `INFORMATION_SCHEMA`)
 and **create/write** on their own `DEV_CORE_<x>`.
 
-**Known tradeoff (unchanged):** per-user schemas mean **siloed `APP_FIX_LOG`s**, so
-the re-fix guard is per-schema. Before multiple people run *live* fixes against the
-same estate, a **shared fix log** should be adopted (the tab shows this caveat).
-The read-only identify/analytics path is unaffected.
+**Known tradeoff (superseded by §15):** per-user schemas meant **siloed `APP_FIX_LOG`s**,
+so the re-fix guard was per-schema. §15 moves the fix log (and the operator allowlist)
+to one **shared** schema; each user keeps their own snapshot and views.
+
+---
+
+## 15. One-by-one live fixing — delivered (2026-09-29)
+
+### Decisions (recorded)
+| Question | Decision |
+|---|---|
+| Where may *Apply live* run? | **DEV/UAT only** in this phase. On PROD: live pre-check + dry run only. Enforced twice (`fixer.live_gate` and `fixer.run_step`). |
+| Who may run live fixes? | A **named group**, listed in the shared `FIX_OPERATORS` table, checked against the SSO session's `CURRENT_USER()`. |
+| Fix log | **Shared**: `DEV_CORE_AAB.DCC_REMEDIATION.APP_FIX_LOG` (configurable per user: "Shared fix log" field / `DCC_SHARED_SCHEMA`). |
+| Bit 16 template | **Suggested** from healthy peers (brand+model+acquirer, then brand+model, then all known templates) and **confirmed by the operator**. |
+| Bit 2 value | `ECB DCC` (all 39,674 healthy terminals have it; broken ones have `Standard`). |
+| Bit 1 value | Always `Add` — any other value makes `build_call` send `@add = 0`, i.e. *remove*. Tested for all three functions. |
+
+### The flow (per check, one at a time)
+Select a worklist row → **Pre-check** (live SQL-Server read; an already-correct target
+is logged, never re-applied) → **Dry run** (`@is_simulation = 1` + rolled back) →
+**Apply live** (operator + console Mode armed + fresh pre-check and dry run of the
+*exact* target/value + reviewed EXEC) → automatic **verify** (fresh live read) → logged
+(one row per worklist terminal the call covers) → **Roll back** if needed → **Next terminal**.
+A Bit 8/16 call changes a whole instance and a Bit 1 call a whole location — the panel
+lists every listed terminal the call covers. UAT/DEV rehearsals may use a substitute
+target when the PROD identifier does not exist there (logged with both IDs).
+
+### Correctness fixes found while building it
+- **Worklist view** read each terminal's newest row across *all* dates, so a terminal
+  repaired since an earlier snapshot never left the list; and it joined fixes by terminal
+  only (a second fixed check would duplicate the row; one fixed check hid the others).
+  Now: latest snapshot date only; per-check resolution; only **PROD** outcomes count
+  (rehearsals never hide PROD work); a later rollback re-opens a check; times compared in
+  UTC (`SOURCE_LAST_ALTERED` is now stored as UTC).
+- **`call_procedure` committed a failed live call** (its `finally` committed whenever
+  `rollback=False`). It now commits only on success and rolls back on any error.
+- **§7.2 recovery P0s** — all three fixed: SP-script journal entries recover without bound
+  parameters (journal `restore_kind`, JSON scripts, old journals migrated); recovery
+  checks environment **+ server + database**; a successful procedure rollback is no longer
+  offered again. Also: "Restore ALL" now restores every entry (it stopped after the first),
+  and a column restore refuses to write NULL.
+- **Kept fixes vs crash recovery**: a verified, logged remediation fix is marked `KEPT` in the
+  journal, so "Restore ALL" can never silently undo it. The Results panel's bulk rollback
+  skips remediation results; they roll back only from the DCC Remediation tab (logged).
+- A pre-check "already correct" only settles the worklist when it proves the check itself
+  (Bit 8 flag true on every handler, Bit 2 on ECB DCC) — never for Bit 1/16.
+
+### Runbook — operators and access
+Add or remove a live-fix operator (owner of the shared schema):
+```sql
+INSERT INTO DEV_CORE_AAB.DCC_REMEDIATION.FIX_OPERATORS (USER_NAME, NOTES)
+VALUES ('<SNOWFLAKE_USER_NAME>', 'approved by <who>, <date>');
+UPDATE DEV_CORE_AAB.DCC_REMEDIATION.FIX_OPERATORS SET ACTIVE = FALSE
+WHERE USER_NAME = '<SNOWFLAKE_USER_NAME>';
+```
+Teammates on **DATA_SCIENTIST** (the owner role) already have access. For another role:
+```sql
+GRANT USAGE ON DATABASE DEV_CORE_AAB TO ROLE <ROLE>;
+GRANT USAGE ON SCHEMA DEV_CORE_AAB.DCC_REMEDIATION TO ROLE <ROLE>;
+GRANT SELECT, INSERT ON TABLE DEV_CORE_AAB.DCC_REMEDIATION.APP_FIX_LOG TO ROLE <ROLE>;
+GRANT SELECT ON TABLE DEV_CORE_AAB.DCC_REMEDIATION.FIX_OPERATORS TO ROLE <ROLE>;
+```
+Honest limits: the allowlist is an **app-level guardrail**, not a security boundary — the
+app runs on each user's machine and anyone holding the owner role can edit the table. The
+real control is each SQL-Server login's `EXECUTE` right on the procedure per environment
+(checked by the readiness probes). A dedicated owner role for the shared schema is the
+recommended next step.
+
+### Still open
+- **Validate on SQL Server** (no access from here): UAT rehearsal of one target per bit
+  (1, 2, 8, 16): pre-check → dry run → live → verify → roll back, checking the journal
+  and `APP_FIX_LOG`. This is also the first real test of Bit 16 undo.
+- **Enabling PROD live** is a separate, explicit decision (CAB): flip
+  `fixer.LIVE_ENVIRONMENTS` after the UAT rehearsal passes.
+- Bit 1 pre-check detects the function by whole-name match in `extra_function`; confirm
+  the node format against real UAT data during the rehearsal.
+- The old **Broken Terminals** tab still reads `instance.package_config` (not the handler
+  rows the procedure edits) and matches 0 rows — retire it once this tab is adopted.

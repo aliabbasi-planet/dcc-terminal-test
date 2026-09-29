@@ -35,8 +35,10 @@ _CARRIED_COLUMNS: tuple[str, ...] = (
     "FIRMWARE_VERSION",
 )
 
+# Stored as UTC wall-clock so the worklist view can compare it with fix times
+# regardless of the session timezone that ran the refresh.
 _SOURCE_LAST_ALTERED = (
-    "(SELECT LAST_ALTERED::TIMESTAMP_NTZ "
+    "(SELECT CONVERT_TIMEZONE('UTC', LAST_ALTERED)::TIMESTAMP_NTZ "
     "FROM PROD_PRESENTATION.INFORMATION_SCHEMA.TABLES "
     "WHERE TABLE_SCHEMA='CORTEX' AND TABLE_NAME='CORTEX_TERMINAL_MAINTENANCE')"
 )

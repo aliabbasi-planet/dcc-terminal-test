@@ -30,7 +30,9 @@ class FlagFix:
     flag_type: str             # HANDLER | DCC_XPRESS | TEMPLATE | CONFIG | FIRMWARE | MERCHANT
     fix_bit: int | None        # @display_config for the SP (None = not fixable here)
     target_id_kind: str | None  # INSTANCE / TERMINAL / LOCATION
-    fix_value: str | None      # value sent (flag/function name); None = taken from the row
+    # What the fix sets: Bit 8 flag name, Bit 1 function name (the call itself sends
+    # "Add"), Bit 2 version description. None = chosen per terminal (Bit 16 template).
+    fix_value: str | None
     sp_column: str | None      # handler column the SP edits (mirror of catalog.sp_column)
     fixable: bool
     catalog_key: str | None = None  # TEST_CATALOG key the live fixer reuses
@@ -114,13 +116,14 @@ FLAG_FIXES: tuple[FlagFix, ...] = (
         "PRINTOUTTYPETEMPLATEDCC_CHECK_C", "PRINTOUTTYPETEMPLATEDCC_BASE",
         "DCC Receipt Template", "TEMPLATE", 16, INSTANCE, None, "receipt_config", True,
         catalog_key="Bit 16 — DCC Receipt Template (instance)",
-        notes="Bit 16; value is the template, taken from the row.",
+        notes="Bit 16; template chosen per terminal (suggested from healthy peers, confirmed "
+        "by the operator) — the row only holds the current, broken value.",
     ),
     FlagFix(
         "CONFIGDOWNLOAD_VERSION_CHECK_C", "CONFIGDOWNLOAD_VERSION_CHECK_BASE",
-        "Config Download Version", "CONFIG", 2, TERMINAL, None, None, True,
+        "Config Download Version", "CONFIG", 2, TERMINAL, "ECB DCC", None, True,
         catalog_key="Bit 2 — Config Download Version (terminal)",
-        notes="Bit 2; value is the version, taken from the row.",
+        notes="Bit 2; sets ECB DCC (every healthy terminal has it; broken ones have Standard).",
     ),
 )
 

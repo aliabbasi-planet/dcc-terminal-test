@@ -42,6 +42,8 @@ class SnowflakeSettings:
     database: str = "DEV_CORE_AAB"
     schema: str = "DCC_REMEDIATION"
     authenticator: str = "externalbrowser"
+    # DATABASE.SCHEMA holding the team's shared fix log + operator allowlist.
+    shared_schema: str = "DEV_CORE_AAB.DCC_REMEDIATION"
 
     def normalised(self) -> SnowflakeSettings:
         return SnowflakeSettings(
@@ -52,6 +54,7 @@ class SnowflakeSettings:
             database=self.database.strip(),
             schema=self.schema.strip(),
             authenticator=self.authenticator.strip() or "externalbrowser",
+            shared_schema=self.shared_schema.strip(),
         )
 
 
