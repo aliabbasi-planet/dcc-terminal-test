@@ -10,7 +10,7 @@ verify → log, all threaded by ``CORRELATION_ID``.
 
 from __future__ import annotations
 
-from . import FIX_LOG_TABLE
+from . import RemediationObjects
 
 # Writable columns in canonical order. FIX_ID (autoincrement), APPLIED_AT and
 # CAPTURED_AT (defaults) are intentionally omitted.
@@ -69,7 +69,7 @@ VALID_OUTCOMES: tuple[str, ...] = (
 )
 
 
-def build_insert(record: dict) -> tuple[str, list]:
+def build_insert(record: dict, objs: RemediationObjects) -> tuple[str, list]:
     """Return ``(sql, params)`` inserting one fix-log row from ``record``.
 
     Raises ``ValueError`` on unknown keys, missing required columns, or an
@@ -90,11 +90,11 @@ def build_insert(record: dict) -> tuple[str, list]:
     placeholders = ", ".join(["%s"] * len(columns))
     col_sql = ", ".join(columns)
     params = [record[c] for c in columns]
-    sql = f"INSERT INTO {FIX_LOG_TABLE} ({col_sql}) VALUES ({placeholders})"  # noqa: S608
+    sql = f"INSERT INTO {objs.fix_log_table} ({col_sql}) VALUES ({placeholders})"  # noqa: S608
     return sql, params
 
 
-def build_recent_fix_query() -> tuple[str, list]:
+def build_recent_fix_query(objs: RemediationObjects) -> tuple[str, list]:
     """Return ``(sql, params)`` for the last verified LIVE fix of a terminal+check.
 
     Caller binds ``params=[terminal_identifier, check_column]``. Used as the live
@@ -102,7 +102,7 @@ def build_recent_fix_query() -> tuple[str, list]:
     """
     sql = (
         f"SELECT MAX(APPLIED_AT) AS LAST_FIX_AT\n"  # noqa: S608
-        f"FROM {FIX_LOG_TABLE}\n"
+        f"FROM {objs.fix_log_table}\n"
         f"WHERE TERMINAL_IDENTIFIER = %s AND CHECK_COLUMN = %s\n"
         f"  AND OUTCOME = 'APPLIED' AND VERIFIED = TRUE AND MODE = 'LIVE'"
     )

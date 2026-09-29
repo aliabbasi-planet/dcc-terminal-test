@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from . import V_CURRENT_BROKEN
+from . import RemediationObjects
 from .mapping import (
     DIMENSION_COLUMNS,
     FIXABLE_CHECK_COLUMNS,
@@ -52,7 +52,7 @@ def _validate_dimension(column: str) -> str:
     return column
 
 
-def build_worklist_query(filters: WorklistFilters) -> tuple[str, list]:
+def build_worklist_query(filters: WorklistFilters, objs: RemediationObjects) -> tuple[str, list]:
     """Return ``(sql, params)`` selecting the filtered broken-terminal rows."""
     clauses: list[str] = []
     params: list = []
@@ -86,27 +86,29 @@ def build_worklist_query(filters: WorklistFilters) -> tuple[str, list]:
     where = ("\nWHERE " + "\n  AND ".join(clauses)) if clauses else ""
     limit = max(1, min(int(filters.limit), _MAX_LIMIT))
     sql = (
-        f"SELECT * FROM {V_CURRENT_BROKEN}{where}\n"
+        f"SELECT * FROM {objs.v_current_broken}{where}\n"
         f"ORDER BY TERMINAL_IDENTIFIER\n"
         f"LIMIT {limit}"
     )
     return sql, params
 
 
-def build_distinct_values_query(column: str, limit: int = 1000) -> str:
+def build_distinct_values_query(
+    column: str, objs: RemediationObjects, limit: int = 1000
+) -> str:
     """Return SQL for the distinct non-null values of a dimension (for dropdowns)."""
     clean = _validate_dimension(column)
     capped = max(1, min(int(limit), _MAX_LIMIT))
     return (
-        f"SELECT DISTINCT {clean} AS VALUE FROM {V_CURRENT_BROKEN}\n"  # noqa: S608
+        f"SELECT DISTINCT {clean} AS VALUE FROM {objs.v_current_broken}\n"  # noqa: S608
         f"WHERE {clean} IS NOT NULL\nORDER BY VALUE\nLIMIT {capped}"
     )
 
 
-def build_terminal_detail_query() -> tuple[str, list]:
+def build_terminal_detail_query(objs: RemediationObjects) -> tuple[str, list]:
     """Return ``(sql, params)`` for a single terminal's current broken row.
 
     The parameter is bound by the caller: ``params=[terminal_identifier]``.
     """
-    sql = f"SELECT * FROM {V_CURRENT_BROKEN} WHERE TERMINAL_IDENTIFIER = %s"  # noqa: S608
+    sql = f"SELECT * FROM {objs.v_current_broken} WHERE TERMINAL_IDENTIFIER = %s"  # noqa: S608
     return sql, []

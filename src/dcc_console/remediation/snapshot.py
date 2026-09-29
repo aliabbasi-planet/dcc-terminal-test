@@ -14,7 +14,7 @@ All column and table names come from :mod:`.mapping` constants, never user input
 
 from __future__ import annotations
 
-from . import MAINTENANCE_SOURCE, SNAPSHOT_TABLE
+from . import MAINTENANCE_SOURCE, RemediationObjects
 from .mapping import FLAG_FIXES, TRACKED_CHECK_COLUMNS
 
 # Non-check columns carried into the snapshot, in table order. Grouped to terminal
@@ -47,7 +47,7 @@ def _broken_expr(check_column: str, base_column: str) -> str:
     return f"{base_column} = 1 AND COALESCE({check_column}, 1) = 1"
 
 
-def build_refresh_merge() -> str:
+def build_refresh_merge(objs: RemediationObjects) -> str:
     """Return the idempotent upsert that refreshes today's snapshot.
 
     Safe to run repeatedly on the same day: matched terminals are updated, new
@@ -81,7 +81,7 @@ def build_refresh_merge() -> str:
     update_targets = list(_CARRIED_COLUMNS) + list(TRACKED_CHECK_COLUMNS)
     update_sql = ",\n    ".join(f"{c} = src.{c}" for c in update_targets)
 
-    return f"""MERGE INTO {SNAPSHOT_TABLE} tgt
+    return f"""MERGE INTO {objs.snapshot_table} tgt
 USING (
     SELECT
         CURRENT_DATE() AS SNAPSHOT_DATE,

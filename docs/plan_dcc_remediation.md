@@ -51,7 +51,7 @@ related to**, the existing CAB test tabs.
 |---|---|---|
 | Fix mode | **Live fixes now** | Against my recommendation; see §7 non-negotiables |
 | Analytics refresh | **App-triggered** | Idempotent per day; see §5 caveats |
-| Persistence target | **New dedicated schema** `DEV_CORE_AAB.DCC_REMEDIATION` | `DEV_CORE_PLACEHOLDER` does not exist |
+| Persistence target | **Per-user schema, configurable** (default `DEV_CORE_AAB.DCC_REMEDIATION`) | Each user points at their own `DEV_CORE_<x>`; see §14 |
 | Snowflake auth | **SSO / externalbrowser**, user picks role + warehouse | No secrets stored |
 
 Open items to confirm during review (do not block writing this doc):
@@ -311,3 +311,30 @@ in the fixer. Broken = `BASE = 1 AND COALESCE(CHECK, 1) = 1` (in scope, failing/
 - Phase 9 logging/alerts/runbook/version stamp/health checks.
 - `sql/remediation/003_refresh_snapshot.sql` is generated from `snapshot.py`
   (do not hand-edit). `runbook_recovery.md` not yet written (phase 9).
+
+---
+
+## 14. Multi-tenant (per-user DEV_CORE) — delivered
+
+Per your choice, the schema is no longer hardcoded. Each user points the tab at
+their **own** `DEV_CORE_<x>` and initialises it in one click.
+
+- **`RemediationObjects(database, schema)`** (in `remediation/__init__.py`) holds the
+  fully-qualified names and **validates** database/schema as bare SQL identifiers
+  (interpolated, not bound) — an injection guard. Built from the live connection.
+- All five query builders now **take `objs`** instead of a module constant.
+- **`remediation/ddl.py`** generates the `CREATE SCHEMA` + tables + views and the
+  `FLAG_REFERENCE` seed for any target, from the same `mapping` (so columns/rows
+  can't drift). The tab exposes **"Initialise / verify my schema"** (idempotent)
+  and detects when core tables are missing.
+- The connection panel now collects **Database** + **Schema** (defaults from
+  `SNOWFLAKE_DATABASE`/`SNOWFLAKE_SCHEMA` env, else `DEV_CORE_AAB`/`DCC_REMEDIATION`).
+
+Per-user prerequisites (RBAC, outside the app): each user's role needs **read** on
+`PROD_PRESENTATION.CORTEX.CORTEX_TERMINAL_MAINTENANCE` (+ its `INFORMATION_SCHEMA`)
+and **create/write** on their own `DEV_CORE_<x>`.
+
+**Known tradeoff (unchanged):** per-user schemas mean **siloed `APP_FIX_LOG`s**, so
+the re-fix guard is per-schema. Before multiple people run *live* fixes against the
+same estate, a **shared fix log** should be adopted (the tab shows this caveat).
+The read-only identify/analytics path is unaffected.
