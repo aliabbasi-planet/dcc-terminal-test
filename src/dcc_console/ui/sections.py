@@ -916,7 +916,7 @@ def _render_rollback_panel(result: TestResult) -> None:
     # Procedure-managed bits (e.g. Bit 8, Bit 16): the change is on a related table
     # the generic verify column never sees, so roll back with the procedure's OWN
     # returned script rather than the generic column-restore.
-    if result.has_sp_rollback:
+    if definition.sp_managed and result.has_sp_rollback:
         sp_column = getattr(definition, "sp_column", "extra_config")
         st.caption(
             "Procedure-managed change: the value lives in a related table (e.g. "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from dcc_console.catalog import TEST_CATALOG
 from dcc_console.execution import (
@@ -18,6 +19,7 @@ from dcc_console.rollback import (
 )
 
 BIT8 = "Bit 8 — DCC Handler Flags (instance)"
+BIT1 = "Bit 1 — DCC Xpress CO (location extra_function)"
 BIT2 = "Bit 2 — Config Download Version (terminal)"
 
 
@@ -133,6 +135,41 @@ def test_has_sp_rollback_and_rollback_available():
     assert r.has_sp_rollback is True
     assert r.can_rollback is False  # generic column never moved
     assert r.rollback_available is True
+
+
+@pytest.mark.parametrize(
+    ("test_key", "bit", "target_type", "target"),
+    [
+        (BIT1, 1, "location", "L1"),
+        (BIT2, 2, "terminal", "T1"),
+    ],
+)
+def test_non_managed_bit_uses_procedure_script_and_refreshes_state(
+    monkeypatch, test_key, bit, target_type, target
+):
+    from dcc_console import execution
+
+    result = make_result(
+        test_key=test_key,
+        bit=bit,
+        target_type=target_type,
+        target=target,
+        state_before="1",
+        state_after="2",
+        restore_point="1",
+        change_persisted=True,
+        sp_managed=False,
+        sp_rollback_scripts=["UPDATE handler ..."],
+    )
+    conn = FakeConn()
+    monkeypatch.setattr(execution, "read_state", lambda *args, **kwargs: "1")
+
+    outcome = execution.apply_rollback(conn, TEST_CATALOG[test_key], result)
+
+    assert outcome.ok is True
+    assert conn.batches == [result.sp_rollback_scripts]
+    assert result.state_after == "1"
+    assert result.change_persisted is False
 
 
 def test_simulation_has_no_sp_rollback():
