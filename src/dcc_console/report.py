@@ -383,15 +383,23 @@ def _db_code_block(result: TestResult) -> list[str]:
             read_sql,
             "```",
         ]
-        if sp_managed:
+        if sp_scripts:
+            explanation = (
+                "This is a procedure-managed bit: the change is written to a related table "
+                f"(not `{verify.table}`), so the generic column-restore below does **not** "
+                "revert it."
+                if sp_managed
+                else
+                "The procedure returned the compensating SQL used for rollback, avoiding "
+                "a direct UPDATE permission requirement on the verified table."
+            )
             lines += [
                 "",
                 "_3 · Compensating rollback — the procedure's OWN returned script "
                 "(authoritative)_",
                 "",
-                "This is a procedure-managed bit: the change is written to a related table "
-                f"(not `{verify.table}`), so the generic column-restore below does **not** "
-                "revert it. Rollback runs the `rollback_script` the procedure returned:",
+                explanation,
+                "Rollback runs the `rollback_script` the procedure returned:",
                 "",
                 "```sql",
             ]

@@ -114,9 +114,9 @@ class TestResult:
     def has_sp_rollback(self) -> bool:
         """Live run for which the procedure returned its own compensating script.
 
-        Used to offer rollback for procedure-managed bits (e.g. Bit 8) where the
-        generic verify column never moves, so ``can_rollback`` would be False even
-        though a change was committed and can be undone.
+        Used to offer rollback for procedure-managed Bits 8/16 where the generic
+        verify column never moves, so ``can_rollback`` would be False even though
+        a change was committed and can be undone.
         """
         return self.is_live and bool(self.sp_rollback_scripts)
 
@@ -549,9 +549,8 @@ def apply_rollback(
 ) -> RollbackOutcome:
     """Restore the pre-test value and refresh the result in place.
 
-    For procedure-managed bits (Bit 8, Bit 16) the change is on a related table the
-    generic verify column never sees, so we prefer the procedure's own returned
-    rollback script; otherwise we fall back to the generic column-restore.
+    Use the procedure's own returned rollback script whenever available; otherwise
+    use the catalogue-defined generic column restore.
     """
     if result.sp_rollback_scripts:
         # The procedure also returns a rollback_script under @is_simulation=1 as a
@@ -575,24 +574,22 @@ def apply_rollback(
             result.transaction = (
                 f"COMMITTED then {trigger.upper()} ROLLED BACK (procedure script)"
             )
-            # Handler-level verification: read the value back and compare to prior.
-            # Additive — a read problem leaves sp_flag_verified=None, never failing
-            # the rollback that already committed.
-            sp_flag_name = result.value if definition.sp_value_is_flag_name else None
-            result.sp_restored_states = read_sp_flag_states(
-                connection, result.target, sp_flag_name, column=definition.sp_column
-            )
-            if result.sp_restored_states:
-                # The rollback succeeded: "after" now means "after rollback", so the
-                # Before/After evidence and change-persisted verdict reflect the
-                # value actually left in the database, not the pre-rollback one.
-                result.sp_after_states = result.sp_restored_states
-            if result.sp_prior_states and result.sp_restored_states:
-                result.sp_flag_verified = flag_states_match(
-                    result.sp_prior_states, result.sp_restored_states
+            if definition.sp_managed:
+                sp_flag_name = result.value if definition.sp_value_is_flag_name else None
+                result.sp_restored_states = read_sp_flag_states(
+                    connection, result.target, sp_flag_name, column=definition.sp_column
                 )
+                if result.sp_restored_states:
+                    result.sp_after_states = result.sp_restored_states
+                if result.sp_prior_states and result.sp_restored_states:
+                    result.sp_flag_verified = flag_states_match(
+                        result.sp_prior_states, result.sp_restored_states
+                    )
+                else:
+                    result.sp_flag_verified = None
             else:
-                result.sp_flag_verified = None
+                result.state_after = read_state(connection, definition, result.target)
+                result.change_persisted = result.state_after != result.restore_point
             if result.journal_id is not None:
                 get_journal().mark_resolved(result.journal_id)
         return outcome
