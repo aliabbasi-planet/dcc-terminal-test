@@ -407,9 +407,78 @@ recommended next step.
 - **Validate on SQL Server** (no access from here): UAT rehearsal of one target per bit
   (1, 2, 8, 16): pre-check → dry run → live → verify → roll back, checking the journal
   and `APP_FIX_LOG`. This is also the first real test of Bit 16 undo.
-- **Enabling PROD live** is a separate, explicit decision (CAB): flip
-  `fixer.LIVE_ENVIRONMENTS` after the UAT rehearsal passes.
 - Bit 1 pre-check detects the function by whole-name match in `extra_function`; confirm
   the node format against real UAT data during the rehearsal.
 - The old **Broken Terminals** tab still reads `instance.package_config` (not the handler
   rows the procedure edits) and matches 0 rows — retire it once this tab is adopted.
+
+## 16. PROD enablement + durable fix registry + agent (2026-09-30)
+
+Rebased onto `main @ d499f88` (the Bit 1/2 rollback fix from PR #4). That fix makes
+`execution.apply_rollback` re-read the generic verify column and set `change_persisted`
+for non-SP-managed bits (1, 2); the remediation fixer inherits it because it rolls back
+through the same core.
+
+### Decisions (recorded)
+| Question | Decision |
+|---|---|
+| May *Apply live* run on PROD? | **Yes**, behind a stronger gate on top of the DEV/UAT rules. `fixer.LIVE_ENVIRONMENTS` now includes PROD. |
+| PROD authorization | A **PROD-approved operator** (`CAN_PROD` on `FIX_OPERATORS`) **plus a typed change/CAB reference**, plus the existing armed Mode + fresh pre-check/dry-run + reviewed EXEC. Enforced in `fixer.live_gate` and again in `fixer.run_step`. (Two-person approval was considered; deferred as future work.) |
+| Verify failure on Apply | **Warn only** (all environments): a fresh read that does not confirm the change shows a loud warning and enables Roll back; the fix is **not** registered. No auto-rollback. |
+| Durable "fixed" registry | New shared-schema table **`DCC_FIX_REGISTRY`**, one row per `(ENVIRONMENT, TERMINAL_IDENTIFIER, CHECK_COLUMN)`. Upserted on a verified live fix (or an authoritative already-OK pre-check); **hard-deleted** on a confirmed rollback. `APP_FIX_LOG` stays the immutable audit trail. |
+| Rollback registry delete | Only after a fresh SQL-Server read **confirms** the change reverted (`fixer.rollback_confirmed`). If it can't be confirmed, the row is kept and a warning shown. |
+| Agent in the tab | The `PROD_PRESENTATION.CORTEX.DCC_TERMINAL_MAINTENANCE_AGENT` is embedded as **scoped presets + free chat**, scoped to the selected terminal, read-only, using the operator's own SSO session token. |
+
+### Why a registry (survives the daily refresh)
+The worklist view used to derive "fixed" by replaying `APP_FIX_LOG`. It now reads
+`DCC_FIX_REGISTRY` instead (`V_CURRENT_BROKEN.fixed` CTE): `ENVIRONMENT='PROD'`,
+`STATUS='FIXED'`, and `FIXED_AT_UTC > SOURCE_LAST_ALTERED` — the same freshness guard,
+now materialised in a durable table so a verified fix is **not re-flagged** by the next
+daily `MERGE`, and a **rollback re-opens** it by deleting the row. Upgrading an existing
+schema backfills the registry from `APP_FIX_LOG` (`registry.build_backfill_from_log`,
+insert-only), so nothing regresses. `FIXED_AT`/`FIXED_AT_UTC` are set server-side.
+
+### The flow (per check), updated
+Pre-check → dry run → **Apply live** (DEV/UAT, or PROD with `CAN_PROD` + change ref) →
+automatic **verify** by a fresh read → logged to `APP_FIX_LOG` → **registered** in
+`DCC_FIX_REGISTRY` when verified → **Roll back** (confirms reversion by a fresh read,
+then **de-registers**). Reporting states verified/unverified, the environment, terminals
+covered, and whether the registry was updated.
+
+### Schema changes (idempotent; applied by "Initialise / verify my schema")
+- `FIX_OPERATORS.CAN_PROD BOOLEAN` (nullable migration; NULL = no PROD rights).
+- `APP_FIX_LOG.CHANGE_REF VARCHAR(120)` (migration).
+- New `DCC_FIX_REGISTRY` (+ backfill from the log).
+- `V_CURRENT_BROKEN` rewritten to read the registry; `V_REMEDIATION_KPIS` adds
+  `REGISTERED_FIXES`. Readiness (`build_objects_present_query` / `schema_status`) now
+  also checks the registry table and `CAN_PROD`.
+- SQL snapshots regenerated via `scripts/generate_remediation_sql.py`.
+
+### Security / DR
+- PROD is gated by `CAN_PROD` **and** a change reference (both recorded on every PROD
+  fix-log row and registry row); the app-level allowlist remains a guardrail, not a
+  security boundary (the SQL-Server login's `EXECUTE` right per environment is the real
+  control). The agent call reuses the operator's SSO session — no new secret.
+- The registry stores each fix's compensating `SP_ROLLBACK_SCRIPT` + change ref, so a
+  verified PROD fix can be rolled back later even from a fresh session. Substitute
+  rehearsals remain **off PROD** (`fixer.substitute_allowed`).
+
+### Runbook — PROD approval
+```sql
+-- Grant PROD approval to an existing operator (owner of the shared schema):
+UPDATE DEV_CORE_AAB.DCC_REMEDIATION.FIX_OPERATORS SET CAN_PROD = TRUE
+WHERE USER_NAME = '<SNOWFLAKE_USER_NAME>';
+```
+For a non-owner role, in addition to the §15 grants:
+```sql
+GRANT SELECT, INSERT, DELETE ON TABLE DEV_CORE_AAB.DCC_REMEDIATION.DCC_FIX_REGISTRY TO ROLE <ROLE>;
+GRANT USAGE ON CORTEX AGENT PROD_PRESENTATION.CORTEX.DCC_TERMINAL_MAINTENANCE_AGENT TO ROLE <ROLE>;
+-- plus USAGE on the agent's Cortex Analyst semantic view, per its owner.
+```
+
+### Still open (this iteration)
+- **Live schema upgrade + rehearsal not yet run from here.** Click "Initialise / verify
+  my schema" (or run `sql/remediation/001_schema.sql`) to create `DCC_FIX_REGISTRY`, add
+  `CAN_PROD`/`CHANGE_REF` and rebuild the views; then rehearse one target per bit on UAT,
+  and one gated PROD dry-run, before the first real PROD apply.
+- Two-person PROD approval and an agent-reachability probe are possible follow-ups.

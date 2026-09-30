@@ -64,6 +64,7 @@ class FakeSnowflake:
         loaded: bool = True,
         fail_writes: bool = False,
         operator: bool = True,
+        can_prod: bool = False,
     ) -> None:
         self.settings = SnowflakeSettings(account="acct", user="user", role="role", warehouse="wh")
         self.connection = object()  # non-None means "connected" to the tab
@@ -72,6 +73,7 @@ class FakeSnowflake:
         self.loaded = loaded
         self.fail_writes = fail_writes
         self.operator = operator
+        self.can_prod = can_prod
         self.reads: list[str] = []
         self.writes: list[tuple[str, list]] = []
 
@@ -84,8 +86,9 @@ class FakeSnowflake:
                 [
                     {
                         "OWN_TABLES": 2 * full,
-                        "SHARED_TABLES": 2 * full,
-                        "FIX_LOG_COLUMNS": 2 * full,
+                        "SHARED_TABLES": 3 * full,
+                        "FIX_LOG_COLUMNS": 3 * full,
+                        "OPERATOR_COLUMNS": int(full),
                         "VIEW_CURRENT": int(full),
                     }
                 ]
@@ -101,12 +104,21 @@ class FakeSnowflake:
                         "TOTAL_LIVE_FIXES": 0,
                         "UNIQUE_TERMINALS_FIXED": 0,
                         "REHEARSAL_FIXES": 0,
+                        "REGISTERED_FIXES": 0,
                         "LATEST_SNAPSHOT_DATE": date(2026, 9, 28) if self.loaded else None,
                     }
                 ]
             )
         if "IS_OPERATOR" in sql:
-            return pd.DataFrame([{"USER_NAME": "ALIA", "IS_OPERATOR": int(self.operator)}])
+            return pd.DataFrame(
+                [
+                    {
+                        "USER_NAME": "ALIA",
+                        "IS_OPERATOR": int(self.operator),
+                        "CAN_PROD": int(self.can_prod),
+                    }
+                ]
+            )
         if "SUM(" in sql:
             # SUM over zero rows is NULL in Snowflake, not 0.
             totals = {
@@ -316,26 +328,54 @@ def test_initialise_creates_the_shared_log_before_the_views():
 # --------------------------------------------------------------------------- #
 
 
-def test_prod_offers_pre_check_and_dry_run_but_never_apply():
-    snow = FakeSnowflake(rows=[_bit2_row()])
+def test_prod_pre_check_and_dry_run_work_but_apply_needs_approval_and_change_ref():
+    snow = FakeSnowflake(rows=[_bit2_row()], can_prod=False)
     sql = FakeSql()
     at = _render(snow, **_fixer_state("PROD", sql, armed=True))
 
     assert _problems(at) == []
-    assert any("not enabled in this phase" in w.value for w in at.warning)
+    assert any("PRODUCTION" in w.value for w in at.warning)  # the stern PROD banner
     assert at.button(key="rem_apply_T-9").disabled
 
     at.button(key="rem_pre_T-9").click().run()
     at.button(key="rem_dry_T-9").click().run()
 
     assert _problems(at) == []
-    assert at.button(key="rem_apply_T-9").disabled  # still: PROD is never live here
+    # PROD is enabled now, but this operator is not CAN_PROD and gave no change ref.
+    assert at.button(key="rem_apply_T-9").disabled
+    reasons = " ".join(m.value for m in at.markdown)
+    assert "PROD-approved operator" in reasons and "change/CAB reference" in reasons
     assert [rollback for _, rollback in sql.calls] == [True]  # one dry run, rolled back
     logged = snow.fix_log_rows()
     assert [(r["MODE"], r["OUTCOME"], r["ENVIRONMENT"]) for r in logged] == [
         ("SIMULATION", "SIMULATED", "PROD")
     ]
     assert sql.version == "1"
+
+
+def test_prod_apply_with_approval_and_change_ref_verifies_and_registers(journal):
+    snow = FakeSnowflake(rows=[_bit2_row()], can_prod=True)
+    sql = FakeSql()
+    at = _render(snow, **_fixer_state("PROD", sql, armed=True))
+
+    at.text_input(key="rem_change_ref_T-9").set_value("CHG0043215").run()
+    at.button(key="rem_pre_T-9").click().run()
+    at.button(key="rem_dry_T-9").click().run()
+    assert _problems(at) == []
+    _reviewed_checkbox(at).check().run()
+    assert not at.button(key="rem_apply_T-9").disabled
+    at.button(key="rem_apply_T-9").click().run()
+
+    assert _problems(at) == []
+    assert sql.version == "2"
+    live = [r for r in snow.fix_log_rows() if r["MODE"] == "LIVE"]
+    assert [(r["OUTCOME"], r["VERIFIED"], r["ENVIRONMENT"]) for r in live] == [
+        ("APPLIED", True, "PROD")
+    ]
+    assert live[0]["CHANGE_REF"] == "CHG0043215"
+    # The verified PROD fix is registered in the durable registry.
+    assert any("DCC_FIX_REGISTRY" in s for s, _ in snow.writes)
+    assert any("verified" in s.value for s in at.success)
 
 
 def test_uat_operator_full_cycle_logs_a_verified_fix_and_keeps_it(journal):

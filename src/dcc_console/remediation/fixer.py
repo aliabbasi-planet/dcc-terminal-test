@@ -7,9 +7,10 @@ rule is unit-testable with fakes.
 
 Safety rules (decisions recorded 2026-09-29):
 
-* **Live writes only on DEV/UAT.** The worklist is PROD data; on PROD the fixer
-  offers the live pre-check and a dry run, never a live call. Enforced twice: by
-  :func:`live_gate` and again inside :func:`run_step`.
+* **Live writes on DEV/UAT and — behind a stronger gate — PROD.** A PROD live fix
+  additionally requires a PROD-approved operator (``CAN_PROD`` on the allowlist) and a
+  typed change reference; enforced by :func:`live_gate` and again inside
+  :func:`run_step`.
 * **Pre-check before anything.** A live read of the target decides whether a fix
   is needed at all; an already-correct target is logged, never re-applied (a Bit 1
   ``Add`` on an existing node is not proven idempotent).
@@ -34,8 +35,11 @@ from ..rollback import read_sp_flag_states, read_statement
 from . import mapping
 from .mapping import FlagFix
 
-# Environments where a live fix may be applied in this phase (never PROD).
-LIVE_ENVIRONMENTS: frozenset[str] = frozenset({"DEV", "UAT"})
+# Environments where a live fix may be applied. PROD is allowed only behind the extra
+# gate in live_gate (a CAN_PROD operator + a typed change reference) and run_step.
+LIVE_ENVIRONMENTS: frozenset[str] = frozenset({"DEV", "UAT", "PROD"})
+# The production environment, which carries the extra approval requirements.
+PROD_ENVIRONMENT = "PROD"
 # A pre-check / dry run older than this must be repeated before Apply.
 FRESHNESS_S = 15 * 60
 # Bit 2 version codes, per the catalogue's documented mapping (1 Standard, 2 ECB DCC).
@@ -274,6 +278,11 @@ def _clip(value: object, limit: int = 400) -> str | None:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _opt(value: object) -> str | None:
+    """Stringify a value for a nullable text column, preserving NULL."""
+    return None if value is None else str(value)
+
+
 def precheck(connection, step: FixStep, environment: str) -> Precheck:
     """Read the live target and decide whether the fix is still needed."""
     signature = step.signature(environment)
@@ -399,16 +408,21 @@ def run_step(
     environment: str,
     login: str,
     correlation_id: str,
+    change_ref: str | None = None,
 ) -> TestResult:
     """Run the step through the console's hardened procedure path.
 
-    Refuses a live call outside :data:`LIVE_ENVIRONMENTS` even if a caller skipped
-    :func:`live_gate` — the second, independent block on PROD writes.
+    Independent backstops even if a caller skipped :func:`live_gate`: refuses a live
+    call outside :data:`LIVE_ENVIRONMENTS`, and refuses a live PROD call that carries no
+    change reference — the second, independent block on unapproved PROD writes.
     """
     if step.config_value is None:
         raise ValueError("Choose and confirm the receipt template before running this fix.")
-    if not simulation and environment.upper() not in LIVE_ENVIRONMENTS:
-        raise PermissionError(f"Live fixes are not enabled on {environment} in this phase.")
+    env = environment.upper()
+    if not simulation and env not in LIVE_ENVIRONMENTS:
+        raise PermissionError(f"Live fixes are not enabled on {environment}.")
+    if not simulation and env == PROD_ENVIRONMENT and not (change_ref or "").strip():
+        raise PermissionError("A change reference is required for a live PROD fix.")
     result = run_test(
         connection,
         step.definition,
@@ -452,12 +466,17 @@ def live_gate(
     dry_run: DryRun | None,
     last_live: dict | None = None,
     source_last_altered: object = None,
+    can_prod: bool = False,
+    change_ref: str | None = None,
 ) -> Gate:
     """Every reason Apply live is refused right now (empty = allowed).
 
     ``last_live`` is the latest live APPLIED / ROLLED_BACK fix-log row for this
     terminal + check in this environment (see ``fixlog.build_last_live_outcome_query``):
     a verified fix since the snapshot blocks a re-fix; a later rollback re-opens it.
+
+    On PROD two more approvals are required on top of the DEV/UAT rules: the operator
+    must be PROD-approved (``can_prod``) and a change reference must be supplied.
     """
     reasons: list[str] = []
     env = environment.upper()
@@ -467,6 +486,13 @@ def live_gate(
             f"Live fixes are not enabled on {env or 'this environment'} in this phase — "
             "run the pre-check and dry run only."
         )
+    if env == PROD_ENVIRONMENT:
+        if not can_prod:
+            reasons.append(
+                "PROD live fixes need a PROD-approved operator (CAN_PROD in FIX_OPERATORS)."
+            )
+        if not (change_ref or "").strip():
+            reasons.append("Enter the change/CAB reference authorising this PROD fix.")
     if not is_operator:
         reasons.append("You are not on the live-fix operator list (FIX_OPERATORS).")
     if not armed_live:
@@ -497,7 +523,8 @@ def live_gate(
 
 def substitute_allowed(environment: str) -> bool:
     """Rehearsing on a substitute target is only ever allowed off PROD."""
-    return environment.upper() in LIVE_ENVIRONMENTS
+    env = environment.upper()
+    return env in LIVE_ENVIRONMENTS and env != PROD_ENVIRONMENT
 
 
 # --------------------------------------------------------------------------- #
@@ -542,10 +569,43 @@ def live_outcome(result: TestResult, post: Precheck | None) -> Outcome:
     return Outcome("APPLIED", "LIVE", verified, error)
 
 
-def rollback_outcome(ok: bool, error: str | None) -> Outcome:
-    if ok:
-        return Outcome("ROLLED_BACK", "LIVE", True, None)
-    return Outcome("FAILED", "LIVE", False, f"Rollback failed: {error}")
+def rollback_outcome(ok: bool, error: str | None, reverted: bool | None = None) -> Outcome:
+    """Outcome of a rollback. ``reverted`` is a fresh read confirming the undo.
+
+    VERIFIED means "confirmed reverted by a fresh SQL-Server read", not merely that the
+    compensating script ran. A rollback whose reversion cannot be confirmed is still
+    ROLLED_BACK but unverified, and carries a warning (the registry row is kept until a
+    read confirms the check is open again).
+    """
+    if not ok:
+        return Outcome("FAILED", "LIVE", False, f"Rollback failed: {error}")
+    if reverted is False:
+        return Outcome(
+            "ROLLED_BACK",
+            "LIVE",
+            False,
+            "The rollback ran but a fresh read did not confirm the change was reverted.",
+        )
+    return Outcome("ROLLED_BACK", "LIVE", reverted, None)
+
+
+def rollback_confirmed(post: Precheck | None) -> bool:
+    """True when a fresh read shows the change undone (the check is broken again)."""
+    return post is not None and post.status == NEEDS_FIX
+
+
+def should_register(outcome: Outcome) -> bool:
+    """Whether a resolving outcome is verified enough to record in the fix registry.
+
+    A committed fix confirmed by a fresh read, or a live pre-check that authoritatively
+    proved the check already satisfied — both mean the check is genuinely resolved.
+    """
+    return outcome.outcome in ("APPLIED", "SKIPPED_ALREADY_OK") and bool(outcome.verified)
+
+
+def registry_resolution(outcome: Outcome) -> str:
+    """The registry ``RESOLUTION`` for a resolving outcome (APPLIED vs ALREADY_OK)."""
+    return "APPLIED" if outcome.outcome == "APPLIED" else "ALREADY_OK"
 
 
 def keep_fix(result: TestResult) -> None:
@@ -583,6 +643,7 @@ def log_records(
     post: Precheck | None = None,
     error: str | None = None,
     notes: str | None = None,
+    change_ref: str | None = None,
 ) -> list[dict]:
     """One ``APP_FIX_LOG`` record per worklist terminal the call covers."""
     if result is not None:
@@ -601,6 +662,7 @@ def log_records(
             f"(worklist target {step.worklist_target})."
         )
         notes = f"{substitute_note} {notes}".strip() if notes else substitute_note
+    change = (change_ref or "").strip() or None
     records = []
     for row in covered_rows:
         record = {
@@ -624,9 +686,54 @@ def log_records(
             "OUTCOME": outcome,
             "ERROR": _clip(error, _STATE_MAX),
             "NOTES": _clip(notes, 1000),
+            "CHANGE_REF": _clip(change, 120),
         }
         for column in _ROW_IDENTIFIERS + _DIMENSIONS:
             value = row.get(column)
             record[column] = None if value is None else str(value)
         records.append(record)
+    return records
+
+
+def registry_records(
+    *,
+    step: FixStep,
+    covered_rows: list[dict],
+    environment: str,
+    operator: str,
+    correlation_id: str,
+    resolution: str,
+    change_ref: str | None = None,
+    result: TestResult | None = None,
+) -> list[dict]:
+    """One ``DCC_FIX_REGISTRY`` upsert record per worklist terminal the call covers.
+
+    Stores the procedure's own compensating script (when the bit is SP-managed) so a
+    verified PROD fix can still be rolled back later, even from a fresh session.
+    """
+    rollback_script = None
+    if result is not None and getattr(result, "sp_rollback_scripts", None):
+        rollback_script = _clip("\n".join(result.sp_rollback_scripts), _STATE_MAX)
+    change = (change_ref or "").strip() or None
+    records = []
+    for row in covered_rows:
+        records.append(
+            {
+                "ENVIRONMENT": environment.upper(),
+                "TERMINAL_IDENTIFIER": str(row.get("TERMINAL_IDENTIFIER")),
+                "CHECK_COLUMN": step.check_column,
+                "INSTANCE_IDENTIFIER": _opt(row.get("INSTANCE_IDENTIFIER")),
+                "LOCATION_NO": _opt(row.get("LOCATION_NO")),
+                "FIX_BIT": step.definition.bit,
+                "FLAG_NAME": step.flag.flag_name,
+                "VALUE_SENT": _clip(step.config_value, _VALUE_SENT_MAX),
+                "TARGET_ID_KIND": step.target_kind,
+                "TARGET_IDENTIFIER": step.target_identifier,
+                "CORRELATION_ID": correlation_id,
+                "CHANGE_REF": _clip(change, 120),
+                "RESOLUTION": resolution,
+                "SP_ROLLBACK_SCRIPT": rollback_script,
+                "FIXED_BY": operator,
+            }
+        )
     return records

@@ -39,6 +39,7 @@ _INSERTABLE: tuple[str, ...] = (
     "OUTCOME",
     "ERROR",
     "NOTES",
+    "CHANGE_REF",
     "BANK_MERCHANT_ID",
     "MERCHANT_NAME",
     "CUSTOMER_NAME",
@@ -167,13 +168,17 @@ def build_terminal_history_query(objs: RemediationObjects, limit: int = 50) -> s
 
 
 def build_operator_check_query(objs: RemediationObjects) -> str:
-    """The signed-in Snowflake user and whether they are an active live-fix operator.
+    """The signed-in Snowflake user, whether they may fix live, and whether on PROD.
 
     Identity is the SSO session's ``CURRENT_USER()`` — nothing the client supplies.
-    Returns one row: ``USER_NAME``, ``IS_OPERATOR`` (0/1).
+    Returns one row: ``USER_NAME``, ``IS_OPERATOR`` (0/1), ``CAN_PROD`` (0/1). CAN_PROD
+    is the extra PROD approval; a missing / NULL column counts as no PROD rights.
     """
     return (
         "SELECT CURRENT_USER() AS USER_NAME,\n"  # noqa: S608
         f"    (SELECT COUNT(*) FROM {objs.operators_table}\n"
-        "     WHERE UPPER(USER_NAME) = UPPER(CURRENT_USER()) AND ACTIVE) AS IS_OPERATOR"
+        "     WHERE UPPER(USER_NAME) = UPPER(CURRENT_USER()) AND ACTIVE) AS IS_OPERATOR,\n"
+        f"    (SELECT COUNT(*) FROM {objs.operators_table}\n"
+        "     WHERE UPPER(USER_NAME) = UPPER(CURRENT_USER()) AND ACTIVE\n"
+        "       AND COALESCE(CAN_PROD, FALSE)) AS CAN_PROD"
     )

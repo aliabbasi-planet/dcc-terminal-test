@@ -6,9 +6,11 @@ breakdowns, and filter the worklist of broken terminals. Selecting a worklist ro
 opens the one-by-one fixer (:mod:`.fix_panel`): pre-check → dry run → apply live →
 verify → logged, one check at a time.
 
-Live writes are limited to DEV/UAT in this phase (the worklist itself is PROD data)
-and to the operators listed in the shared ``FIX_OPERATORS`` table. Every attempt is
-logged to the team's shared ``APP_FIX_LOG``, so the re-fix guard covers everyone.
+Live writes run on DEV/UAT for any operator in the shared ``FIX_OPERATORS`` table and,
+behind a stronger gate (a PROD-approved ``CAN_PROD`` operator plus a typed change/CAB
+reference), on PROD. Every attempt is logged to the team's shared ``APP_FIX_LOG``; a
+verified PROD fix is also recorded in ``DCC_FIX_REGISTRY`` so it survives the daily
+refresh, and a confirmed rollback removes it.
 """
 
 from __future__ import annotations
@@ -218,12 +220,13 @@ def _render_kpis(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
         value = row.get(column)
         return f"{int(value or 0):,}"
 
-    cols = st.columns(5)
+    cols = st.columns(6)
     cols[0].metric("Actionable broken", count("BROKEN_ACTIONABLE"))
     cols[1].metric("Awaiting refresh", count("AWAITING_REFRESH"))
     cols[2].metric("Live fixes · PROD", count("TOTAL_LIVE_FIXES"))
-    cols[3].metric("Rehearsals · UAT/DEV", count("REHEARSAL_FIXES"))
-    cols[4].metric("Latest snapshot", str(row.get("LATEST_SNAPSHOT_DATE") or "—"))
+    cols[3].metric("Registered · PROD", count("REGISTERED_FIXES"))
+    cols[4].metric("Rehearsals · UAT/DEV", count("REHEARSAL_FIXES"))
+    cols[5].metric("Latest snapshot", str(row.get("LATEST_SNAPSHOT_DATE") or "—"))
 
 
 def _render_refresh(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
@@ -388,8 +391,8 @@ def render_remediation(armed_live: bool = False) -> None:
     st.subheader("DCC Remediation")
     st.caption(
         "Identify broken terminals from the Snowflake daily snapshot, then fix them one "
-        "check at a time: pre-check → dry run → apply live (DEV/UAT only in this phase) → "
-        "verify → logged."
+        "check at a time: pre-check → dry run → apply live (DEV/UAT, or PROD behind the "
+        "change-reference gate) → verify → logged → registered."
     )
     _show_flash()
     _render_connection_panel()

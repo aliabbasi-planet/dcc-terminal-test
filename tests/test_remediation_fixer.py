@@ -302,10 +302,23 @@ def test_gate_allows_a_fully_prepared_uat_fix():
     assert gate.allowed, gate.reasons
 
 
-def test_gate_blocks_prod_even_when_everything_else_is_ready():
-    gate = _ready(_step("CONFIGDOWNLOAD_VERSION_CHECK_C"), env="PROD")
+def test_gate_blocks_prod_without_prod_approval_or_change_ref():
+    step = _step("CONFIGDOWNLOAD_VERSION_CHECK_C")
+    # PROD with only the DEV/UAT preconditions ready is still blocked: it needs a
+    # PROD-approved operator (CAN_PROD) and a change reference.
+    gate = _ready(step, env="PROD")
     assert not gate.allowed
-    assert any("not enabled on PROD" in r for r in gate.reasons)
+    assert any("PROD-approved operator" in r for r in gate.reasons)
+    assert any("change/CAB reference" in r for r in gate.reasons)
+
+
+def test_gate_allows_prod_with_prod_approval_and_change_ref():
+    step = _step("CONFIGDOWNLOAD_VERSION_CHECK_C")
+    gate = _ready(step, env="PROD", can_prod=True, change_ref="CHG0042")
+    assert gate.allowed, gate.reasons
+    # Missing either approval re-blocks it.
+    assert not _ready(step, env="PROD", can_prod=False, change_ref="CHG0042").allowed
+    assert not _ready(step, env="PROD", can_prod=True, change_ref="  ").allowed
 
 
 def test_gate_reasons():
@@ -366,6 +379,85 @@ def test_run_step_refuses_prod_writes_without_the_gate():
             login="svc",
             correlation_id="c",
         )
+
+
+def test_run_step_allows_prod_live_with_a_change_ref():
+    step = _step("CONFIGDOWNLOAD_VERSION_CHECK_C")
+    sql = FakeSqlServer()
+    sql.terminals["T1"] = "1"
+    live = fixer.run_step(
+        sql,
+        step,
+        simulation=False,
+        environment="PROD",
+        login="svc",
+        correlation_id="c",
+        change_ref="CHG0042",
+    )
+    assert sql.terminals["T1"] == "2"  # the live call ran
+    assert live.environment.upper() == "PROD"
+    # A dry run on PROD needs no change ref (nothing is committed).
+    fixer.run_step(
+        sql, step, simulation=True, environment="PROD", login="svc", correlation_id="c"
+    )
+
+
+def test_rollback_outcome_reverted_semantics():
+    assert fixer.rollback_outcome(True, None, reverted=True).verified is True
+    unconfirmed = fixer.rollback_outcome(True, None, reverted=False)
+    assert unconfirmed.outcome == "ROLLED_BACK" and unconfirmed.verified is False
+    assert unconfirmed.error
+    assert fixer.rollback_outcome(False, "boom").outcome == "FAILED"
+
+
+def test_rollback_confirmed_only_when_check_is_open_again():
+    sig = _step("CONFIGDOWNLOAD_VERSION_CHECK_C").signature("PROD")
+    assert fixer.rollback_confirmed(fixer.Precheck(fixer.NEEDS_FIX, "1", "", sig, time.time()))
+    assert not fixer.rollback_confirmed(fixer.Precheck(fixer.ALREADY_OK, "2", "", sig, time.time()))
+    assert not fixer.rollback_confirmed(None)
+
+
+def test_should_register_and_resolution():
+    applied = fixer.Outcome("APPLIED", "LIVE", True)
+    skipped = fixer.Outcome("SKIPPED_ALREADY_OK", "LIVE", True)
+    unverified = fixer.Outcome("APPLIED", "LIVE", False)
+    simulated = fixer.Outcome("SIMULATED", "SIMULATION", None)
+    assert fixer.should_register(applied) and fixer.registry_resolution(applied) == "APPLIED"
+    assert fixer.should_register(skipped) and fixer.registry_resolution(skipped) == "ALREADY_OK"
+    assert not fixer.should_register(unverified)
+    assert not fixer.should_register(simulated)
+
+
+def test_registry_records_cover_every_terminal_with_change_ref_and_script():
+    step = _step("HANDLER_DCCENABLE_CHECK_O")
+    covered = [_row(TERMINAL_IDENTIFIER="T1"), _row(TERMINAL_IDENTIFIER="T2")]
+
+    class R:
+        sp_rollback_scripts = ["UPDATE handler SET ... prior"]
+
+    records = fixer.registry_records(
+        step=step,
+        covered_rows=covered,
+        environment="prod",
+        operator="ALIA",
+        correlation_id="c9",
+        resolution="APPLIED",
+        change_ref=" CHG0042 ",
+        result=R(),
+    )
+    assert [r["TERMINAL_IDENTIFIER"] for r in records] == ["T1", "T2"]
+    assert all(r["ENVIRONMENT"] == "PROD" for r in records)
+    assert all(r["CHANGE_REF"] == "CHG0042" for r in records)
+    assert all(r["SP_ROLLBACK_SCRIPT"] for r in records)
+    assert all(r["CHECK_COLUMN"] == "HANDLER_DCCENABLE_CHECK_O" for r in records)
+    for record in records:  # every key is an allowed, well-formed registry column
+        fixer_registry_ok(record)
+
+
+def fixer_registry_ok(record: dict) -> None:
+    from dcc_console.remediation import registry
+
+    registry.build_upsert([record], OBJS)
 
 
 def test_substitutes_are_never_allowed_on_prod():

@@ -16,24 +16,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import RemediationObjects
+from . import RemediationObjects, registry
 from .mapping import FIXABLE_CHECK_COLUMNS, FLAG_FIXES, TRACKED_CHECK_COLUMNS
 
 # Tables in the user's own schema, and in the (possibly identical) shared schema.
 OWN_TABLES: tuple[str, ...] = ("FLAG_REFERENCE", "HEALTH_DAILY_SNAPSHOT")
-SHARED_TABLES: tuple[str, ...] = ("APP_FIX_LOG", "FIX_OPERATORS")
+SHARED_TABLES: tuple[str, ...] = ("APP_FIX_LOG", "FIX_OPERATORS", "DCC_FIX_REGISTRY")
 # Columns added to APP_FIX_LOG after its first release (migrated in place).
 FIX_LOG_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("SQL_LOGIN", "VARCHAR(128)"),
     ("NOTES", "VARCHAR(1000)"),
+    ("CHANGE_REF", "VARCHAR(120)"),
 )
+# Columns added to FIX_OPERATORS after its first release (migrated in place). CAN_PROD is
+# added nullable so the ALTER never needs a default backfill on a non-empty table; the
+# operator check treats a missing / NULL value as FALSE (no PROD rights by default).
+OPERATORS_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (("CAN_PROD", "BOOLEAN"),)
 # A column only the current V_CURRENT_BROKEN exposes; if absent, views need upgrading.
 VIEW_MARKER_COLUMN = "OPEN_FIXABLE_CHECKS"
 
 # The snapshot is built from PROD data, so only PROD outcomes change the worklist.
 SNAPSHOT_ENVIRONMENT = "PROD"
-# Fix-log outcomes that settle a (terminal, check) until the next snapshot load.
-RESOLVING_OUTCOMES: tuple[str, ...] = ("APPLIED", "SKIPPED_ALREADY_OK")
 
 # Non-check snapshot columns with their types, in table order (mirrors 001).
 _SNAPSHOT_FIXED_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -127,10 +130,19 @@ def _create_operators(objs: RemediationObjects) -> str:
     return f"""CREATE TABLE IF NOT EXISTS {objs.operators_table} (
     USER_NAME   VARCHAR(150)  NOT NULL PRIMARY KEY,
     ACTIVE      BOOLEAN       NOT NULL DEFAULT TRUE,
+    CAN_PROD    BOOLEAN       NOT NULL DEFAULT FALSE,
     ADDED_BY    VARCHAR(150)  NOT NULL DEFAULT CURRENT_USER(),
     ADDED_AT    TIMESTAMP_LTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
     NOTES       VARCHAR(500)
 )"""
+
+
+def _upgrade_operators(objs: RemediationObjects) -> list[str]:
+    """Add columns introduced after the first release to an existing allowlist."""
+    return [
+        f"ALTER TABLE {objs.operators_table} ADD COLUMN IF NOT EXISTS {name} {ddl}"
+        for name, ddl in OPERATORS_ADDED_COLUMNS
+    ]
 
 
 def _seed_first_operator(objs: RemediationObjects) -> str:
@@ -143,13 +155,16 @@ def _seed_first_operator(objs: RemediationObjects) -> str:
 
 
 def build_shared_statements(objs: RemediationObjects) -> list[str]:
-    """Idempotent statements for the shared fix log + operator allowlist."""
+    """Idempotent statements for the shared fix log + operator allowlist + fix registry."""
     return [
         f"CREATE SCHEMA IF NOT EXISTS {objs.shared_fqn}",
         _create_fix_log(objs),
         *_upgrade_fix_log(objs),
         _create_operators(objs),
+        *_upgrade_operators(objs),
         _seed_first_operator(objs),
+        registry.create_table(objs),
+        registry.build_backfill_from_log(objs),
     ]
 
 
@@ -195,7 +210,6 @@ def _open_fixable_expr() -> str:
 
 
 def _create_v_current_broken(objs: RemediationObjects) -> str:
-    outcomes = _in_list(RESOLVING_OUTCOMES)
     return f"""CREATE OR REPLACE VIEW {objs.v_current_broken} AS
 WITH latest AS (
     -- Only the most recent load: a terminal repaired since an earlier snapshot has no
@@ -203,34 +217,23 @@ WITH latest AS (
     SELECT * FROM {objs.snapshot_table}
     WHERE SNAPSHOT_DATE = (SELECT MAX(SNAPSHOT_DATE) FROM {objs.snapshot_table})
 ),
-resolved AS (
-    -- {SNAPSHOT_ENVIRONMENT} outcomes that settle a (terminal, check) until the next load:
-    -- a verified live fix, or a live pre-check that found it already correct. The
-    -- latest live outcome per check wins, so a later rollback re-opens the check.
-    -- UAT/DEV rehearsals never hide {SNAPSHOT_ENVIRONMENT} work.
-    SELECT TERMINAL_IDENTIFIER, CHECK_COLUMN,
-           CONVERT_TIMEZONE('UTC', APPLIED_AT)::TIMESTAMP_NTZ AS RESOLVED_AT_UTC
-    FROM (
-        SELECT TERMINAL_IDENTIFIER, CHECK_COLUMN, APPLIED_AT, OUTCOME, VERIFIED
-        FROM {objs.fix_log_table}
-        WHERE ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' AND MODE = 'LIVE'
-          AND CHECK_COLUMN IS NOT NULL AND OUTCOME IN ({outcomes}, 'ROLLED_BACK')
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY TERMINAL_IDENTIFIER, CHECK_COLUMN ORDER BY APPLIED_AT DESC, FIX_ID DESC
-        ) = 1
-    )
-    WHERE OUTCOME IN ({outcomes}) AND VERIFIED = TRUE
-),
 fixed AS (
-    -- Only resolutions newer than the source load the snapshot was built from count
-    -- (SOURCE_LAST_ALTERED is stored as UTC).
+    -- Durable registry of verified {SNAPSHOT_ENVIRONMENT} fixes (DCC_FIX_REGISTRY): a row
+    -- is written when a live fix is verified by a fresh SQL-Server read (or a live
+    -- pre-check proves the check already satisfied) and DELETED when a rollback is
+    -- confirmed, so a later rollback re-opens the check. It survives the daily refresh,
+    -- and UAT/DEV rehearsals never hide {SNAPSHOT_ENVIRONMENT} work (only
+    -- ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' rows count). Only fixes newer than the source
+    -- load the snapshot was built from count, so a terminal re-broken in a later load
+    -- resurfaces (FIXED_AT_UTC and SOURCE_LAST_ALTERED are both UTC).
     SELECT l.TERMINAL_IDENTIFIER,
-           ARRAY_AGG(DISTINCT r.CHECK_COLUMN) AS FIXED_CHECKS,
-           MAX(r.RESOLVED_AT_UTC) AS LAST_FIX_AT_UTC
+           ARRAY_AGG(DISTINCT g.CHECK_COLUMN) AS FIXED_CHECKS,
+           MAX(g.FIXED_AT_UTC) AS LAST_FIX_AT_UTC
     FROM latest l
-    JOIN resolved r
-      ON r.TERMINAL_IDENTIFIER = l.TERMINAL_IDENTIFIER
-     AND r.RESOLVED_AT_UTC > l.SOURCE_LAST_ALTERED
+    JOIN {objs.registry_table} g
+      ON g.TERMINAL_IDENTIFIER = l.TERMINAL_IDENTIFIER
+     AND g.ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' AND g.STATUS = 'FIXED'
+     AND g.FIXED_AT_UTC > l.SOURCE_LAST_ALTERED
     GROUP BY l.TERMINAL_IDENTIFIER
 ),
 joined AS (
@@ -282,6 +285,8 @@ SELECT
         WHERE {live_applied} AND {prod})                              AS UNIQUE_TERMINALS_FIXED,
     (SELECT COUNT(DISTINCT CORRELATION_ID) FROM {objs.fix_log_table}
         WHERE {live_applied} AND NOT {prod})                          AS REHEARSAL_FIXES,
+    (SELECT COUNT(*) FROM {objs.registry_table}
+        WHERE ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' AND STATUS = 'FIXED') AS REGISTERED_FIXES,
     (SELECT MAX(SNAPSHOT_DATE) FROM {objs.snapshot_table})            AS LATEST_SNAPSHOT_DATE"""
 
 
@@ -355,6 +360,7 @@ WHEN NOT MATCHED THEN INSERT
 def build_objects_present_query(objs: RemediationObjects) -> str:
     """One row describing which objects exist (own tables, shared tables, upgrades)."""
     added = tuple(name for name, _ in FIX_LOG_ADDED_COLUMNS)
+    operator_added = tuple(name for name, _ in OPERATORS_ADDED_COLUMNS)
     return f"""SELECT
     (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.TABLES
       WHERE TABLE_SCHEMA = '{objs.schema.upper()}'
@@ -365,6 +371,9 @@ def build_objects_present_query(objs: RemediationObjects) -> str:
     (SELECT COUNT(*) FROM {objs.shared_database}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '{objs.shared_schema.upper()}' AND TABLE_NAME = 'APP_FIX_LOG'
         AND COLUMN_NAME IN ({_in_list(added)}))                     AS FIX_LOG_COLUMNS,
+    (SELECT COUNT(*) FROM {objs.shared_database}.INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '{objs.shared_schema.upper()}' AND TABLE_NAME = 'FIX_OPERATORS'
+        AND COLUMN_NAME IN ({_in_list(operator_added)}))            AS OPERATOR_COLUMNS,
     (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '{objs.schema.upper()}' AND TABLE_NAME = 'V_CURRENT_BROKEN'
         AND COLUMN_NAME = '{VIEW_MARKER_COLUMN}')                     AS VIEW_CURRENT"""
@@ -390,15 +399,17 @@ def schema_status(row: dict) -> SchemaStatus:
         return int(value) if value is not None else 0
 
     own = count("OWN_TABLES") >= len(OWN_TABLES)
-    shared = count("SHARED_TABLES") >= len(SHARED_TABLES) and count("FIX_LOG_COLUMNS") >= len(
-        FIX_LOG_ADDED_COLUMNS
+    shared = (
+        count("SHARED_TABLES") >= len(SHARED_TABLES)
+        and count("FIX_LOG_COLUMNS") >= len(FIX_LOG_ADDED_COLUMNS)
+        and count("OPERATOR_COLUMNS") >= len(OPERATORS_ADDED_COLUMNS)
     )
     views = count("VIEW_CURRENT") >= 1
     missing = []
     if not own:
         missing.append("snapshot / flag-reference tables")
     if not shared:
-        missing.append("shared fix log / operator allowlist (or its new columns)")
+        missing.append("shared fix log / operator allowlist / fix registry (or new columns)")
     if not views:
         missing.append("current worklist views")
     return SchemaStatus(own, shared, views, tuple(missing))

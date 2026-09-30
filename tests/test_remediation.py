@@ -430,18 +430,17 @@ def test_view_reads_only_the_latest_snapshot_date():
     assert "ORDER BY SNAPSHOT_DATE DESC" not in view  # no per-terminal "latest row" fallback
 
 
-def test_view_counts_only_prod_live_verified_resolutions_per_check():
+def test_view_reads_the_fix_registry_for_prod_resolutions():
     view = next(s for s in ddl.build_create_statements(OBJS) if "V_CURRENT_BROKEN AS" in s)
-    assert "ENVIRONMENT = 'PROD'" in view
-    assert "MODE = 'LIVE'" in view and "VERIFIED = TRUE" in view
-    assert "OUTCOME IN ('APPLIED', 'SKIPPED_ALREADY_OK')" in view
-    # Latest live outcome per (terminal, check): a later rollback re-opens the check.
-    assert "'ROLLED_BACK'" in view
-    assert "PARTITION BY TERMINAL_IDENTIFIER, CHECK_COLUMN" in view
+    # Suppression is now driven by the durable registry (survives the daily refresh and
+    # is deleted on rollback), scoped to PROD/FIXED and guarded by the snapshot's
+    # source-load time so a terminal re-broken in a later load resurfaces.
+    assert OBJS.registry_table in view
+    assert "g.ENVIRONMENT = 'PROD'" in view and "g.STATUS = 'FIXED'" in view
+    assert "g.FIXED_AT_UTC > l.SOURCE_LAST_ALTERED" in view
     for col in mapping.FIXABLE_CHECK_COLUMNS:
         assert f"ARRAY_CONTAINS('{col}'::VARIANT, FIXED_CHECKS)" in view
     assert ddl.VIEW_MARKER_COLUMN in view
-    assert "CONVERT_TIMEZONE('UTC', APPLIED_AT)" in view
 
 
 def test_kpis_separate_prod_fixes_from_rehearsals():
@@ -472,16 +471,60 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
     assert "TABLE_SCHEMA = 'DCC_REMEDIATION'" in sql
     for table in ddl.OWN_TABLES + ddl.SHARED_TABLES:
         assert f"'{table}'" in sql
+    assert "DCC_FIX_REGISTRY" in sql  # the durable registry is part of readiness
+    assert "TABLE_NAME = 'FIX_OPERATORS'" in sql and "'CAN_PROD'" in sql
     assert f"COLUMN_NAME = '{ddl.VIEW_MARKER_COLUMN}'" in sql
 
 
 @pytest.mark.parametrize(
     ("row", "ready", "missing"),
     [
-        ({"OWN_TABLES": 2, "SHARED_TABLES": 2, "FIX_LOG_COLUMNS": 2, "VIEW_CURRENT": 1}, True, 0),
-        # The 2026-09-28 schema: tables exist, but no allowlist, new columns or new view.
-        ({"OWN_TABLES": 2, "SHARED_TABLES": 1, "FIX_LOG_COLUMNS": 0, "VIEW_CURRENT": 0}, False, 2),
-        ({"OWN_TABLES": 0, "SHARED_TABLES": 0, "FIX_LOG_COLUMNS": 0, "VIEW_CURRENT": 0}, False, 3),
+        (
+            {
+                "OWN_TABLES": 2,
+                "SHARED_TABLES": 3,
+                "FIX_LOG_COLUMNS": 3,
+                "OPERATOR_COLUMNS": 1,
+                "VIEW_CURRENT": 1,
+            },
+            True,
+            0,
+        ),
+        # The 2026-09-28 schema: tables exist, but no allowlist/registry, new columns or view.
+        (
+            {
+                "OWN_TABLES": 2,
+                "SHARED_TABLES": 1,
+                "FIX_LOG_COLUMNS": 0,
+                "OPERATOR_COLUMNS": 0,
+                "VIEW_CURRENT": 0,
+            },
+            False,
+            2,
+        ),
+        # Fix log + registry present, but the operator allowlist is missing CAN_PROD.
+        (
+            {
+                "OWN_TABLES": 2,
+                "SHARED_TABLES": 3,
+                "FIX_LOG_COLUMNS": 3,
+                "OPERATOR_COLUMNS": 0,
+                "VIEW_CURRENT": 1,
+            },
+            False,
+            1,
+        ),
+        (
+            {
+                "OWN_TABLES": 0,
+                "SHARED_TABLES": 0,
+                "FIX_LOG_COLUMNS": 0,
+                "OPERATOR_COLUMNS": 0,
+                "VIEW_CURRENT": 0,
+            },
+            False,
+            3,
+        ),
         ({"OWN_TABLES": None}, False, 3),
     ],
 )

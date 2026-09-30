@@ -29,6 +29,11 @@ from dataclasses import dataclass
 # Shared, read-only discovery source — the same for every user.
 MAINTENANCE_SOURCE = "PROD_PRESENTATION.CORTEX.CORTEX_TERMINAL_MAINTENANCE"
 
+# The account's DCC maintenance Cortex Agent (Cortex Analyst over the maintenance
+# semantic view). Queried on demand from the tab so an operator can ask about a
+# terminal before changing it. Read-only; called with the operator's own SSO session.
+DCC_AGENT_FQN = "PROD_PRESENTATION.CORTEX.DCC_TERMINAL_MAINTENANCE_AGENT"
+
 # Unquoted Snowflake identifier: letter/underscore start, then letters/digits/_/$.
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 
@@ -112,6 +117,16 @@ class RemediationObjects:
     @property
     def operators_table(self) -> str:
         return f"{self.shared_fqn}.FIX_OPERATORS"
+
+    @property
+    def registry_table(self) -> str:
+        """Durable registry of verified PROD fixes (survives the daily refresh).
+
+        One row per (ENVIRONMENT, TERMINAL_IDENTIFIER, CHECK_COLUMN) currently fixed;
+        inserted when a live fix verifies, deleted when a rollback is confirmed. The
+        worklist view reads its PROD rows so a fix is not re-flagged after a refresh.
+        """
+        return f"{self.shared_fqn}.DCC_FIX_REGISTRY"
 
     @property
     def flag_reference_table(self) -> str:

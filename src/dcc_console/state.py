@@ -39,6 +39,7 @@ _PRESERVED_ON_RESET = {
     "rem_sf_conn",
     "rem_operator",
     "rem_pending_logs",
+    "rem_agent_chat",
 }
 
 # Sidebar credential widgets are already on screen when a new login is made, and
