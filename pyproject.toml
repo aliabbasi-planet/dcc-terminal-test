@@ -40,6 +40,19 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
 
+[tool.coverage.run]
+branch = true
+source = ["src/dcc_console"]
+# Core logic is measured here; Streamlit UI is validated manually/integratively.
+omit = [
+    "src/dcc_console/ui/*",
+    "src/dcc_console/app.py",
+    "src/dcc_console/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
