@@ -111,6 +111,26 @@ def _result(**overrides) -> TestResult:
 
 
 class TestVerdictVocabulary:
+    def test_trace_text_and_rollback_properties(self):
+        r = _result(
+            mode="LIVE",
+            state_before="before",
+            state_after="after",
+            restore_point="before",
+            change_persisted=True,
+            trace_rows=[{"message": "first"}, {"line": 2, "message": "second"}],
+            sp_rollback_scripts=["UPDATE handler"],
+        )
+        assert r.trace_text == "first second"
+        assert r.restore_point_known is True
+        assert r.can_rollback is True
+        assert r.rollback_available is True
+
+    @pytest.mark.parametrize("status", ["FAIL", "REVIEW"])
+    def test_live_non_applied_verdicts(self, status):
+        r = _result(mode="LIVE", status=status, error="problem" if status == "FAIL" else None)
+        assert r.verdict_code == status
+
     def test_simulation_pass_is_simulated_ok_not_applied(self):
         r = _result(mode="SIMULATION", status="PASS")
         assert r.verdict_code == "SIMULATED-OK"
