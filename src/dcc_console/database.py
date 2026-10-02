@@ -174,6 +174,10 @@ class DatabaseConnection:
         *inside* the result-set loop because some ODBC drivers clear
         ``cursor.messages`` on each ``nextset()`` call.  Reading only once at
         the end would silently lose any message emitted between result sets.
+
+        Commits only when the whole call succeeded and ``rollback`` is False. Any
+        error rolls the transaction back before re-raising, so a live call that
+        fails part-way never leaves a half-applied change committed.
         """
         connection = self._require_connection()
         cursor = connection.cursor()
@@ -191,6 +195,7 @@ class DatabaseConnection:
                     seen.add(text)
                     messages.append(text)
 
+        succeeded = False
         try:
             cursor.execute(sql, params)
             _drain_messages()
@@ -213,9 +218,10 @@ class DatabaseConnection:
                     break
                 _drain_messages()
             _drain_messages()
+            succeeded = True
         finally:
             cursor.close()
-            if rollback:
+            if rollback or not succeeded:
                 connection.rollback()
             else:
                 connection.commit()

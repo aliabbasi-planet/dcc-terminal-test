@@ -15,7 +15,7 @@ from ..catalog import TEST_CATALOG, TEST_KEYS
 from ..config import ENVIRONMENTS, configdownload_version_text
 from ..coverage import compute_coverage, coverage_totals
 from ..docx_report import generate_cab_docx
-from ..execution import TestResult, apply_rollback, build_call, run_test
+from ..execution import ORIGIN_REMEDIATION, TestResult, apply_rollback, build_call, run_test
 from ..negatives import NegativeCase, default_negative_cases, run_negative, run_negative_battery
 from ..pdf_report import generate_cab_pdf
 from ..readiness import all_passed, capture_procedure_version, grant_script, run_readiness
@@ -903,6 +903,12 @@ def _render_rollback_panel(result: TestResult) -> None:
             "nothing to restore."
         )
         return
+    if result.origin == ORIGIN_REMEDIATION:
+        st.info(
+            "Remediation fix — roll it back from the **DCC Remediation** tab so the rollback "
+            "is recorded in the shared fix log."
+        )
+        return
 
     definition = TEST_CATALOG[result.test_key]
 
@@ -1150,7 +1156,13 @@ def render_results() -> None:
         )
         return
 
-    outstanding = [result for result in all_results if result.rollback_available]
+    # Remediation fixes are meant to stay applied, and their rollbacks must be logged in
+    # APP_FIX_LOG — so they are undone only from the DCC Remediation tab, never in bulk.
+    outstanding = [
+        result
+        for result in all_results
+        if result.rollback_available and result.origin != ORIGIN_REMEDIATION
+    ]
     negatives = [result for result in all_results if result.is_negative]
 
     summary = st.columns(6)
@@ -1344,6 +1356,9 @@ def render_recovery_banner() -> None:
     """Show a warning banner if there are PENDING journal entries from a crash."""
     from ..journal import get_journal
 
+    for level, message in st.session_state.pop("recovery_flash", []):
+        getattr(st, level)(message)
+
     journal = get_journal()
     pending = journal.pending_entries()
     if not pending:
@@ -1351,10 +1366,10 @@ def render_recovery_banner() -> None:
 
     envs = sorted({e["environment"] for e in pending})
     st.error(
-        f"**Crash recovery**: {len(pending)} uncommitted live change(s) found "
-        f"in {', '.join(envs)}. These changes were committed to the database but "
-        "never rolled back because the app crashed. Connect to the affected "
-        "environment and use the recovery panel below to restore original values."
+        f"**Crash recovery**: {len(pending)} live change(s) in {', '.join(envs)} were "
+        "committed but never rolled back or confirmed as kept — usually because the app "
+        "stopped mid-run. Connect to the affected environment and use the recovery panel "
+        "below to restore original values."
     )
     with st.expander(f"View {len(pending)} pending restore point(s)", expanded=True):
         for entry in pending:
@@ -1363,7 +1378,7 @@ def render_recovery_banner() -> None:
             c2.markdown(f"{entry['test_key']}")
             c3.code(f"Original: {str(entry['original_value'])[:80]}", language=None)
             if c4.button("↩️ Restore", key=f"recover-{entry['id']}"):
-                _recover_entry(entry)
+                _recover_and_rerun([entry])
 
         if st.button(
             "↩️ Restore ALL pending entries",
@@ -1371,37 +1386,25 @@ def render_recovery_banner() -> None:
             use_container_width=True,
             key="recover-all",
         ):
-            for entry in pending:
-                _recover_entry(entry)
+            _recover_and_rerun(pending)
 
 
-def _recover_entry(entry: dict) -> None:
-    """Execute the restore SQL from a journal entry."""
+def _recover_and_rerun(entries: list[dict]) -> None:
+    """Restore each entry, keep every outcome for the next run, then refresh once."""
     from ..journal import get_journal
+    from ..recovery import recover_entry
 
-    conn = st.session_state.get("connection")
-    if conn is None or not hasattr(conn, "execute_write"):
-        st.warning(
-            f"Connect to {entry['environment']} ({entry['server']}/{entry['database_name']}) "
-            "first, then retry the recovery."
+    flash = []
+    for entry in entries:
+        outcome = recover_entry(
+            entry,
+            st.session_state.get("connection"),
+            st.session_state.get("connected_env", ""),
+            get_journal(),
         )
-        return
-
-    current_env = st.session_state.get("connected_env", "")
-    if current_env.upper() != entry["environment"].upper():
-        st.warning(
-            f"You are connected to {current_env} but this entry is for "
-            f"{entry['environment']}. Switch environments first."
-        )
-        return
-
-    try:
-        conn.execute_write(entry["restore_sql"], (entry["original_value"], entry["target"]))
-        get_journal().mark_resolved(entry["id"])
-        st.success(f"Restored {entry['target']} ({entry['test_key']})")
-        st.rerun()
-    except Exception as exc:
-        st.error(f"Recovery failed for {entry['target']}: {exc}")
+        flash.append(("success" if outcome.ok else "error", outcome.message))
+    st.session_state["recovery_flash"] = flash
+    st.rerun()
 
 
 __all__ = [

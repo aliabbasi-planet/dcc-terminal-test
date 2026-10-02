@@ -31,6 +31,10 @@ HANDLER_TYPE_FILTER = (
 
 _CONFIG_VALUE_RE = re.compile(r'config_value="([^"]*)"')
 
+# How a rollback was performed (recorded on every outcome).
+METHOD_COLUMN = "column"
+METHOD_PROCEDURE_SCRIPT = "procedure_script"
+
 
 @dataclass
 class RollbackOutcome:
@@ -42,6 +46,7 @@ class RollbackOutcome:
     at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
+    method: str = METHOD_COLUMN
 
     def as_dict(self) -> dict:
         return {
@@ -51,6 +56,7 @@ class RollbackOutcome:
             "trigger": self.trigger,
             "error": self.error,
             "at": self.at,
+            "method": self.method,
         }
 
 
@@ -130,12 +136,16 @@ def restore_via_scripts(
         return RollbackOutcome(
             ok=False, rows=0, sql="", trigger=trigger,
             error="No procedure rollback script was captured for this result.",
+            method=METHOD_PROCEDURE_SCRIPT,
         )
     try:
         affected = connection.execute_batch(list(scripts))
     except Exception as exc:
         logger.error("Procedure rollback script failed: %s", exc)
-        return RollbackOutcome(ok=False, rows=0, sql=joined, trigger=trigger, error=str(exc))
+        return RollbackOutcome(
+            ok=False, rows=0, sql=joined, trigger=trigger, error=str(exc),
+            method=METHOD_PROCEDURE_SCRIPT,
+        )
 
     return RollbackOutcome(
         ok=affected > 0,
@@ -143,6 +153,7 @@ def restore_via_scripts(
         sql=joined,
         trigger=trigger,
         error=None if affected > 0 else "Rollback script committed but affected 0 rows.",
+        method=METHOD_PROCEDURE_SCRIPT,
     )
 
 

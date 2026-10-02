@@ -29,8 +29,18 @@ DEFAULTS: dict[str, Any] = {
     "trace_signature": None,
 }
 
-# Keys that must survive a disconnect so the sidebar keeps its selection.
-_PRESERVED_ON_RESET = {"active_env", "session_history"}
+# Keys that must survive a disconnect so the sidebar keeps its selection. The DCC
+# Remediation tab's Snowflake session (SSO), its operator check and any fix-log rows
+# still waiting to be written are independent of the SQL-Server login, so a
+# reconnect must not drop them — losing a pending row would leave a live fix unaudited.
+_PRESERVED_ON_RESET = {
+    "active_env",
+    "session_history",
+    "rem_sf_conn",
+    "rem_operator",
+    "rem_pending_logs",
+    "rem_agent_chat",
+}
 
 # Sidebar credential widgets are already on screen when a new login is made, and
 # Streamlit forbids rewriting the state of an instantiated widget.

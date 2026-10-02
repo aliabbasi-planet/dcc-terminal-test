@@ -13,6 +13,7 @@ from .config import PROCEDURE, RETURN_CODE_COLUMN
 from .database import DatabaseConnection
 from .journal import get_journal
 from .rollback import (
+    METHOD_PROCEDURE_SCRIPT,
     RollbackOutcome,
     flag_states_match,
     read_sp_flag_states,
@@ -24,6 +25,9 @@ from .rollback import (
 from .trace import TraceSignature, trace_from_messages
 
 PERMISSION_DENIED_MARKER = "EXECUTE permission was denied"
+
+ORIGIN_TEST = "test"
+ORIGIN_REMEDIATION = "remediation"
 
 
 @dataclass
@@ -82,6 +86,9 @@ class TestResult:
     # True/False once a rollback has been verified against prior; None = not yet
     # attempted or the verification read was unavailable.
     sp_flag_verified: bool | None = None
+    # Which part of the console produced the run (ORIGIN_* below). Remediation fixes
+    # are kept on purpose and roll back only through the DCC Remediation tab.
+    origin: str = "test"
 
     @property
     def trace_text(self) -> str:
@@ -121,9 +128,25 @@ class TestResult:
         return self.is_live and bool(self.sp_rollback_scripts)
 
     @property
+    def sp_rolled_back(self) -> bool:
+        """The procedure's own rollback script has already run successfully."""
+        return any(
+            entry.get("ok") and entry.get("method") == METHOD_PROCEDURE_SCRIPT
+            for entry in self.rollback_log
+        )
+
+    @property
     def rollback_available(self) -> bool:
-        """Either the generic column-restore or the procedure's own script applies."""
-        return self.can_rollback or self.has_sp_rollback
+        """A committed change is still applied and there is a way to undo it.
+
+        Procedure-managed results roll back with the procedure's own script, so once
+        that has succeeded nothing is outstanding (running it again would rewrite the
+        prior value over anything changed since). Column restores update
+        ``change_persisted`` themselves, so ``can_rollback`` already turns False.
+        """
+        if self.has_sp_rollback:
+            return not self.sp_rolled_back
+        return self.can_rollback
 
     @property
     def sp_flag_rows(self) -> list[dict]:
@@ -181,7 +204,7 @@ class TestResult:
         if self.sp_managed:
             if self.sp_change_detected is not None:
                 return self.sp_change_detected
-            return self.has_sp_rollback
+            return self.has_sp_rollback and not self.sp_rolled_back
         return self.change_persisted
 
     @property
@@ -489,9 +512,10 @@ def run_test(
         transaction = "COMMITTED"
 
     # For sp_managed live changes, replace the journal's generic (wrong) restore
-    # SQL with the procedure's own script so crash recovery restores the right row.
+    # SQL with the procedure's own script so crash recovery restores the right row
+    # (flagged SP_SCRIPT, so recovery runs it verbatim without bound parameters).
     if journal_id is not None and sp_applied and sp_rollback_scripts:
-        journal.update_restore_sql(journal_id, "\n".join(sp_rollback_scripts))
+        journal.set_procedure_scripts(journal_id, sp_rollback_scripts)
 
     # Update journal: mark resolved if auto-rolled back or genuinely no change.
     if journal_id is not None:
