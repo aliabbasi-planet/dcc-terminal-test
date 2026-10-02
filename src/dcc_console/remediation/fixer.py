@@ -44,6 +44,11 @@ PROD_ENVIRONMENT = "PROD"
 FRESHNESS_S = 15 * 60
 # Bit 2 version codes, per the catalogue's documented mapping (1 Standard, 2 ECB DCC).
 _CONFIG_DOWNLOAD_CODES = {"Standard": "1", "ECB DCC": "2"}
+_BIT1_EXTRA_FUNCTION_IDS = {
+    "DCCXpressCO": "51",
+    "DCCXpressCODT": "141",
+    "DCCXpressCOFallback": "139",
+}
 # Fix-log column widths that must not be exceeded.
 _VALUE_SENT_MAX = 120
 _STATE_MAX = 16000
@@ -252,6 +257,15 @@ def _token(name: str) -> re.Pattern:
     return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
 
 
+def _has_bit1_extra_function(document: object, function: str) -> bool:
+    """Check the exact location extra_function_id assigned to a Bit 1 function."""
+    expected_id = _BIT1_EXTRA_FUNCTION_IDS.get(function)
+    if document is None or expected_id is None:
+        return False
+    attribute = rf"\bextra_function_id\s*=\s*[\"']{re.escape(expected_id)}[\"']"
+    return re.search(attribute, str(document)) is not None
+
+
 def _exists(connection, definition: TestDefinition, identifier: str) -> bool:
     verify = definition.verify
     # Table and key are catalogue constants; the identifier is a bound parameter.
@@ -353,7 +367,7 @@ def precheck(connection, step: FixStep, environment: str) -> Precheck:
         ok, document = _read_value(connection, definition, target)
         if not ok:
             return verdict(UNKNOWN, None, "Could not read the location's extra_function.")
-        if document is not None and _token(function).search(str(document)):
+        if _has_bit1_extra_function(document, function):
             return verdict(
                 ALREADY_OK,
                 document,

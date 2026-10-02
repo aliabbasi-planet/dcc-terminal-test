@@ -51,6 +51,11 @@ def _step(check: str, **row_overrides) -> fixer.FixStep:
 # --------------------------------------------------------------------------- #
 
 _FLAG = re.compile(r'config_name="(?P<name>[^"]+)" config_value="(?P<value>[^"]*)"')
+_BIT1_EXTRA_FUNCTION_IDS = {
+    "DCCXpressCO": "51",
+    "DCCXpressCODT": "141",
+    "DCCXpressCOFallback": "139",
+}
 
 
 def _handler_xml(**flags: str) -> str:
@@ -111,7 +116,13 @@ class FakeSqlServer:
             self.terminals[target] = {"Standard": "1", "ECB DCC": "2"}[params[2]]
         elif bit == 1:
             assert params[3] == 1, "a fix must ADD the function"
-            self.locations[target] = (self.locations[target] or "") + f'<fn name="{params[2]}"/>'
+            current = self.locations[target] or ""
+            function_id = _BIT1_EXTRA_FUNCTION_IDS[params[2]]
+            self.locations[target] = (
+                f"<extra_function>{current}"
+                f'<extra_function extra_function_id="{function_id}"/>'
+                "</extra_function>"
+            )
         elif bit == 8:
             for handler in self.handlers[target]:
                 handler["extra_config"] = _FLAG.sub(
@@ -243,16 +254,53 @@ def test_bit8_precheck():
     assert fixer.precheck(sql, step, "UAT").status == fixer.NOT_FOUND
 
 
-def test_bit1_precheck_matches_the_whole_function_name():
-    step = _step("DCCXPRESSCO_CHECK_O")
+@pytest.mark.parametrize(
+    ("check", "function", "expected_id", "other_id"),
+    [
+        ("DCCXPRESSCO_CHECK_O", "DCCXpressCO", "51", "141"),
+        ("DCCXPRESSCODT_CHECK_O", "DCCXpressCODT", "141", "139"),
+        ("DCCXPRESSCOFALLBACK_CHECK_O", "DCCXpressCOFallback", "139", "51"),
+    ],
+)
+def test_bit1_precheck_matches_only_the_configured_extra_function_id(
+    check, function, expected_id, other_id
+):
+    step = _step(check)
     sql = FakeSqlServer()
-    sql.locations["L1"] = '<fn name="DCCXpressCODT"/><fn name="DCCXpressCOFallback"/>'
-    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX  # CODT is not CO
-    sql.locations["L1"] += '<fn name="DCCXpressCO"/>'
+    sql.locations["L1"] = (
+        f'<extra_function><extra_function extra_function_id="{other_id}"/></extra_function>'
+    )
+    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
+
+    sql.locations["L1"] = (
+        f'<extra_function><extra_function extra_function_id="{expected_id}"/></extra_function>'
+    )
     ok = fixer.precheck(sql, step, "UAT")
     assert ok.status == fixer.ALREADY_OK and not ok.authoritative
-    sql.locations["L1"] = None  # no extra functions at all
-    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
+
+
+@pytest.mark.parametrize(
+    ("check", "expected_id"),
+    [
+        ("DCCXPRESSCO_CHECK_O", "51"),
+        ("DCCXPRESSCODT_CHECK_O", "141"),
+        ("DCCXPRESSCOFALLBACK_CHECK_O", "139"),
+    ],
+)
+def test_bit1_live_apply_is_verified_by_its_extra_function_id(journal, check, expected_id):
+    step = _step(check)
+    sql = FakeSqlServer()
+    sql.locations["L1"] = "<extra_function/>"
+
+    result = fixer.run_step(
+        sql, step, simulation=False, environment="UAT", login="svc", correlation_id="bit1"
+    )
+    post = fixer.precheck(sql, step, "UAT")
+
+    assert result.status == "PASS"
+    assert f'extra_function_id="{expected_id}"' in sql.locations["L1"]
+    assert post.status == fixer.ALREADY_OK
+    assert fixer.live_outcome(result, post).verified is True
 
 
 def test_bit2_precheck_uses_the_version_code():
