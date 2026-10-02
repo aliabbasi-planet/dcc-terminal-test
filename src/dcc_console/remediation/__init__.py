@@ -129,6 +129,21 @@ class RemediationObjects:
         return f"{self.shared_fqn}.DCC_FIX_REGISTRY"
 
     @property
+    def confirmed_table(self) -> str:
+        """Profit-tracking handoff: fixes the Cortex source has confirmed as healthy.
+
+        One row per confirmed fix event ``(ENVIRONMENT, TERMINAL_IDENTIFIER, CHECK_COLUMN,
+        FIXED_AT_UTC)``, carrying the fix metadata plus the terminal's dimensions. The separate
+        financial app reads this; the operational app only writes it (see :mod:`.reconcile`).
+        """
+        return f"{self.shared_fqn}.DCC_CONFIRMED_FIXES"
+
+    @property
+    def reconcile_task(self) -> str:
+        """Daily task that confirms fixes against Cortex and fills the handoff (owner-run)."""
+        return f"{self.shared_fqn}.DCC_RECONCILE_CONFIRMED_FIXES_TASK"
+
+    @property
     def flag_reference_table(self) -> str:
         return f"{self.schema_fqn}.FLAG_REFERENCE"
 

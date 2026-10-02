@@ -36,7 +36,14 @@ def test_create_table_has_key_and_columns():
     sql = registry.create_table(OBJS)
     assert OBJS.registry_table in sql
     assert "PRIMARY KEY (ENVIRONMENT, TERMINAL_IDENTIFIER, CHECK_COLUMN)" in sql
-    for column in ("RESOLUTION", "STATUS", "SP_ROLLBACK_SCRIPT", "FIXED_AT_UTC", "CHANGE_REF"):
+    for column in (
+        "RESOLUTION",
+        "STATUS",
+        "SP_ROLLBACK_SCRIPT",
+        "FIXED_AT_UTC",
+        "CHANGE_REF",
+        "CONFIRMED_AT_UTC",
+    ):
         assert column in sql
 
 
@@ -104,4 +111,5 @@ def test_uses_the_given_shared_schema_only():
 def test_registered_terminals_query_scopes_to_prod_fixed():
     sql = registry.build_registered_terminals_query(OBJS)
     assert OBJS.registry_table in sql
-    assert "ENVIRONMENT = 'PROD'" in sql and "STATUS = 'FIXED'" in sql
+    # "Registered" spans both still-pending (FIXED) and Cortex-confirmed (CONFIRMED) fixes.
+    assert "ENVIRONMENT = 'PROD'" in sql and "STATUS IN ('FIXED', 'CONFIRMED')" in sql

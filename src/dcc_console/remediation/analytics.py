@@ -47,3 +47,21 @@ def build_flag_totals_query(objs: RemediationObjects) -> str:
         f"SELECT\n    {sums}\n"
         f"FROM {objs.v_current_broken}\nWHERE REMEDIATION_STATE = 'ACTIONABLE'"
     )
+
+
+def build_fix_activity_query(objs: RemediationObjects, days: int = 14) -> str:
+    """Daily live-applied vs rehearsed fix counts over the last ``days`` (Overview trend).
+
+    Reads the shared ``APP_FIX_LOG`` so the Overview page can show recent remediation
+    throughput, not just the standing backlog. ``days`` is clamped and inlined as an
+    integer literal (never user text); the fix-log name is a validated identifier.
+    """
+    window = max(1, min(int(days), 180))
+    return (
+        f"SELECT CAST(APPLIED_AT AS DATE) AS FIX_DATE,\n"  # noqa: S608
+        f"    COUNT_IF(MODE = 'LIVE' AND OUTCOME = 'APPLIED') AS LIVE_APPLIED,\n"
+        f"    COUNT_IF(MODE = 'SIMULATION') AS REHEARSED\n"
+        f"FROM {objs.fix_log_table}\n"
+        f"WHERE APPLIED_AT >= DATEADD('day', -{window}, CURRENT_TIMESTAMP())\n"
+        f"GROUP BY 1\nORDER BY 1"
+    )

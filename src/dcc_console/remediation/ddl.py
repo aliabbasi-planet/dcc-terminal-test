@@ -16,12 +16,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import RemediationObjects, registry
+from . import RemediationObjects, reconcile, registry
 from .mapping import FIXABLE_CHECK_COLUMNS, FLAG_FIXES, TRACKED_CHECK_COLUMNS
 
 # Tables in the user's own schema, and in the (possibly identical) shared schema.
 OWN_TABLES: tuple[str, ...] = ("FLAG_REFERENCE", "HEALTH_DAILY_SNAPSHOT")
-SHARED_TABLES: tuple[str, ...] = ("APP_FIX_LOG", "FIX_OPERATORS", "DCC_FIX_REGISTRY")
+SHARED_TABLES: tuple[str, ...] = (
+    "APP_FIX_LOG",
+    "FIX_OPERATORS",
+    "DCC_FIX_REGISTRY",
+    "DCC_CONFIRMED_FIXES",
+)
 # Columns added to APP_FIX_LOG after its first release (migrated in place).
 FIX_LOG_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("SQL_LOGIN", "VARCHAR(128)"),
@@ -32,6 +37,9 @@ FIX_LOG_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
 # added nullable so the ALTER never needs a default backfill on a non-empty table; the
 # operator check treats a missing / NULL value as FALSE (no PROD rights by default).
 OPERATORS_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (("CAN_PROD", "BOOLEAN"),)
+# Columns added to DCC_FIX_REGISTRY after its first release (migrated in place). Set when
+# the Cortex source confirms a fix and it is handed to the profit app (see :mod:`.reconcile`).
+REGISTRY_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (("CONFIRMED_AT_UTC", "TIMESTAMP_NTZ"),)
 # A column only the current V_CURRENT_BROKEN exposes; if absent, views need upgrading.
 VIEW_MARKER_COLUMN = "OPEN_FIXABLE_CHECKS"
 
@@ -145,6 +153,14 @@ def _upgrade_operators(objs: RemediationObjects) -> list[str]:
     ]
 
 
+def _upgrade_registry(objs: RemediationObjects) -> list[str]:
+    """Add columns introduced after the first release to an existing fix registry."""
+    return [
+        f"ALTER TABLE {objs.registry_table} ADD COLUMN IF NOT EXISTS {name} {ddl}"
+        for name, ddl in REGISTRY_ADDED_COLUMNS
+    ]
+
+
 def _seed_first_operator(objs: RemediationObjects) -> str:
     """Whoever initialises an empty allowlist becomes its first operator."""
     return (
@@ -164,7 +180,9 @@ def build_shared_statements(objs: RemediationObjects) -> list[str]:
         *_upgrade_operators(objs),
         _seed_first_operator(objs),
         registry.create_table(objs),
+        *_upgrade_registry(objs),
         registry.build_backfill_from_log(objs),
+        reconcile.create_confirmed_table(objs),
     ]
 
 
@@ -232,7 +250,7 @@ fixed AS (
     FROM latest l
     JOIN {objs.registry_table} g
       ON g.TERMINAL_IDENTIFIER = l.TERMINAL_IDENTIFIER
-     AND g.ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' AND g.STATUS = 'FIXED'
+     AND g.ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' AND g.STATUS IN ('FIXED', 'CONFIRMED')
      AND g.FIXED_AT_UTC > l.SOURCE_LAST_ALTERED
     GROUP BY l.TERMINAL_IDENTIFIER
 ),
@@ -286,7 +304,13 @@ SELECT
     (SELECT COUNT(DISTINCT CORRELATION_ID) FROM {objs.fix_log_table}
         WHERE {live_applied} AND NOT {prod})                          AS REHEARSAL_FIXES,
     (SELECT COUNT(*) FROM {objs.registry_table}
-        WHERE ENVIRONMENT = '{SNAPSHOT_ENVIRONMENT}' AND STATUS = 'FIXED') AS REGISTERED_FIXES,
+        WHERE {prod} AND STATUS IN ('{registry.STATUS_FIXED}', '{registry.STATUS_CONFIRMED}'))
+                                                                      AS REGISTERED_FIXES,
+    (SELECT COUNT(*) FROM {objs.registry_table}
+        WHERE {prod} AND STATUS = '{registry.STATUS_FIXED}')          AS PENDING_CONFIRMATION,
+    (SELECT COUNT(*) FROM {objs.registry_table}
+        WHERE {prod} AND STATUS = '{registry.STATUS_CONFIRMED}')      AS CONFIRMED_FIXES,
+    (SELECT COUNT(*) FROM {objs.confirmed_table})                     AS HANDED_OFF_FIXES,
     (SELECT MAX(SNAPSHOT_DATE) FROM {objs.snapshot_table})            AS LATEST_SNAPSHOT_DATE"""
 
 
@@ -361,6 +385,7 @@ def build_objects_present_query(objs: RemediationObjects) -> str:
     """One row describing which objects exist (own tables, shared tables, upgrades)."""
     added = tuple(name for name, _ in FIX_LOG_ADDED_COLUMNS)
     operator_added = tuple(name for name, _ in OPERATORS_ADDED_COLUMNS)
+    registry_added = tuple(name for name, _ in REGISTRY_ADDED_COLUMNS)
     return f"""SELECT
     (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.TABLES
       WHERE TABLE_SCHEMA = '{objs.schema.upper()}'
@@ -374,6 +399,9 @@ def build_objects_present_query(objs: RemediationObjects) -> str:
     (SELECT COUNT(*) FROM {objs.shared_database}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '{objs.shared_schema.upper()}' AND TABLE_NAME = 'FIX_OPERATORS'
         AND COLUMN_NAME IN ({_in_list(operator_added)}))            AS OPERATOR_COLUMNS,
+    (SELECT COUNT(*) FROM {objs.shared_database}.INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = '{objs.shared_schema.upper()}' AND TABLE_NAME = 'DCC_FIX_REGISTRY'
+        AND COLUMN_NAME IN ({_in_list(registry_added)}))            AS REGISTRY_COLUMNS,
     (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '{objs.schema.upper()}' AND TABLE_NAME = 'V_CURRENT_BROKEN'
         AND COLUMN_NAME = '{VIEW_MARKER_COLUMN}')                     AS VIEW_CURRENT"""
@@ -403,6 +431,7 @@ def schema_status(row: dict) -> SchemaStatus:
         count("SHARED_TABLES") >= len(SHARED_TABLES)
         and count("FIX_LOG_COLUMNS") >= len(FIX_LOG_ADDED_COLUMNS)
         and count("OPERATOR_COLUMNS") >= len(OPERATORS_ADDED_COLUMNS)
+        and count("REGISTRY_COLUMNS") >= len(REGISTRY_ADDED_COLUMNS)
     )
     views = count("VIEW_CURRENT") >= 1
     missing = []
