@@ -51,7 +51,7 @@ def _step(check: str, **row_overrides) -> fixer.FixStep:
 # --------------------------------------------------------------------------- #
 
 _FLAG = re.compile(r'config_name="(?P<name>[^"]+)" config_value="(?P<value>[^"]*)"')
-_BIT1_EXTRA_FUNCTION_IDS = {
+_EXTRA_FUNCTION_CATALOG = {
     "DCCXpressCO": "51",
     "DCCXpressCODT": "141",
     "DCCXpressCOFallback": "139",
@@ -74,12 +74,20 @@ class FakeSqlServer:
         self.handlers: dict[str, list[dict]] = {}
         self.calls: list[tuple[tuple, bool]] = []
         self.fail_reads = False
+        self.fail_extra_function_lookup = False
+        self.extra_function_ids = dict(_EXTRA_FUNCTION_CATALOG)
 
     # -- reads -----------------------------------------------------------------
     def scalar(self, sql: str, params=()):
         if self.fail_reads:
             raise RuntimeError("read failed")
         key = params[0]
+        if "FROM [ccc].[extra_function]" in sql:
+            assert "extra_function_name = ?" in sql
+            assert "ccc_config = 1" in sql
+            if self.fail_extra_function_lookup:
+                raise RuntimeError("catalog lookup failed")
+            return self.extra_function_ids.get(key)
         if "COUNT(*)" in sql:
             assert "is_deleted" in sql  # deleted rows must not count as existing
             if "[emv_terminal]" in sql:
@@ -117,7 +125,7 @@ class FakeSqlServer:
         elif bit == 1:
             assert params[3] == 1, "a fix must ADD the function"
             current = self.locations[target] or ""
-            function_id = _BIT1_EXTRA_FUNCTION_IDS[params[2]]
+            function_id = self.extra_function_ids[params[2]]
             self.locations[target] = (
                 f"<extra_function>{current}"
                 f'<extra_function extra_function_id="{function_id}"/>'
@@ -277,6 +285,35 @@ def test_bit1_precheck_matches_only_the_configured_extra_function_id(
     )
     ok = fixer.precheck(sql, step, "UAT")
     assert ok.status == fixer.ALREADY_OK and not ok.authoritative
+
+
+def test_bit1_precheck_uses_id_resolved_from_connected_environment():
+    step = _step("DCCXPRESSCO_CHECK_O")
+    sql = FakeSqlServer()
+    sql.extra_function_ids["DCCXpressCO"] = "777"
+    sql.locations["L1"] = (
+        '<extra_function><extra_function extra_function_id="777"/></extra_function>'
+    )
+
+    result = fixer.precheck(sql, step, "UAT")
+
+    assert result.status == fixer.ALREADY_OK
+
+
+def test_bit1_precheck_fails_closed_if_catalog_entry_is_missing_or_unreadable():
+    step = _step("DCCXPRESSCO_CHECK_O")
+    sql = FakeSqlServer()
+    sql.locations["L1"] = "<extra_function/>"
+    sql.extra_function_ids.pop("DCCXpressCO")
+    missing = fixer.precheck(sql, step, "UAT")
+    assert missing.status == fixer.UNKNOWN
+    assert "not configured" in missing.detail
+
+    sql.extra_function_ids["DCCXpressCO"] = "51"
+    sql.fail_extra_function_lookup = True
+    failed_read = fixer.precheck(sql, step, "UAT")
+    assert failed_read.status == fixer.UNKNOWN
+    assert "Could not resolve" in failed_read.detail
 
 
 @pytest.mark.parametrize(

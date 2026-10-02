@@ -44,11 +44,6 @@ PROD_ENVIRONMENT = "PROD"
 FRESHNESS_S = 15 * 60
 # Bit 2 version codes, per the catalogue's documented mapping (1 Standard, 2 ECB DCC).
 _CONFIG_DOWNLOAD_CODES = {"Standard": "1", "ECB DCC": "2"}
-_BIT1_EXTRA_FUNCTION_IDS = {
-    "DCCXpressCO": "51",
-    "DCCXpressCODT": "141",
-    "DCCXpressCOFallback": "139",
-}
 # Fix-log column widths that must not be exceeded.
 _VALUE_SENT_MAX = 120
 _STATE_MAX = 16000
@@ -257,12 +252,23 @@ def _token(name: str) -> re.Pattern:
     return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
 
 
-def _has_bit1_extra_function(document: object, function: str) -> bool:
-    """Check the exact location extra_function_id assigned to a Bit 1 function."""
-    expected_id = _BIT1_EXTRA_FUNCTION_IDS.get(function)
-    if document is None or expected_id is None:
+def _read_bit1_extra_function_id(connection, function: str) -> tuple[bool, object]:
+    """Resolve the Bit 1 function ID from the connected environment's catalog."""
+    sql = (
+        "SELECT TOP (1) extra_function_id FROM [ccc].[extra_function] "
+        "WHERE extra_function_name = ? AND ccc_config = 1"
+    )
+    try:
+        return True, connection.scalar(sql, (function,))
+    except Exception:
+        return False, None
+
+
+def _has_bit1_extra_function(document: object, function_id: object) -> bool:
+    """Check whether a location XML contains the resolved extra_function_id."""
+    if document is None or function_id is None:
         return False
-    attribute = rf"\bextra_function_id\s*=\s*[\"']{re.escape(expected_id)}[\"']"
+    attribute = rf"\bextra_function_id\s*=\s*[\"']{re.escape(str(function_id).strip())}[\"']"
     return re.search(attribute, str(document)) is not None
 
 
@@ -364,10 +370,23 @@ def precheck(connection, step: FixStep, environment: str) -> Precheck:
 
     if bit == 1:
         function = definition.function_name or ""
+        lookup_ok, function_id = _read_bit1_extra_function_id(connection, function)
+        if not lookup_ok:
+            return verdict(
+                UNKNOWN,
+                None,
+                f"Could not resolve {function} in [ccc].[extra_function] for {environment}.",
+            )
+        if function_id is None:
+            return verdict(
+                UNKNOWN,
+                None,
+                f"{function} is not configured in [ccc].[extra_function] for {environment}.",
+            )
         ok, document = _read_value(connection, definition, target)
         if not ok:
             return verdict(UNKNOWN, None, "Could not read the location's extra_function.")
-        if _has_bit1_extra_function(document, function):
+        if _has_bit1_extra_function(document, function_id):
             return verdict(
                 ALREADY_OK,
                 document,
