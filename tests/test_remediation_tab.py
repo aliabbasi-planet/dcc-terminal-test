@@ -86,9 +86,10 @@ class FakeSnowflake:
                 [
                     {
                         "OWN_TABLES": 2 * full,
-                        "SHARED_TABLES": 3 * full,
+                        "SHARED_TABLES": 4 * full,
                         "FIX_LOG_COLUMNS": 3 * full,
                         "OPERATOR_COLUMNS": int(full),
+                        "REGISTRY_COLUMNS": int(full),
                         "VIEW_CURRENT": int(full),
                     }
                 ]
@@ -105,7 +106,21 @@ class FakeSnowflake:
                         "UNIQUE_TERMINALS_FIXED": 0,
                         "REHEARSAL_FIXES": 0,
                         "REGISTERED_FIXES": 0,
+                        "PENDING_CONFIRMATION": 0,
+                        "CONFIRMED_FIXES": 0,
+                        "HANDED_OFF_FIXES": 0,
                         "LATEST_SNAPSHOT_DATE": date(2026, 9, 28) if self.loaded else None,
+                    }
+                ]
+            )
+        if "PENDING_CONFIRMATION" in sql:  # reconcile panel summary
+            return pd.DataFrame(
+                [
+                    {
+                        "PENDING_CONFIRMATION": 0,
+                        "CONFIRMED_IN_REGISTRY": 0,
+                        "HANDED_OFF": 0,
+                        "LAST_CONFIRMED_AT_UTC": None,
                     }
                 ]
             )
@@ -119,6 +134,8 @@ class FakeSnowflake:
                     }
                 ]
             )
+        if "FIX_DATE" in sql:  # Overview fix-activity trend
+            return pd.DataFrame(columns=["FIX_DATE", "LIVE_APPLIED", "REHEARSED"])
         if "SUM(" in sql:
             # SUM over zero rows is NULL in Snowflake, not 0.
             totals = {
@@ -247,6 +264,7 @@ def _fixer_state(env: str, sql: FakeSql, tid: str = "T-9", armed: bool = False) 
         "connected_env": env,
         "connected_login": "svc",
         "rem_selected_terminal": tid,
+        "rem_page": "Single fix",
         "_test_armed": armed,
     }
 
@@ -260,18 +278,24 @@ def _reviewed_checkbox(at: AppTest):
 # --------------------------------------------------------------------------- #
 
 
-def test_connected_tab_renders_beside_sidebar_disconnect():
-    at = _render(FakeSnowflake())
+def test_overview_page_shows_kpis_beside_sidebar_disconnect():
+    at = _render(FakeSnowflake())  # Overview is the default page
 
     assert _problems(at) == []
     assert at.button(key="rem_sf_disconnect").label == "Disconnect"
     assert at.metric[0].value == "12,654"
+
+
+def test_single_page_shows_worklist_and_fixer_prompt():
+    at = _render(FakeSnowflake(), rem_page="Single fix")
+
+    assert _problems(at) == []
     assert len(at.dataframe) == 1
     assert any("Select a terminal" in info.value for info in at.info)
 
 
 def test_empty_snapshot_renders_without_errors():
-    at = _render(FakeSnowflake(loaded=False))
+    at = _render(FakeSnowflake(loaded=False), rem_page="Single fix")
 
     assert _problems(at) == []
     assert any("No terminals match" in info.value for info in at.info)
@@ -321,6 +345,21 @@ def test_initialise_creates_the_shared_log_before_the_views():
     view_at = next(i for i, s in enumerate(statements) if "V_CURRENT_BROKEN AS" in s)
     assert log_at < view_at
     assert any("FIX_OPERATORS" in s for s in statements)
+
+
+def test_reconcile_button_runs_the_confirmation_handoff():
+    fake = FakeSnowflake()
+    at = _render(fake)
+
+    assert _problems(at) == []
+    assert at.button(key="rem_reconcile").label == "Reconcile confirmed fixes now"
+    at.button(key="rem_reconcile").click().run()
+
+    assert _problems(at) == []
+    block = next(s for s, _ in fake.writes if "DCC_CONFIRMED_FIXES" in s)
+    assert "EXECUTE IMMEDIATE" in block and "MERGE INTO" in block
+    assert "SET STATUS = 'CONFIRMED'" in block  # also flips the registry rows
+    assert any("Reconcile complete" in s.value for s in at.success)
 
 
 # --------------------------------------------------------------------------- #
@@ -444,3 +483,46 @@ def test_failed_fix_log_write_is_queued_and_retried():
     at.button(key="rem_retry_logs").click().run()
     assert at.session_state["rem_pending_logs"] == []
     assert [r["OUTCOME"] for r in snow.fix_log_rows()] == ["SIMULATED", "SIMULATED"]
+
+
+# --------------------------------------------------------------------------- #
+# the batch fixer
+# --------------------------------------------------------------------------- #
+
+
+def _batch_state(env: str, sql: FakeSql, armed: bool = False) -> dict:
+    return {
+        "connection": sql,
+        "connected_env": env,
+        "connected_login": "svc",
+        "rem_page": "Batch fix",
+        "_test_armed": armed,
+    }
+
+
+def test_batch_page_plans_and_rehearses_dry_runs_for_the_selection():
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    sql = FakeSql()
+    at = _render(snow, **_batch_state("UAT", sql))
+
+    assert _problems(at) == []
+    assert any(m.label == "Fixes to run" and m.value == "1" for m in at.metric)
+    assert at.button(key="rem_batch_run").label == "Rehearse 1 fix(es)"
+
+    at.button(key="rem_batch_run").click().run()
+    assert _problems(at) == []
+    # A rehearse is a dry run only: the SP was called once and rolled back, logged SIMULATED.
+    assert [rollback for _, rollback in sql.calls] == [True]
+    assert [(r["MODE"], r["OUTCOME"]) for r in snow.fix_log_rows()] == [("SIMULATION", "SIMULATED")]
+    assert sql.version == "1"  # nothing applied live
+
+
+def test_batch_prod_apply_is_blocked_without_approval_and_change_ref():
+    snow = FakeSnowflake(rows=[_bit2_row()], can_prod=False)
+    at = _render(snow, **_batch_state("PROD", FakeSql(), armed=True))
+
+    at.radio(key="rem_batch_mode").set_value("Apply live").run()
+    assert _problems(at) == []
+    assert at.button(key="rem_batch_run").disabled
+    blockers = " ".join(c.value for c in at.caption)
+    assert "PROD-approved" in blockers and "change/CAB reference" in blockers

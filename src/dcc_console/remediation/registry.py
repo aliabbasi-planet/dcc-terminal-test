@@ -60,9 +60,12 @@ _KEY: tuple[str, ...] = ("ENVIRONMENT", "TERMINAL_IDENTIFIER", "CHECK_COLUMN")
 # that proved the check already satisfied in production (nothing to undo).
 VALID_RESOLUTIONS: tuple[str, ...] = ("APPLIED", "ALREADY_OK")
 
-# The registry only ever holds current (FIXED) rows; a rollback deletes rather than
-# flips the status, so the worklist re-opens the check immediately.
-_STATUS = "FIXED"
+# A registered fix is FIXED until the Cortex source confirms it (then CONFIRMED, kept for
+# history — see :mod:`.reconcile`). A rollback deletes the row rather than flipping status,
+# so the worklist re-opens the check immediately.
+STATUS_FIXED = "FIXED"
+STATUS_CONFIRMED = "CONFIRMED"
+_STATUS = STATUS_FIXED
 _FIXED_AT = "CURRENT_TIMESTAMP()"
 _FIXED_AT_UTC = "CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP())::TIMESTAMP_NTZ"
 
@@ -88,6 +91,7 @@ def create_table(objs: RemediationObjects) -> str:
     FIXED_BY             VARCHAR(150),
     FIXED_AT             TIMESTAMP_LTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(),
     FIXED_AT_UTC         TIMESTAMP_NTZ NOT NULL,
+    CONFIRMED_AT_UTC     TIMESTAMP_NTZ,
     PRIMARY KEY (ENVIRONMENT, TERMINAL_IDENTIFIER, CHECK_COLUMN)
 )"""
 
@@ -213,5 +217,5 @@ def build_registered_terminals_query(objs: RemediationObjects) -> str:
         f"SELECT COUNT(*) AS REGISTERED_CHECKS,\n"  # noqa: S608
         f"       COUNT(DISTINCT TERMINAL_IDENTIFIER) AS REGISTERED_TERMINALS\n"
         f"FROM {objs.registry_table}\n"
-        f"WHERE ENVIRONMENT = 'PROD' AND STATUS = '{_STATUS}'"
+        f"WHERE ENVIRONMENT = 'PROD' AND STATUS IN ('{STATUS_FIXED}', '{STATUS_CONFIRMED}')"
     )

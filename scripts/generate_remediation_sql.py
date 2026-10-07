@@ -14,10 +14,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from dcc_console.remediation import RemediationObjects, ddl, snapshot
+from dcc_console.remediation import RemediationObjects, ddl, reconcile, snapshot
 
 _OBJS = RemediationObjects("DEV_CORE_AAB")
 _OUT = Path(__file__).resolve().parents[1] / "sql" / "remediation"
+# Warehouse the reviewable reconcile task runs on (edit before installing in another account).
+_TASK_WAREHOUSE = "DATA_SCIENCE"
 
 
 def _header(title: str, builder: str) -> str:
@@ -56,6 +58,23 @@ def main() -> None:
         "003_refresh_snapshot.sql",
         _header(f"Refresh {_OBJS.snapshot_table}", "snapshot.py (build_refresh_merge())"),
         snapshot.build_refresh_merge(_OBJS) + ";",
+    )
+    reconcile_body = (
+        reconcile.create_confirmed_table(_OBJS) + ";\n\n"
+        + "-- Confirm fixes vs Cortex and hand them to the profit table (run by the app button).\n"
+        + reconcile.build_reconcile_block(_OBJS) + ";\n\n"
+        + "-- Optional daily automation. Needs EXECUTE TASK on the account for the task owner\n"
+        + "-- and SELECT on the Cortex source; see docs/plan_dcc_remediation.md runbook.\n"
+        + reconcile.build_reconcile_task(_OBJS, _TASK_WAREHOUSE) + "\n\n"
+        + reconcile.build_task_resume(_OBJS) + ";"
+    )
+    _write(
+        "004_reconcile.sql",
+        _header(
+            f"Confirm fixes + profit handoff for {_OBJS.confirmed_table}",
+            "reconcile.py (create_confirmed_table / build_reconcile_block / build_reconcile_task)",
+        ),
+        reconcile_body,
     )
 
 

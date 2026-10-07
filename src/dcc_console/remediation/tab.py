@@ -24,12 +24,16 @@ from . import (
     DEFAULT_SHARED_SCHEMA,
     MAINTENANCE_SOURCE,
     RemediationObjects,
+    agent_panel,
+    batch_panel,
     ddl,
     fix_panel,
     fixer,
     parse_schema_fqn,
+    writes,
 )
 from . import analytics as an
+from . import reconcile as rec
 from . import snapshot as snap
 from . import worklist as wl
 from .mapping import DIMENSION_COLUMNS, FIXABLE_CHECK_COLUMNS, TRACKED_CHECK_COLUMNS
@@ -220,13 +224,14 @@ def _render_kpis(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
         value = row.get(column)
         return f"{int(value or 0):,}"
 
-    cols = st.columns(6)
+    cols = st.columns(7)
     cols[0].metric("Actionable broken", count("BROKEN_ACTIONABLE"))
     cols[1].metric("Awaiting refresh", count("AWAITING_REFRESH"))
     cols[2].metric("Live fixes · PROD", count("TOTAL_LIVE_FIXES"))
     cols[3].metric("Registered · PROD", count("REGISTERED_FIXES"))
-    cols[4].metric("Rehearsals · UAT/DEV", count("REHEARSAL_FIXES"))
-    cols[5].metric("Latest snapshot", str(row.get("LATEST_SNAPSHOT_DATE") or "—"))
+    cols[4].metric("Confirmed · PROD", count("CONFIRMED_FIXES"))
+    cols[5].metric("Rehearsals · UAT/DEV", count("REHEARSAL_FIXES"))
+    cols[6].metric("Latest snapshot", str(row.get("LATEST_SNAPSHOT_DATE") or "—"))
 
 
 def _render_refresh(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
@@ -241,6 +246,39 @@ def _render_refresh(conn: SnowflakeConnection, objs: RemediationObjects) -> None
                 _flash("success", "Snapshot refreshed.")
             except Exception as exc:
                 _flash("error", f"Refresh failed: {exc}")
+        st.rerun()
+
+
+def _render_reconcile(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
+    """Confirm registered PROD fixes against Cortex and hand confirmed ones to the profit app."""
+    st.caption(
+        "Confirm fixes against the Cortex source: when a registered PROD fix shows healthy there "
+        "(and the source reloaded after the fix), it is handed off to the profit table "
+        f"`{objs.confirmed_table}` and kept as CONFIRMED. Runs daily; run it now too."
+    )
+    df, error = _run(conn, rec.build_pending_summary_query(objs))
+    if error:
+        st.info("Confirmation summary unavailable — initialise the schema first.")
+    elif df is not None and not df.empty:
+        row = df.iloc[0]
+
+        def count(column: str) -> str:
+            return f"{int(row.get(column) or 0):,}"
+
+        cols = st.columns(3)
+        cols[0].metric("Pending confirmation", count("PENDING_CONFIRMATION"))
+        cols[1].metric("Confirmed (registry)", count("CONFIRMED_IN_REGISTRY"))
+        cols[2].metric("Handed off to profit", count("HANDED_OFF"))
+    if st.button("Reconcile confirmed fixes now", use_container_width=True, key="rem_reconcile"):
+        with st.spinner("Confirming fixes against the Cortex source..."):
+            try:
+                conn.execute(rec.build_reconcile_block(objs))
+                _flash(
+                    "success",
+                    "Reconcile complete — confirmed fixes were handed off to the profit table.",
+                )
+            except Exception as exc:
+                _flash("error", f"Reconcile failed: {exc}")
         st.rerun()
 
 
@@ -266,6 +304,17 @@ def _render_analytics(conn: SnowflakeConnection, objs: RemediationObjects) -> No
         st.bar_chart(dim_df.set_index("CATEGORY"))
 
 
+def _render_activity(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
+    """Recent remediation throughput (last 14 days) from the shared fix log."""
+    df, error = _run(conn, an.build_fix_activity_query(objs))
+    if error or df is None or df.empty:
+        st.caption("No fix activity logged in the last 14 days.")
+        return
+    st.caption("Fix activity — live applied vs rehearsed (last 14 days)")
+    chart = df.rename(columns={"FIX_DATE": "date"}).set_index("date")
+    st.bar_chart(chart[[c for c in ("LIVE_APPLIED", "REHEARSED") if c in chart.columns]])
+
+
 def _distinct_values(conn: SnowflakeConnection, column: str, objs: RemediationObjects) -> list[str]:
     df, error = _run(conn, wl.build_distinct_values_query(column, objs))
     if error or df is None or df.empty:
@@ -273,48 +322,57 @@ def _distinct_values(conn: SnowflakeConnection, column: str, objs: RemediationOb
     return [str(v) for v in df["VALUE"].tolist()]
 
 
-def _render_worklist(conn: SnowflakeConnection, objs: RemediationObjects) -> pd.DataFrame | None:
-    """Filters + the selectable worklist grid; returns the rows shown (or None)."""
-    st.subheader("Worklist")
-    st.caption("Click a row to open it in the fixer below.")
+def _render_filters(
+    conn: SnowflakeConnection, objs: RemediationObjects, *, key_prefix: str
+) -> wl.WorklistFilters:
+    """Shared worklist filters (used by both the Single-fix and Batch-fix pages)."""
     top = st.columns(3)
     state = top[0].selectbox(
-        "State", ["ACTIONABLE", "AWAITING_REFRESH", "(all)"], index=0, key="rem_state"
+        "State", ["ACTIONABLE", "AWAITING_REFRESH", "(all)"], index=0, key=f"{key_prefix}_state"
     )
-    fixable_only = top[1].checkbox("Fixable checks only", value=True, key="rem_fixable_only")
+    fixable_only = top[1].checkbox(
+        "Fixable checks only", value=True, key=f"{key_prefix}_fixable_only"
+    )
     limit = int(
         top[2].number_input(
-            "Max rows", min_value=50, max_value=5000, value=500, step=50, key="rem_max_rows"
+            "Max rows",
+            min_value=50,
+            max_value=5000,
+            value=500,
+            step=50,
+            key=f"{key_prefix}_max_rows",
         )
     )
-
     dimensions: dict[str, tuple[str, ...]] = {}
     dim_cols = st.columns(len(_FILTER_DIMS))
     for idx, column in enumerate(_FILTER_DIMS):
         chosen = dim_cols[idx].multiselect(
             column.replace("_", " ").title(),
             _distinct_values(conn, column, objs),
-            key=f"rem_dim_{column}",
+            key=f"{key_prefix}_dim_{column}",
         )
         if chosen:
             dimensions[column] = tuple(chosen)
-
     check_pool = FIXABLE_CHECK_COLUMNS if fixable_only else TRACKED_CHECK_COLUMNS
-    checks = st.multiselect("Broken on check(s)", check_pool, key="rem_checks")
-
-    filters = wl.WorklistFilters(
+    checks = st.multiselect("Broken on check(s)", check_pool, key=f"{key_prefix}_checks")
+    return wl.WorklistFilters(
         remediation_state=None if state == "(all)" else state,
         dimensions=dimensions,
         check_columns=tuple(checks),
         fixable_only=fixable_only,
         limit=limit,
     )
+
+
+def _run_worklist(
+    conn: SnowflakeConnection, objs: RemediationObjects, filters: wl.WorklistFilters
+) -> pd.DataFrame | None:
+    """Run the worklist query for ``filters``; returns the rows (or None on empty/error)."""
     try:
         sql, params = wl.build_worklist_query(filters, objs)
     except ValueError as exc:
         st.error(str(exc))
         return None
-
     df, error = _run(conn, sql, params)
     if error:
         st.error(f"Could not read worklist: {error}")
@@ -322,7 +380,14 @@ def _render_worklist(conn: SnowflakeConnection, objs: RemediationObjects) -> pd.
     if df is None or df.empty:
         st.info("No terminals match the current filters.")
         return None
-    st.caption(f"{len(df):,} terminal(s) shown")
+    return df
+
+
+def _render_worklist_grid(
+    conn: SnowflakeConnection, objs: RemediationObjects, df: pd.DataFrame
+) -> pd.DataFrame:
+    """Selectable grid + CSV download for the Single-fix page; sets the fixer selection."""
+    st.caption(f"{len(df):,} terminal(s) shown — click a row to open it in the fixer below.")
     view = df.copy()
     view.insert(1, "BROKEN_CHECKS", [fixer.describe_checks(r) for r in df.to_dict("records")])
     event = st.dataframe(
@@ -382,18 +447,61 @@ def _render_fixer(
         )
 
 
+_PAGE_KEY = "rem_page"
+_PAGES = ("Overview", "Single fix", "Batch fix")
+
+
+def _render_overview(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
+    """Main page: insightful fleet statistics, recent activity, handoff, and the agent."""
+    st.caption("Fleet health, recent activity, and the daily fix-confirmation handoff.")
+    _render_kpis(conn, objs)
+    with st.container(border=True):
+        _render_refresh(conn, objs)
+        st.divider()
+        _render_reconcile(conn, objs)
+    st.divider()
+    _render_analytics(conn, objs)
+    _render_activity(conn, objs)
+    st.divider()
+    agent_panel.render_account_agent(conn, context_key="overview", expanded=True)
+
+
+def _render_single(conn: SnowflakeConnection, objs: RemediationObjects, armed_live: bool) -> None:
+    """Single-fix page: filter + selectable worklist + the one-by-one fixer."""
+    st.caption(
+        "Fix one terminal at a time: pre-check → dry run → apply live (DEV/UAT, or PROD "
+        "behind the change-reference gate) → verify → logged → registered."
+    )
+    filters = _render_filters(conn, objs, key_prefix="rem")
+    df = _run_worklist(conn, objs, filters)
+    worklist = _render_worklist_grid(conn, objs, df) if df is not None else None
+    st.divider()
+    _render_fixer(conn, objs, worklist, armed_live)
+    if not st.session_state.get(fix_panel.SELECTED_KEY):
+        agent_panel.render_account_agent(conn, context_key="single")
+
+
+def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_live: bool) -> None:
+    """Batch-fix page: filter + select terminals + fix every broken check they have."""
+    st.caption(
+        "Fix many terminals at once: filter, choose terminals, and apply every fixable broken "
+        "check they have — not only the check you filtered on. Every attempt is logged."
+    )
+    filters = _render_filters(conn, objs, key_prefix="rembatch")
+    df = _run_worklist(conn, objs, filters)
+    batch_panel.render_batch_panel(conn, objs, df, armed_live=armed_live)
+
+
 def render_remediation(armed_live: bool = False) -> None:
-    """Entry point wired into the console's tab strip.
+    """Entry point wired into the console's tab strip / PROD-streamlined layout.
 
     ``armed_live`` is the console's own Mode control: Live selected, the environment
     name typed, and the readiness probes passed. Apply live needs it (and much more).
+
+    The experience is split into three pages — **Overview** (statistics + agent),
+    **Single fix** and **Batch fix** — with the DCC maintenance agent on each.
     """
     st.subheader("DCC Remediation")
-    st.caption(
-        "Identify broken terminals from the Snowflake daily snapshot, then fix them one "
-        "check at a time: pre-check → dry run → apply live (DEV/UAT, or PROD behind the "
-        "change-reference gate) → verify → logged → registered."
-    )
     _show_flash()
     _render_connection_panel()
 
@@ -408,20 +516,23 @@ def render_remediation(armed_live: bool = False) -> None:
         st.error(f"Invalid database/schema: {exc}")
         return
 
-    fix_panel.render_pending_logs(conn)
+    writes.render_pending_logs(conn)
     with st.container(border=True):
         ready = _render_init(conn, objs)
     if not ready:  # every read below needs the schema; don't cascade errors
         return
-    with st.container(border=True):
-        _render_kpis(conn, objs)
-        _render_refresh(conn, objs)
-    st.divider()
-    _render_analytics(conn, objs)
-    st.divider()
-    worklist = _render_worklist(conn, objs)
-    st.divider()
-    _render_fixer(conn, objs, worklist, armed_live)
+
+    st.session_state.setdefault(_PAGE_KEY, _PAGES[0])
+    page = st.radio(
+        "Section", _PAGES, horizontal=True, key=_PAGE_KEY, label_visibility="collapsed"
+    )
+    if page == "Single fix":
+        _render_single(conn, objs, armed_live)
+    elif page == "Batch fix":
+        _render_batch(conn, objs, armed_live)
+    else:
+        _render_overview(conn, objs)
+
     st.caption(
         f"Every attempt is logged to the shared `{objs.fix_log_table}`; only PROD outcomes "
         "change the worklist. Live-fix operators are listed in "

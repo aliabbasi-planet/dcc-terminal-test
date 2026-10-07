@@ -482,3 +482,126 @@ GRANT USAGE ON CORTEX AGENT PROD_PRESENTATION.CORTEX.DCC_TERMINAL_MAINTENANCE_AG
   `CAN_PROD`/`CHANGE_REF` and rebuild the views; then rehearse one target per bit on UAT,
   and one gated PROD dry-run, before the first real PROD apply.
 - Two-person PROD approval and an agent-reachability probe are possible follow-ups.
+
+## 17. Daily fix confirmation + profit handoff (2026-10-02)
+
+The operational app records a verified fix immediately (registry `STATUS='FIXED'`), before
+the Cortex source has caught up. This iteration adds the next step the business asked for:
+once the Cortex maintenance table reflects the fix as healthy, **confirm** it and hand it to
+the separate financial / profit-tracking app, while keeping the operational and analytical
+apps decoupled.
+
+### Decisions (recorded)
+| Question | Decision |
+|---|---|
+| Where confirmed fixes go | **A new table we own**, `DEV_CORE_AAB.DCC_REMEDIATION.DCC_CONFIRMED_FIXES`, read by the financial app. We never write that app's `PUBLIC` tables. |
+| When a fix counts as confirmed | **First Cortex load that reflects it healthy** — source `LAST_ALTERED` (UTC) newer than the fix *and* the check no longer broken. |
+| Registry row on confirm | **Kept, flipped to `STATUS='CONFIRMED'`** (not deleted); audit stays in `APP_FIX_LOG`. |
+| How it runs | **App button + daily task** (`DCC_RECONCILE_CONFIRMED_FIXES_TASK`). |
+
+### The reconcile (per registry PROD/FIXED row)
+1. Scan `PROD_PRESENTATION.CORTEX.CORTEX_TERMINAL_MAINTENANCE` to terminal grain (same
+   `BASE = 1 AND COALESCE(CHECK, 1) = 1` rule as the snapshot), restricted to registry
+   terminals.
+2. **Confirm** when `SRC_LOADED_UTC > FIXED_AT_UTC` **and** the row's `CHECK_COLUMN` is no
+   longer broken (resolved by a `CASE` generated from `mapping.FLAG_FIXES`).
+3. **MERGE** confirmed rows into `DCC_CONFIRMED_FIXES` (keyed on the fix event
+   `ENVIRONMENT, TERMINAL_IDENTIFIER, CHECK_COLUMN, FIXED_AT_UTC`, so re-runs never
+   duplicate and a later re-fix is a new row), carrying the fix metadata + the terminal's
+   dimensions + the config/check fixed.
+4. **UPDATE** those registry rows to `STATUS='CONFIRMED'`. Both steps run in one atomic
+   `EXECUTE IMMEDIATE` block (button) or the task body.
+
+A terminal that re-breaks later re-surfaces in the worklist automatically (the view's
+freshness guard already compares `FIXED_AT_UTC` to the newer `SOURCE_LAST_ALTERED`); the
+financial app models the re-break as a new episode.
+
+### Schema changes (idempotent; applied by "Initialise / verify my schema")
+- New shared table `DCC_CONFIRMED_FIXES` (`reconcile.create_confirmed_table`).
+- `DCC_FIX_REGISTRY` gains `CONFIRMED_AT_UTC`; `STATUS` now spans `FIXED`/`CONFIRMED`; the
+  worklist view's registry join widened to `STATUS IN ('FIXED','CONFIRMED')`.
+- `V_REMEDIATION_KPIS` adds `PENDING_CONFIRMATION`, `CONFIRMED_FIXES`, `HANDED_OFF_FIXES`;
+  readiness checks the handoff table + `CONFIRMED_AT_UTC`.
+- Reviewable SQL regenerated: `sql/remediation/001_schema.sql` + new `004_reconcile.sql`
+  (confirmed table, reconcile block, optional task). Builders in `remediation/reconcile.py`;
+  tests in `tests/test_remediation_reconcile.py` (331 tests pass, ruff clean).
+
+### Boundary with the financial app
+- The financial app (Streamlit `DEV_CORE_AAB.PUBLIC.DCC_TERMINAL_PROFIT_TRACKING`, tables
+  `DCC_FIX_EPISODES` / `DCC_FIX_EPISODE_PROFIT` / `DCC_FIX_PROFIT_SUMMARY`) already infers
+  fix episodes from Cortex history + revenue. `DCC_CONFIRMED_FIXES` is the clean handoff it
+  can join to **attribute profit to app-driven, confirmed fixes** (operator, change ref,
+  bit, correlation). Pointing that app at the table + granting it `SELECT` is its own change.
+
+### Runbook — daily automation (optional; owner-run)
+```sql
+-- The task owner (shared-schema owner, e.g. SCH_FULL_DEV_AAB) needs, from an admin:
+GRANT EXECUTE TASK ON ACCOUNT TO ROLE SCH_FULL_DEV_AAB;
+-- and SELECT on the Cortex source so the task body can read it as its owner:
+-- (granted by the source owner) GRANT SELECT ON PROD_PRESENTATION.CORTEX.CORTEX_TERMINAL_MAINTENANCE ...
+-- Then create + resume the task (see sql/remediation/004_reconcile.sql):
+--   CREATE TASK ... SCHEDULE = 'USING CRON 30 6 * * * UTC' AS <reconcile block>;
+--   ALTER TASK ... RESUME;
+-- Grant the financial app's role read on the handoff:
+GRANT SELECT ON TABLE DEV_CORE_AAB.DCC_REMEDIATION.DCC_CONFIRMED_FIXES TO ROLE <PROFIT_APP_ROLE>;
+```
+The **"Reconcile confirmed fixes now"** button works today for an operator connected with a
+role that can read the Cortex source and write the shared schema — no account grant needed.
+
+### Still open (this iteration)
+- Live schema upgrade not yet run from here: click "Initialise / verify my schema" (or run
+  `001_schema.sql`) to add `DCC_CONFIRMED_FIXES` + `CONFIRMED_AT_UTC` and rebuild the views.
+- Installing/scheduling the daily task needs the `EXECUTE TASK` grant above; until then use
+  the button. A "fix didn't hold after N days" alert is a possible follow-up.
+
+## 18. UI/UX restructure — pages, batch fixes, agent everywhere (2026-10-02)
+
+The remediation experience was a single long scroll. This iteration splits it into **three
+pages**, adds a **batch fixer**, puts the **Cortex agent on every page**, and — on a **PROD
+login** — streamlines the console to the remediation pages only. No new Snowflake objects:
+batch reuses `APP_FIX_LOG` + `DCC_FIX_REGISTRY`.
+
+### Decisions (recorded)
+| Question | Decision |
+|---|---|
+| How "pages" are built | In-app nav (`st.radio`, horizontal) switching **Overview / Single fix / Batch fix** inside `render_remediation`. (`st.segmented_control` is prettier but crashes the Streamlit 1.40.2 `AppTest` harness, so it is not used.) |
+| What PROD login hides | On `connected_env == "PROD"` the console shows **only** DCC Remediation — no Single-test (CAB report), Campaigns or Broken-Terminals tabs (`app.prod_streamlined`). DEV/UAT keep the full rehearsal tooling. |
+| Batch scope | For each selected terminal, fix **every** fixable broken check — not just the filtered one (free: `fixer.plan_for_row` reads the full `SELECT *` row). Shared instance/location calls are **de-duplicated**. |
+| Bit 16 in batch | **Never auto-applied** — the receipt template is per-terminal and operator-confirmed, so Bit 16 is listed as "manual, use Single fix". |
+| Batch safety | Same gate as the single fixer, at batch scope: operator + Mode armed + (PROD → `CAN_PROD` + change ref) + one "I reviewed these N statements" authorisation; a **Rehearse** (dry-run-only) mode; a per-run cap (200 terminals / 300 fixes); per-item isolation; full logging + registry. |
+| Agent placement | A reusable panel (`agent_panel`): account-wide on Overview (expanded) and Batch, terminal-scoped inside the Single fixer. |
+
+### The pages
+- **Overview** — KPIs (incl. Confirmed/Handed-off), per-check and per-dimension breakdowns, a
+  14-day **fix-activity trend** (`analytics.build_fix_activity_query`), the refresh +
+  reconcile controls, and the account-wide agent.
+- **Single fix** — shared filters → selectable worklist grid → the unchanged one-by-one fixer
+  (pre-check → dry run → apply → verify → log → register), with the terminal-scoped agent.
+- **Batch fix** — shared filters → multiselect of terminals → **plan** (fixes to run, "N
+  terminals need more than the filtered check", Bit-16/manual lists) → **Rehearse** or **Apply
+  live** → per-call pipeline looped headlessly → outcome summary. Each call logs one
+  `APP_FIX_LOG` row per covered terminal and registers verified fixes, identical to Single.
+
+### Code changes (additive + a small refactor)
+- New `remediation/writes.py` — shared fix-log / registry writes + the notice & pending-retry
+  queue, extracted from `fix_panel.py` (both panels now use it; audit behaviour unchanged).
+- New `remediation/agent_panel.py` — the reusable scoped/account agent chat (history via
+  `st.chat_message`; input via text box + button, since `st.chat_input` cannot sit inside
+  `st.tabs`/`st.expander`).
+- New `remediation/batch.py` — **pure** planner (`plan_batch` → `BatchPlan` of de-duplicated
+  `BatchItem`s + `templates` + `manual` + `resolved`), fully unit-tested.
+- New `remediation/batch_panel.py` — the batch UI + headless execution loop (reuses `fixer.*`
+  and `writes.*`).
+- `remediation/tab.py` — page nav + `_render_overview/_render_single/_render_batch`; worklist
+  split into `_render_filters` / `_run_worklist` / `_render_worklist_grid` (shared by both
+  pages); new `_render_activity`.
+- `app.py` — `prod_streamlined(connected_env)` routes PROD to the remediation-only layout.
+- Tests: `tests/test_remediation_batch.py` (planner), `tests/test_app_routing.py` (routing),
+  and `tests/test_remediation_tab.py` extended for pages + two batch tests. **346 pass, ruff
+  clean.**
+
+### Still open (this iteration)
+- Batch Bit-16 is intentionally manual; auto-suggesting a strong-confidence template behind one
+  batch confirmation is a possible follow-up.
+- Nothing new to deploy to Snowflake for this iteration (UI only); the §17 live schema upgrade
+  / daily task remain the outstanding infra steps.

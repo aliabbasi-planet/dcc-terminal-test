@@ -18,19 +18,15 @@ import streamlit as st
 
 from ..config import configdownload_version_text
 from ..execution import TestResult, apply_rollback, build_call
-from ..journal import get_journal
 from ..state import add_result
-from . import RemediationObjects, agent, fixer, fixlog, registry, suggest
+from . import RemediationObjects, agent_panel, fixer, fixlog, suggest, writes
 from . import worklist as wl
 from .sf_connection import SnowflakeConnection
 
 SELECTED_KEY = "rem_selected_terminal"
 _WORK_KEY = "rem_fix_work"
-_PENDING_KEY = "rem_pending_logs"
 _OPERATOR_KEY = "rem_operator"
 _TEMPLATES_KEY = "rem_template_cache"
-_NOTICE_KEY = "rem_fix_notice"
-_AGENT_CHAT_KEY = "rem_agent_chat"
 
 _KIND_LABELS = {
     "INSTANCE_IDENTIFIER": "instance",
@@ -51,16 +47,6 @@ def _state(key: str, default):
     if key not in st.session_state:
         st.session_state[key] = default
     return st.session_state[key]
-
-
-def _notice(level: str, message: str) -> None:
-    """Queue a message that survives ``st.rerun()``."""
-    _state(_NOTICE_KEY, []).append((level, message))
-
-
-def _show_notices() -> None:
-    for level, message in st.session_state.pop(_NOTICE_KEY, []):
-        getattr(st, level)(message)
 
 
 def _query(conn: SnowflakeConnection, sql: str, params: list | None = None):
@@ -98,180 +84,6 @@ def operator_status(conn: SnowflakeConnection, objs: RemediationObjects):
         )
     st.session_state[_OPERATOR_KEY] = (cache_key, *status)
     return status
-
-
-def _write_log(
-    conn: SnowflakeConnection,
-    objs: RemediationObjects,
-    records: list[dict],
-    *,
-    summary: str,
-    keep: TestResult | None = None,
-) -> bool:
-    """Write fix-log rows; on failure queue them for retry (never lose an audit row).
-
-    ``keep`` is a verified live fix: once its rows are written it leaves crash recovery.
-    """
-    if not records:
-        return True
-    try:
-        sql, params = fixlog.build_insert_many(records, objs)
-    except ValueError as exc:  # a malformed record is a bug — surface it, don't queue it
-        _notice("error", f"Fix-log rows for {summary} were rejected: {exc}")
-        return False
-    try:
-        conn.execute(sql, params)
-    except Exception as exc:
-        _state(_PENDING_KEY, []).append(
-            {
-                "sql": sql,
-                "params": params,
-                "summary": summary,
-                "journal_id": keep.journal_id if keep is not None else None,
-                "error": str(exc),
-            }
-        )
-        _notice(
-            "error",
-            f"Could not write the fix log for {summary}: {exc}. The rows are queued — use "
-            "**Retry fix-log writes** at the top of the tab.",
-        )
-        return False
-    if keep is not None:
-        fixer.keep_fix(keep)
-    return True
-
-
-def render_pending_logs(conn: SnowflakeConnection) -> None:
-    """Banner + retry for fix-log rows that could not be written."""
-    pending = st.session_state.get(_PENDING_KEY) or []
-    if not pending:
-        return
-    st.error(
-        f"**{len(pending)} fix-log write(s) are queued.** Until they are written, those "
-        "attempts are missing from the shared audit trail, and a live fix among them stays "
-        "listed in crash recovery."
-    )
-    if st.button("Retry fix-log writes", key="rem_retry_logs", type="primary"):
-        remaining = []
-        for item in pending:
-            try:
-                conn.execute(item["sql"], item["params"])
-            except Exception as exc:
-                remaining.append({**item, "error": str(exc)})
-                continue
-            if item.get("journal_id") is not None:
-                get_journal().mark_kept(item["journal_id"])
-        st.session_state[_PENDING_KEY] = remaining
-        written = len(pending) - len(remaining)
-        _notice(
-            "success" if not remaining else "warning",
-            f"Wrote {written} queued fix-log write(s); {len(remaining)} still queued.",
-        )
-        st.rerun()
-    with st.expander("Queued fix-log writes"):
-        st.table([{"what": item["summary"], "last error": item["error"]} for item in pending])
-
-
-# --------------------------------------------------------------------------- #
-# durable fix registry (the "we fixed this in PROD" table) writes
-# --------------------------------------------------------------------------- #
-
-
-def _register_fix(
-    conn: SnowflakeConnection,
-    objs: RemediationObjects,
-    records: list[dict],
-    *,
-    summary: str,
-) -> None:
-    """Upsert verified fixes into the durable registry (best-effort; never crashes).
-
-    A failure here does not lose the audit trail (that is in APP_FIX_LOG) — it only
-    means the worklist may re-show this terminal until the next daily load confirms it,
-    so we surface a warning rather than blocking the operator.
-    """
-    if not records:
-        return
-    try:
-        sql, params = registry.build_upsert(records, objs)
-        conn.execute(sql, params)
-    except Exception as exc:
-        _notice("warning", f"Could not register {summary} in the fix registry: {exc}")
-
-
-def _deregister_fix(
-    conn: SnowflakeConnection,
-    objs: RemediationObjects,
-    *,
-    environment: str,
-    terminals: list[str],
-    check_column: str,
-    summary: str,
-) -> None:
-    """Delete registry rows for a confirmed rollback (best-effort; never crashes)."""
-    try:
-        sql, params = registry.build_delete_many(environment, terminals, check_column, objs)
-        conn.execute(sql, params)
-    except Exception as exc:
-        _notice("warning", f"Could not remove {summary} from the fix registry: {exc}")
-
-
-# --------------------------------------------------------------------------- #
-# Ask the DCC maintenance agent about the selected terminal (scoped + chat)
-# --------------------------------------------------------------------------- #
-
-
-_AGENT_PRESETS = {
-    "Health summary": "Give a health summary and list which DCC checks pass or fail.",
-    "Failing checks": "Which DCC checks are failing and why? Distinguish CRITICAL from Supporting.",
-    "Remediation steps": "How do I fix the failing checks? Give only the relevant steps.",
-}
-
-
-def _ask_agent(conn: SnowflakeConnection, row: dict, question: str) -> None:
-    """Call the agent and append the exchange to the per-terminal chat history."""
-    chat = _state(_AGENT_CHAT_KEY, {})
-    tid = str(row.get("TERMINAL_IDENTIFIER"))
-    history = chat.get(tid, [])
-    prior = [t for t in history if t.get("role") in ("user", "assistant")]
-    with st.spinner("Asking the DCC maintenance agent…"):
-        answer = agent.ask(conn, question, row=row, history=prior)
-    history.append({"role": "user", "text": question})
-    reply = answer.text if answer.ok else f"⚠️ {answer.error}"
-    history.append({"role": "assistant", "text": reply, "sql": answer.sql})
-    chat[tid] = history
-
-
-def _render_agent_panel(conn: SnowflakeConnection, row: dict) -> None:
-    """Scoped preset questions + a free-text chat with the DCC maintenance agent."""
-    tid = str(row.get("TERMINAL_IDENTIFIER"))
-    with st.expander(f"Ask the DCC maintenance agent about {tid}"):
-        st.caption(
-            "Cortex agent `DCC_TERMINAL_MAINTENANCE_AGENT`, scoped to this terminal. Read-only "
-            "and answered from the same maintenance data as the worklist — use it to sanity-check "
-            "a terminal before you change it."
-        )
-        cols = st.columns(len(_AGENT_PRESETS))
-        for col, (label, prompt) in zip(cols, _AGENT_PRESETS.items(), strict=True):
-            if col.button(label, key=f"rem_agent_preset_{tid}_{label}", use_container_width=True):
-                _ask_agent(conn, row, prompt)
-                st.rerun()
-        typed = st.text_input("Ask something else", key=f"rem_agent_q_{tid}")
-        if st.button("Ask", key=f"rem_agent_ask_{tid}", disabled=not typed.strip()):
-            _ask_agent(conn, row, typed.strip())
-            st.rerun()
-        history = st.session_state.get(_AGENT_CHAT_KEY, {}).get(tid, [])
-        for turn in history:
-            if turn["role"] == "user":
-                st.markdown(f"**You:** {turn['text']}")
-            else:
-                st.markdown(turn["text"])
-                for statement in turn.get("sql") or []:
-                    st.code(statement, language="sql")
-        if history and st.button("Clear conversation", key=f"rem_agent_clear_{tid}"):
-            st.session_state[_AGENT_CHAT_KEY].pop(tid, None)
-            st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -503,8 +315,8 @@ def render_fix_panel(
         if row.get(c)
     ]
     st.caption(" · ".join([*facts, f"state {row.get('REMEDIATION_STATE')}"]))
-    _show_notices()
-    _render_agent_panel(conn, row)
+    writes.show_notices()
+    agent_panel.render_terminal_agent(conn, row)
 
     sql_conn = st.session_state.get("connection")
     environment = str(st.session_state.get("connected_env") or "").upper()
@@ -626,7 +438,7 @@ def render_fix_panel(
         work["pre"] = pre
         recorded = fixer.precheck_outcome(pre)
         if recorded is not None:
-            _write_log(
+            writes.write_log(
                 conn,
                 objs,
                 fixer.log_records(
@@ -640,7 +452,7 @@ def render_fix_panel(
                 summary=f"pre-check of {tid}",
             )
             if fixer.should_register(recorded):
-                _register_fix(
+                writes.register_fix(
                     conn,
                     objs,
                     fixer.registry_records(
@@ -671,12 +483,12 @@ def render_fix_panel(
                     correlation_id=correlation,
                 )
         except Exception as exc:
-            _notice("error", f"The dry run did not start: {exc}")
+            writes.notice("error", f"The dry run did not start: {exc}")
         else:
             add_result(result)
             work["dry"] = fixer.DryRun(step.signature(environment), result.status, time.time())
             recorded = fixer.dry_run_outcome(result)
-            _write_log(
+            writes.write_log(
                 conn,
                 objs,
                 fixer.log_records(
@@ -728,13 +540,13 @@ def render_fix_panel(
                 )
                 post = fixer.precheck(sql_conn, step, environment)
         except Exception as exc:
-            _notice("error", f"The live call did not run: {exc}")
+            writes.notice("error", f"The live call did not run: {exc}")
         else:
             add_result(result)
             work.update(live=result, post=post)
             work.pop("dry", None)  # any further live call needs a fresh dry run
             recorded = fixer.live_outcome(result, post)
-            _write_log(
+            writes.write_log(
                 conn,
                 objs,
                 fixer.log_records(
@@ -751,7 +563,7 @@ def render_fix_panel(
                 keep=result if recorded.outcome == "APPLIED" and recorded.verified else None,
             )
             if fixer.should_register(recorded):
-                _register_fix(
+                writes.register_fix(
                     conn,
                     objs,
                     fixer.registry_records(
@@ -788,7 +600,7 @@ def render_fix_panel(
         work.pop("pre", None)
         reverted = fixer.rollback_confirmed(post)
         recorded = fixer.rollback_outcome(outcome.ok, outcome.error, reverted)
-        _write_log(
+        writes.write_log(
             conn,
             objs,
             fixer.log_records(
@@ -803,7 +615,7 @@ def render_fix_panel(
             summary=f"rollback on {tid}",
         )
         if outcome.ok and reverted:
-            _deregister_fix(
+            writes.deregister_fix(
                 conn,
                 objs,
                 environment=environment,
@@ -812,15 +624,15 @@ def render_fix_panel(
                 summary=f"terminal(s) on {tid}'s call",
             )
         if not outcome.ok:
-            _notice("error", f"Rollback failed: {outcome.error}")
+            writes.notice("error", f"Rollback failed: {outcome.error}")
         elif reverted:
-            _notice(
+            writes.notice(
                 "success",
                 f"Rolled back and confirmed reverted on {environment} by a fresh read; the fix "
                 "registry entry was removed, so the check re-opens on the worklist.",
             )
         else:
-            _notice(
+            writes.notice(
                 "warning",
                 "The rollback ran but a fresh read did not confirm the change reverted — "
                 "investigate. The fix registry entry was kept so the worklist is not misled.",

@@ -24,6 +24,16 @@ from dcc_console.ui import (
 logging.basicConfig(level=logging.INFO)
 
 
+def prod_streamlined(connected_env: str | None) -> bool:
+    """Whether to show the focused PROD layout instead of the full tab strip.
+
+    On PROD the console hides the single-test (CAB report), Campaigns and Broken-Terminals
+    tabs and shows only the DCC Remediation experience (Overview statistics + agent, Single
+    fix and Batch fix). DEV/UAT keep the full rehearsal tooling.
+    """
+    return (connected_env or "").upper() == "PROD"
+
+
 def main() -> None:
     st.set_page_config(
         page_title="DCC Test Console",
@@ -56,6 +66,16 @@ def main() -> None:
     ready = render_readiness()
     st.divider()
     simulation, confirmed = render_mode()
+    armed_live = not simulation and confirmed and ready
+
+    if prod_streamlined(st.session_state.connected_env):
+        # PROD: a focused remediation console — no single-test CAB report, Campaigns or
+        # Broken-Terminals browser. The remediation experience carries its own Overview,
+        # Single-fix and Batch-fix pages and the agent on each.
+        st.divider()
+        render_remediation(armed_live=armed_live)
+        return
+
     st.divider()
     render_terminals()
     st.divider()
@@ -71,7 +91,7 @@ def main() -> None:
     with broken_tab:
         render_broken_terminals()
     with remediation_tab:
-        render_remediation(armed_live=not simulation and confirmed and ready)
+        render_remediation(armed_live=armed_live)
 
 
 if __name__ == "__main__":
