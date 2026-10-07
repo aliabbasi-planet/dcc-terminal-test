@@ -59,7 +59,8 @@ FLAG_FIXES: tuple[FlagFix, ...] = (
     FlagFix(
         "HANDLER_DCCENABLECOMPLETION_CHECK_O", "HANDLER_DCCENABLECOMPLETION_BASE",
         "Handler DCC Completion", "HANDLER", 8, INSTANCE, "dccEnableCompletion", "extra_config",
-        True, catalog_key="Bit 8 — DCC Handler Flags (instance)", notes="Bit 8 handler flag.",
+        True, catalog_key="Bit 8 — DCC Handler Flags (instance)",
+        notes="Bit 8 handler flag; BASE=1 requires dccEnableCompletion=false.",
     ),
     FlagFix(
         "HANDLER_DCCENABLEAUTH_CHECK_O", "HANDLER_DCCENABLEAUTH_BASE",
@@ -79,9 +80,9 @@ FLAG_FIXES: tuple[FlagFix, ...] = (
     ),
     FlagFix(
         "DCCFLAGSENABLED_CHECK_C", "DCCFLAGSENABLED_BASE",
-        "DCC Flags Enabled", "HANDLER", 8, INSTANCE, "dccFlagsEnabled", "extra_config", False,
+        "DCC Flags Enabled", "HANDLER", 8, INSTANCE, "dccFlagsEnabled", "extra_config", True,
         catalog_key="Bit 8 — DCC Handler Flags (instance)",
-        notes="CONFIRM _CHECK_C semantics + whether dccFlagsEnabled is boolean or bitmask.",
+        notes="Bit 8 handler flag; BASE=1 requires dccFlagsEnabled=false.",
     ),
     FlagFix(
         "DCCXPRESSCO_CHECK_O", "DCCXPRESSCO_BASE",

@@ -142,8 +142,7 @@ CONFIG_AREAS: tuple[ConfigArea, ...] = (
         requirement="A valid instance.",
         bit8_value="dccFlagsEnabled",
         assumption=(
-            "Exercised as a boolean (@Config_value=1). If it is an integer bitmask, its "
-            "numeric semantics must be confirmed with the procedure owner."
+            "The in-scope maintenance check requires false (@Config_value=0)."
         ),
     ),
     ConfigArea(

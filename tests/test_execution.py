@@ -88,13 +88,15 @@ def test_bit1_function_name_flows_into_extra_function_name(key, expected_functio
     assert expected_function in rendered
 
 
-@pytest.mark.parametrize("flag", ["dccEnableRefund", "dccFlagsEnabled"])
-def test_new_bit8_flags_build_a_call(flag):
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("dccEnableRefund", 1), ("dccFlagsEnabled", 0), ("dccEnableCompletion", 0)],
+)
+def test_new_bit8_flags_build_a_call(flag, expected):
     definition = TEST_CATALOG["Bit 8 — DCC Handler Flags (instance)"]
     _, params, rendered = build_call(definition, "I1", flag, simulation=True)
-    # params = (bit, payload, flag, config_value=1, sim)
     assert params[2] == flag
-    assert params[3] == 1
+    assert params[3] == expected
     assert flag in rendered
 
 

@@ -280,10 +280,8 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             sp_column="extra_config",
             assumption=(
                 "`dccEnableRefund` is treated as a boolean handler flag set to 1, consistent "
-                "with the other dccEnable* flags. `dccFlagsEnabled` is also exercised as a "
-                "boolean (`@Config_value = 1`); if it is in fact an integer bitmask its exact "
-                "numeric semantics must be confirmed with the procedure owner before that "
-                "value is treated as a fully verified capability."
+                "with the other enabling flags. `dccEnableCompletion` and `dccFlagsEnabled` "
+                "are set to false (`@Config_value = 0`) for their in-scope maintenance checks."
             ),
         ),
         TestDefinition(

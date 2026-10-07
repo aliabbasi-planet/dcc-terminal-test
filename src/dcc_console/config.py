@@ -24,6 +24,8 @@ TRACE_FUNCTION = "[db].[fnDisplayTrace]"
 # preview result set.
 RETURN_CODE_COLUMN = "dcc_return_code"
 
+BIT8_FALSE_FLAGS = frozenset({"dccEnableCompletion", "dccFlagsEnabled"})
+
 # Bit 2 — configdownload_version numeric code -> human description.
 # Confirmed mapping: 1 = Standard (baseline DCC), 2 = ECB DCC (European Central
 # Bank conversion-rate variant). These are the only two versions the procedure
