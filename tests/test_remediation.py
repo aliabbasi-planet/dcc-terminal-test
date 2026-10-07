@@ -102,7 +102,7 @@ def test_fixable_subset_matches_flag_fixes():
     assert set(mapping.FIXABLE_CHECK_COLUMNS) == expected
     assert "FIRMWARE_VERSION_CHECK" not in mapping.FIXABLE_CHECK_COLUMNS
     assert "DCCMERCHANT_NO_CHECK_O" not in mapping.FIXABLE_CHECK_COLUMNS
-    assert "DCCFLAGSENABLED_CHECK_C" not in mapping.FIXABLE_CHECK_COLUMNS
+    assert "DCCFLAGSENABLED_CHECK_C" in mapping.FIXABLE_CHECK_COLUMNS
     assert "LOCATION_DCCENABLED_CHECK_C" not in mapping.FIXABLE_CHECK_COLUMNS
 
 

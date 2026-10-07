@@ -9,7 +9,7 @@ from datetime import datetime
 import pandas as pd
 
 from .catalog import TestDefinition
-from .config import PROCEDURE, RETURN_CODE_COLUMN
+from .config import BIT8_FALSE_FLAGS, PROCEDURE, RETURN_CODE_COLUMN
 from .database import DatabaseConnection
 from .journal import get_journal
 from .rollback import (
@@ -322,7 +322,7 @@ def build_call(
             f"EXEC {PROCEDURE} @display_config = ?, @instance_json = ?, "
             "@Extra_Config_Name = ?, @Config_value = ?, @is_simulation = ?"
         )
-        params = (bit, payload, config_value, 1, sim)
+        params = (bit, payload, config_value, 0 if config_value in BIT8_FALSE_FLAGS else 1, sim)
     elif bit == 16:
         sql = (
             f"EXEC {PROCEDURE} @display_config = ?, @instance_json = ?, "

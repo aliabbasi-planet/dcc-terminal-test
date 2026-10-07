@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from ..catalog import TEST_CATALOG, TestDefinition
+from ..config import BIT8_FALSE_FLAGS
 from ..execution import ORIGIN_REMEDIATION, TestResult, run_test
 from ..journal import get_journal
 from ..rollback import read_sp_flag_states, read_statement
@@ -335,15 +336,18 @@ def precheck(connection, step: FixStep, environment: str) -> Precheck:
                 f"Instance {target} has no DCC handler of the types the procedure edits.",
             )
         current = "; ".join(f"{s.get('handler_name')}={s.get('flag_value')}" for s in states)
-        if all(str(s.get("flag_value")).strip().lower() == "true" for s in states):
+        expected = "false" if flag_name in BIT8_FALSE_FLAGS else "true"
+        if all(str(s.get("flag_value")).strip().lower() == expected for s in states):
             return verdict(
                 ALREADY_OK,
                 current,
-                f"{flag_name} is already true on every handler.",
+                f"{flag_name} is already {expected} on every handler.",
                 states,
                 authoritative=True,
             )
-        return verdict(NEEDS_FIX, current, f"{flag_name} is not true on every handler.", states)
+        return verdict(
+            NEEDS_FIX, current, f"{flag_name} is not {expected} on every handler.", states
+        )
 
     if bit == 16:
         states = read_sp_flag_states(connection, target, None, column="receipt_config")

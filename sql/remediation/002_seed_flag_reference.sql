@@ -11,11 +11,11 @@ USING (
     SELECT * FROM VALUES
         ('LOCATION_DCCENABLED_CHECK_C', 'Location DCC Enabled', 'CONFIG', NULL, NULL, NULL, NULL, FALSE, 'CONFIRM semantics with data owner; returned 0 broken in PROD.'),
         ('HANDLER_DCCENABLE_CHECK_O', 'Handler DCC Enable', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccEnable', 'extra_config', TRUE, 'Bit 8 handler flag.'),
-        ('HANDLER_DCCENABLECOMPLETION_CHECK_O', 'Handler DCC Completion', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccEnableCompletion', 'extra_config', TRUE, 'Bit 8 handler flag.'),
+        ('HANDLER_DCCENABLECOMPLETION_CHECK_O', 'Handler DCC Completion', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccEnableCompletion', 'extra_config', TRUE, 'Bit 8 handler flag; BASE=1 requires dccEnableCompletion=false.'),
         ('HANDLER_DCCENABLEAUTH_CHECK_O', 'Handler DCC Auth', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccEnableAuth', 'extra_config', TRUE, 'Bit 8 handler flag.'),
         ('HANDLER_DCCENABLENFC_CHECK_O', 'Handler DCC NFC', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccEnableNfc', 'extra_config', TRUE, 'Bit 8 handler flag.'),
         ('HANDLER_DCCENABLENFCSINGLETAP_CHECK_O', 'Handler DCC NFC Single Tap', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccEnableNfcSingleTap', 'extra_config', TRUE, 'Bit 8 handler flag.'),
-        ('DCCFLAGSENABLED_CHECK_C', 'DCC Flags Enabled', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccFlagsEnabled', 'extra_config', FALSE, 'CONFIRM _CHECK_C semantics + whether dccFlagsEnabled is boolean or bitmask.'),
+        ('DCCFLAGSENABLED_CHECK_C', 'DCC Flags Enabled', 'HANDLER', 8, 'INSTANCE_IDENTIFIER', 'dccFlagsEnabled', 'extra_config', TRUE, 'Bit 8 handler flag; BASE=1 requires dccFlagsEnabled=false.'),
         ('DCCXPRESSCO_CHECK_O', 'DCC Xpress CO', 'DCC_XPRESS', 1, 'LOCATION_NO', 'DCCXpressCO', NULL, TRUE, 'Bit 1 location extra_function.'),
         ('DCCXPRESSCODT_CHECK_O', 'DCC Xpress CO DT', 'DCC_XPRESS', 1, 'LOCATION_NO', 'DCCXpressCODT', NULL, TRUE, 'Bit 1 location extra_function.'),
         ('DCCXPRESSCOFALLBACK_CHECK_O', 'DCC Xpress CO Fallback', 'DCC_XPRESS', 1, 'LOCATION_NO', 'DCCXpressCOFallback', NULL, TRUE, 'Bit 1 location extra_function.'),

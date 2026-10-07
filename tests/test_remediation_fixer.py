@@ -132,10 +132,11 @@ class FakeSqlServer:
                 "</extra_function>"
             )
         elif bit == 8:
+            expected = "true" if params[3] else "false"
             for handler in self.handlers[target]:
                 handler["extra_config"] = _FLAG.sub(
                     lambda m: (
-                        f'config_name="{m["name"]}" config_value="true"'
+                        f'config_name="{m["name"]}" config_value="{expected}"'
                         if m["name"] == params[2]
                         else m[0]
                     ),
@@ -338,6 +339,40 @@ def test_bit1_live_apply_is_verified_by_its_extra_function_id(journal, check, ex
     assert f'extra_function_id="{expected_id}"' in sql.locations["L1"]
     assert post.status == fixer.ALREADY_OK
     assert fixer.live_outcome(result, post).verified is True
+
+
+@pytest.mark.parametrize(
+    ("check", "flag"),
+    [
+        ("HANDLER_DCCENABLECOMPLETION_CHECK_O", "dccEnableCompletion"),
+        ("DCCFLAGSENABLED_CHECK_C", "dccFlagsEnabled"),
+    ],
+)
+def test_bit8_false_flags_plan_apply_and_verify(journal, check, flag):
+    step = _step(check)
+    sql = FakeSqlServer()
+    sql.handlers["I1"] = [{
+        "handler_name": "h1",
+        "extra_config": _handler_xml(**{flag: "true", "dccEnableAuth": "true"}),
+    }]
+    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
+    _, params, _ = build_call(step.definition, "I1", step.config_value, True)
+    assert params[2:4] == (flag, 0)
+    live = fixer.run_step(
+        sql, step, simulation=False, environment="UAT", login="svc", correlation_id="false-flag"
+    )
+    post = fixer.precheck(sql, step, "UAT")
+    assert post.status == fixer.ALREADY_OK
+    assert post.authoritative
+    assert fixer.live_outcome(live, post).verified
+    document = sql.handlers["I1"][0]["extra_config"]
+    assert 'config_name="dccEnableAuth" config_value="true"' in document
+    sql.handlers["I1"].append({
+        "handler_name": "h2", "extra_config": _handler_xml(**{flag: "true"}),
+    })
+    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
+    sql.handlers["I1"][1]["extra_config"] = _handler_xml(dccEnableAuth="true")
+    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
 
 
 def test_bit2_precheck_uses_the_version_code():
