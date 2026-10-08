@@ -210,6 +210,23 @@ def test_worklist_dimension_in_clause_binds_values():
     assert params == ["Germany", "France"]
 
 
+def test_worklist_exact_identifier_filters_are_bound_and_trimmed():
+    filters = wl.WorklistFilters(
+        remediation_state=None,
+        identifiers={"LOCATION_NO": " L1 ", "INSTANCE_IDENTIFIER": " I1 "},
+    )
+    sql, params = wl.build_worklist_query(filters, OBJS)
+    assert "INSTANCE_IDENTIFIER = %s" in sql
+    assert "LOCATION_NO = %s" in sql
+    assert params == ["I1", "L1"]
+
+
+def test_worklist_identifier_filter_rejects_unknown_column():
+    filters = wl.WorklistFilters(identifiers={"DROP_TABLE": "x"})
+    with pytest.raises(ValueError, match="Unknown identifier column"):
+        wl.build_worklist_query(filters, OBJS)
+
+
 def test_worklist_check_filter_orders_and_binds_nothing():
     filters = wl.WorklistFilters(
         remediation_state=None,

@@ -31,6 +31,7 @@ class WorklistFilters:
 
     remediation_state: str | None = "ACTIONABLE"
     dimensions: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    identifiers: dict[str, str] = field(default_factory=dict)
     check_columns: tuple[str, ...] = ()   # keep terminals broken on ANY of these
     fixable_only: bool = False
     limit: int = 500
@@ -78,6 +79,14 @@ def build_worklist_query(filters: WorklistFilters, objs: RemediationObjects) -> 
         placeholders = ", ".join(["%s"] * len(selected))
         clauses.append(f"{clean} IN ({placeholders})")
         params.extend(selected)
+
+    for column, value in sorted(filters.identifiers.items()):
+        if column not in IDENTIFIER_COLUMNS:
+            raise ValueError(f"Unknown identifier column: {column!r}")
+        clean = value.strip()
+        if clean:
+            clauses.append(f"{column} = %s")
+            params.append(clean)
 
     chosen_checks = _validate_check_columns(filters.check_columns, filters.fixable_only)
     if chosen_checks:

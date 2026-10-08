@@ -292,6 +292,21 @@ def test_single_page_shows_worklist_and_fixer_prompt():
     assert _problems(at) == []
     assert len(at.dataframe) == 1
     assert any("Select a terminal" in info.value for info in at.info)
+    assert at.text_input(key="rem_target_LOCATION_NO")
+    assert at.text_input(key="rem_target_INSTANCE_IDENTIFIER")
+    assert at.text_input(key="rem_target_TERMINAL_IDENTIFIER")
+
+
+def test_batch_page_does_not_show_single_target_filters():
+    at = _render(FakeSnowflake(), rem_page="Batch fix")
+
+    assert _problems(at) == []
+    target_filter_keys = {
+        "rembatch_target_LOCATION_NO",
+        "rembatch_target_INSTANCE_IDENTIFIER",
+        "rembatch_target_TERMINAL_IDENTIFIER",
+    }
+    assert not target_filter_keys.intersection({widget.key for widget in at.text_input})
 
 
 def test_empty_snapshot_renders_without_errors():

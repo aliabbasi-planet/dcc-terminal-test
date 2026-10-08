@@ -323,9 +323,13 @@ def _distinct_values(conn: SnowflakeConnection, column: str, objs: RemediationOb
 
 
 def _render_filters(
-    conn: SnowflakeConnection, objs: RemediationObjects, *, key_prefix: str
+    conn: SnowflakeConnection,
+    objs: RemediationObjects,
+    *,
+    key_prefix: str,
+    include_target_filters: bool = False,
 ) -> wl.WorklistFilters:
-    """Shared worklist filters (used by both the Single-fix and Batch-fix pages)."""
+    """Shared filters, with optional exact target IDs for the Single-fix page."""
     top = st.columns(3)
     state = top[0].selectbox(
         "State", ["ACTIONABLE", "AWAITING_REFRESH", "(all)"], index=0, key=f"{key_prefix}_state"
@@ -353,11 +357,28 @@ def _render_filters(
         )
         if chosen:
             dimensions[column] = tuple(chosen)
+    identifiers: dict[str, str] = {}
+    if include_target_filters:
+        st.caption("Optional exact target filters")
+        target_cols = st.columns(3)
+        for idx, (column, label) in enumerate((
+            ("LOCATION_NO", "Location number"),
+            ("INSTANCE_IDENTIFIER", "Instance identifier"),
+            ("TERMINAL_IDENTIFIER", "Terminal identifier"),
+        )):
+            value = target_cols[idx].text_input(
+                label,
+                key=f"{key_prefix}_target_{column}",
+                placeholder=f"Exact {label.lower()}",
+            ).strip()
+            if value:
+                identifiers[column] = value
     check_pool = FIXABLE_CHECK_COLUMNS if fixable_only else TRACKED_CHECK_COLUMNS
     checks = st.multiselect("Broken on check(s)", check_pool, key=f"{key_prefix}_checks")
     return wl.WorklistFilters(
         remediation_state=None if state == "(all)" else state,
         dimensions=dimensions,
+        identifiers=identifiers,
         check_columns=tuple(checks),
         fixable_only=fixable_only,
         limit=limit,
@@ -472,7 +493,9 @@ def _render_single(conn: SnowflakeConnection, objs: RemediationObjects, armed_li
         "Fix one terminal at a time: pre-check → dry run → apply live (DEV/UAT, or PROD "
         "behind the change-reference gate) → verify → logged → registered."
     )
-    filters = _render_filters(conn, objs, key_prefix="rem")
+    filters = _render_filters(
+        conn, objs, key_prefix="rem", include_target_filters=True
+    )
     df = _run_worklist(conn, objs, filters)
     worklist = _render_worklist_grid(conn, objs, df) if df is not None else None
     st.divider()
