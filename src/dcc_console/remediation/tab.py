@@ -226,14 +226,96 @@ def _render_kpis(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
         value = row.get(column)
         return f"{int(value or 0):,}"
 
-    cols = st.columns(7)
-    cols[0].metric("Actionable broken", count("BROKEN_ACTIONABLE"))
-    cols[1].metric("Awaiting refresh", count("AWAITING_REFRESH"))
-    cols[2].metric("Live fixes · PROD", count("TOTAL_LIVE_FIXES"))
-    cols[3].metric("Registered · PROD", count("REGISTERED_FIXES"))
-    cols[4].metric("Confirmed · PROD", count("CONFIRMED_FIXES"))
-    cols[5].metric("Rehearsals · UAT/DEV", count("REHEARSAL_FIXES"))
-    cols[6].metric("Latest snapshot", str(row.get("LATEST_SNAPSHOT_DATE") or "—"))
+    first_row = st.columns(4)
+    first_row[0].metric(
+        "Actionable broken",
+        count("BROKEN_ACTIONABLE"),
+        help=(
+            "Terminals in the latest snapshot that still have at least one actionable broken check."
+        ),
+    )
+    first_row[1].metric(
+        "Fixable",
+        count("FIXABLE_TERMINALS"),
+        help=(
+            "Actionable terminals with at least one unresolved broken check that this app can "
+            "fix through its supported remediation procedures."
+        ),
+    )
+    first_row[2].metric(
+        "Awaiting refresh",
+        count("AWAITING_REFRESH"),
+        help=(
+            "Terminals with verified PROD fixes and no other open fixable checks, "
+            "awaiting the next source snapshot."
+        ),
+    )
+    first_row[3].metric(
+        "Latest snapshot",
+        str(row.get("LATEST_SNAPSHOT_DATE") or "—"),
+        help="Most recent SNAPSHOT_DATE loaded into this user's HEALTH_DAILY_SNAPSHOT table.",
+    )
+
+    second_row = st.columns(4)
+    second_row[0].metric(
+        "Live applied · PROD",
+        count("TOTAL_LIVE_FIXES"),
+        help=(
+            "Distinct successful LIVE procedure calls in PROD with OUTCOME=APPLIED. "
+            "SKIPPED_ALREADY_OK pre-checks are counted separately. One call can cover "
+            "multiple terminals."
+        ),
+    )
+    second_row[1].metric(
+        "Already OK · PROD",
+        count("ALREADY_OK_PROD"),
+        help=(
+            "Distinct PROD pre-checks logged as SKIPPED_ALREADY_OK. The target already "
+            "had the requested setting; the procedure was not applied."
+        ),
+    )
+    second_row[2].metric(
+        "Dry runs · PROD",
+        count("PROD_SIMULATIONS"),
+        help=(
+            "Distinct PROD simulation attempts in APP_FIX_LOG, including failed dry runs. "
+            "These execute with simulation enabled and do not commit the fix."
+        ),
+    )
+    second_row[3].metric(
+        "Registered · PROD",
+        count("REGISTERED_FIXES"),
+        help=(
+            "Current PROD terminal/check entries in DCC_FIX_REGISTRY with status FIXED or "
+            "CONFIRMED."
+        ),
+    )
+
+    third_row = st.columns(3)
+    third_row[0].metric(
+        "Confirmed · PROD",
+        count("CONFIRMED_FIXES"),
+        help=(
+            "Registered PROD fixes confirmed healthy by a newer Cortex source load and "
+            "handed off by Reconcile."
+        ),
+    )
+    third_row[1].metric(
+        "Rehearsal simulations · UAT/DEV",
+        count("REHEARSAL_FIXES"),
+        help=(
+            "Distinct UAT and DEV simulation attempts in APP_FIX_LOG, including failed dry "
+            "runs. These do not commit fixes."
+        ),
+    )
+    third_row[2].metric(
+        "Live applied · UAT/DEV",
+        count("LIVE_APPLIED_UAT_DEV"),
+        help=(
+            "Distinct successful LIVE procedure calls applied in UAT or DEV. These are "
+            "committed outside PROD and are not included in PROD fix counts."
+        ),
+    )
 
 
 def _render_refresh(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
@@ -340,14 +422,113 @@ def _render_analytics(conn: SnowflakeConnection, objs: RemediationObjects) -> No
 
 
 def _render_activity(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
-    """Recent remediation throughput (last 14 days) from the shared fix log."""
+    """Recent PROD fixes and environment-specific simulations from the shared fix log."""
     df, error = _run(conn, an.build_fix_activity_query(objs))
     if error or df is None or df.empty:
         st.caption("No fix activity logged in the last 14 days.")
         return
-    st.caption("Fix activity — live applied vs rehearsed (last 14 days)")
-    chart = df.rename(columns={"FIX_DATE": "date"}).set_index("date")
-    st.bar_chart(chart[[c for c in ("LIVE_APPLIED", "REHEARSED") if c in chart.columns]])
+    activity_labels = {
+        "LIVE_APPLIED_PROD": "Live applied · PROD",
+        "ALREADY_OK_PROD": "Pre-check already OK · PROD",
+        "DRY_RUN_PROD": "Dry run · PROD",
+        "DRY_RUN_UAT": "Rehearsal · UAT",
+        "DRY_RUN_DEV": "Rehearsal · DEV",
+        "LIVE_APPLIED_UAT_DEV": "Live applied · UAT/DEV",
+    }
+    available = [column for column in activity_labels if column in df.columns]
+    if not available:
+        st.caption("No fix activity logged in the last 14 days.")
+        return
+    st.caption("Fix activity by environment and outcome (last 14 days)")
+    chart = df.melt(
+        id_vars="FIX_DATE",
+        value_vars=available,
+        var_name="ACTIVITY",
+        value_name="CALLS",
+    )
+    chart["ACTIVITY"] = chart["ACTIVITY"].map(activity_labels)
+    figure = px.bar(
+        chart,
+        x="FIX_DATE",
+        y="CALLS",
+        color="ACTIVITY",
+        barmode="group",
+        labels={"FIX_DATE": "Date", "CALLS": "Procedure calls", "ACTIVITY": "Activity"},
+    )
+    figure.update_layout(height=380, margin={"l": 55, "r": 25, "t": 20, "b": 45})
+    figure.update_xaxes(tickformat="%d %b", dtick="D1")
+    st.plotly_chart(figure, use_container_width=True)
+
+
+def _render_fix_coverage(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
+    st.subheader("PROD fix coverage")
+    st.caption(
+        "Unique target IDs currently in DCC_FIX_REGISTRY, grouped by target type. "
+        "A target can cover multiple terminals and checks."
+    )
+    df, error = _run(conn, an.build_fix_coverage_query(objs))
+    if error:
+        st.info(f"PROD fix coverage unavailable: {error}")
+    elif df is None or df.empty:
+        st.caption("No registered PROD fixes.")
+    else:
+        coverage = df.rename(
+            columns={
+                "TARGET_TYPE": "Target type",
+                "REGISTERED_TARGETS": "Registered targets",
+                "CONFIRMED_TARGETS": "Confirmed targets",
+                "TERMINALS_COVERED": "Terminals covered",
+            }
+        )
+        st.dataframe(coverage, use_container_width=True, hide_index=True)
+
+    st.subheader("PROD fix coverage by bit")
+    st.caption(
+        "Call counts come from APP_FIX_LOG; registered and confirmed counts are terminal/check "
+        "entries from DCC_FIX_REGISTRY. A live call can cover multiple terminals."
+    )
+    bit_df, bit_error = _run(conn, an.build_bit_fix_coverage_query(objs))
+    if bit_error:
+        st.info(f"PROD fix coverage by bit unavailable: {bit_error}")
+    elif bit_df is None or bit_df.empty:
+        st.caption("No PROD fix activity by bit.")
+    else:
+        bit_labels = {
+            1: "Location Xpress CO features",
+            2: "Terminal config download version",
+            8: "Instance handler flags",
+            16: "Instance receipt template",
+        }
+        by_bit = bit_df.copy()
+        by_bit["FIX_AREA"] = by_bit["FIX_BIT"].map(
+            lambda bit: bit_labels.get(int(bit), "Other")
+        )
+        by_bit = by_bit[
+            [
+                "FIX_BIT",
+                "FIX_AREA",
+                "LIVE_APPLIED_CALLS",
+                "ALREADY_OK_CALLS",
+                "DRY_RUN_ATTEMPTS",
+                "REGISTERED_CHECKS",
+                "PENDING_CONFIRMATION_CHECKS",
+                "CONFIRMED_CHECKS",
+                "TERMINALS_COVERED",
+            ]
+        ].rename(
+            columns={
+                "FIX_BIT": "Bit",
+                "FIX_AREA": "Fix area",
+                "LIVE_APPLIED_CALLS": "Live applied calls",
+                "ALREADY_OK_CALLS": "Already OK calls",
+                "DRY_RUN_ATTEMPTS": "Dry-run attempts",
+                "REGISTERED_CHECKS": "Registered checks",
+                "PENDING_CONFIRMATION_CHECKS": "Pending confirmation",
+                "CONFIRMED_CHECKS": "Confirmed checks",
+                "TERMINALS_COVERED": "Terminals covered",
+            }
+        )
+        st.dataframe(by_bit, use_container_width=True, hide_index=True)
 
 
 def _distinct_values(conn: SnowflakeConnection, column: str, objs: RemediationObjects) -> list[str]:
@@ -518,6 +699,7 @@ def _render_overview(conn: SnowflakeConnection, objs: RemediationObjects) -> Non
     st.divider()
     _render_analytics(conn, objs)
     _render_activity(conn, objs)
+    _render_fix_coverage(conn, objs)
     st.divider()
     agent_panel.render_account_agent(conn, context_key="overview", expanded=True)
 

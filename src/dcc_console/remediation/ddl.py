@@ -296,13 +296,32 @@ SELECT
         WHERE REMEDIATION_STATE = 'ACTIONABLE')                       AS BROKEN_ACTIONABLE,
     (SELECT COUNT(*) FROM {objs.v_current_broken}
         WHERE REMEDIATION_STATE = 'AWAITING_REFRESH')                 AS AWAITING_REFRESH,
+    (SELECT COUNT(*) FROM {objs.v_current_broken}
+        WHERE OPEN_FIXABLE_CHECKS > 0)                                 AS FIXABLE_TERMINALS,
     -- One CORRELATION_ID per procedure call; one row per terminal it covered.
-    (SELECT COUNT(DISTINCT CORRELATION_ID) FROM {objs.fix_log_table}
-        WHERE {live_applied} AND {prod})                              AS TOTAL_LIVE_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE {live_applied} AND {prod}
+    ))                                                                AS TOTAL_LIVE_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'LIVE' AND OUTCOME = 'SKIPPED_ALREADY_OK' AND {prod}
+    ))
+                                                                      AS ALREADY_OK_PROD,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'SIMULATION' AND {prod}
+    ))                                                                AS PROD_SIMULATIONS,
     (SELECT COUNT(DISTINCT TERMINAL_IDENTIFIER) FROM {objs.fix_log_table}
         WHERE {live_applied} AND {prod})                              AS UNIQUE_TERMINALS_FIXED,
-    (SELECT COUNT(DISTINCT CORRELATION_ID) FROM {objs.fix_log_table}
-        WHERE {live_applied} AND NOT {prod})                          AS REHEARSAL_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'SIMULATION' AND ENVIRONMENT IN ('UAT', 'DEV')
+    ))                                                                AS REHEARSAL_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'LIVE' AND OUTCOME = 'APPLIED' AND ENVIRONMENT IN ('UAT', 'DEV')
+    ))                                                                AS LIVE_APPLIED_UAT_DEV,
     (SELECT COUNT(*) FROM {objs.registry_table}
         WHERE {prod} AND STATUS IN ('{registry.STATUS_FIXED}', '{registry.STATUS_CONFIRMED}'))
                                                                       AS REGISTERED_FIXES,

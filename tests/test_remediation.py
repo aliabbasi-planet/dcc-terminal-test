@@ -463,7 +463,44 @@ def test_view_reads_the_fix_registry_for_prod_resolutions():
 def test_kpis_separate_prod_fixes_from_rehearsals():
     kpis = next(s for s in ddl.build_create_statements(OBJS) if "V_REMEDIATION_KPIS AS" in s)
     assert "AS TOTAL_LIVE_FIXES" in kpis and "AS REHEARSAL_FIXES" in kpis
-    assert "NOT ENVIRONMENT = 'PROD'" in kpis
+    assert "AS FIXABLE_TERMINALS" in kpis
+    assert "AS ALREADY_OK_PROD" in kpis and "AS PROD_SIMULATIONS" in kpis
+    assert "AS LIVE_APPLIED_UAT_DEV" in kpis
+    assert "OUTCOME = 'SKIPPED_ALREADY_OK'" in kpis
+    assert "MODE = 'SIMULATION' AND ENVIRONMENT IN ('UAT', 'DEV')" in kpis
+
+
+def test_fix_activity_separates_prod_outcomes_from_uat_dev_dry_runs():
+    query = an.build_fix_activity_query(OBJS)
+    assert "AS LIVE_APPLIED_PROD" in query
+    assert "AS ALREADY_OK_PROD" in query
+    assert "AS DRY_RUN_PROD" in query
+    assert "AS DRY_RUN_UAT" in query
+    assert "AS DRY_RUN_DEV" in query
+    assert "AS LIVE_APPLIED_UAT_DEV" in query
+    assert "SELECT DISTINCT CAST(APPLIED_AT AS DATE)" in query
+    assert "CORRELATION_ID, APPLIED_AT, MODE, ENVIRONMENT, OUTCOME" in query
+
+
+def test_fix_coverage_counts_unique_targets_and_terminals_by_registry_status():
+    query = an.build_fix_coverage_query(OBJS)
+    assert OBJS.registry_table in query
+    assert "COUNT(DISTINCT TARGET_IDENTIFIER) AS REGISTERED_TARGETS" in query
+    assert "COUNT(DISTINCT IFF(STATUS = 'CONFIRMED'" in query
+    assert "COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINALS_COVERED" in query
+    assert "ENVIRONMENT = 'PROD' AND STATUS IN ('FIXED', 'CONFIRMED')" in query
+
+
+def test_bit_fix_coverage_separates_calls_registry_checks_and_terminals():
+    query = an.build_bit_fix_coverage_query(OBJS)
+    assert "FROM VALUES (1), (2), (8), (16)" in query
+    assert "AS LIVE_APPLIED_CALLS" in query
+    assert "AS ALREADY_OK_CALLS" in query
+    assert "AS DRY_RUN_ATTEMPTS" in query
+    assert "AS REGISTERED_CHECKS" in query
+    assert "AS PENDING_CONFIRMATION_CHECKS" in query
+    assert "AS CONFIRMED_CHECKS" in query
+    assert "AS TERMINALS_COVERED" in query
 
 
 def test_snapshot_stores_source_load_time_in_utc():

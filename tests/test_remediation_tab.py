@@ -110,9 +110,13 @@ class FakeSnowflake:
                     {
                         "BROKEN_ACTIONABLE": 12654 if self.loaded else 0,
                         "AWAITING_REFRESH": 0,
+                        "FIXABLE_TERMINALS": 11000 if self.loaded else 0,
                         "TOTAL_LIVE_FIXES": 0,
+                        "ALREADY_OK_PROD": 0,
+                        "PROD_SIMULATIONS": 0,
                         "UNIQUE_TERMINALS_FIXED": 0,
                         "REHEARSAL_FIXES": 0,
+                        "LIVE_APPLIED_UAT_DEV": 0,
                         "REGISTERED_FIXES": 0,
                         "PENDING_CONFIRMATION": 0,
                         "CONFIRMED_FIXES": 0,
@@ -121,7 +125,7 @@ class FakeSnowflake:
                     }
                 ]
             )
-        if "PENDING_CONFIRMATION" in sql:  # reconcile panel summary
+        if "PENDING_CONFIRMATION" in sql and "FIX_BIT" not in sql:  # reconcile summary
             return pd.DataFrame(
                 [
                     {
@@ -143,7 +147,50 @@ class FakeSnowflake:
                 ]
             )
         if "FIX_DATE" in sql:  # Overview fix-activity trend
-            return pd.DataFrame(columns=["FIX_DATE", "LIVE_APPLIED", "REHEARSED"])
+            return pd.DataFrame(
+                columns=[
+                    "FIX_DATE",
+                    "LIVE_APPLIED_PROD",
+                    "ALREADY_OK_PROD",
+                    "DRY_RUN_PROD",
+                    "DRY_RUN_UAT",
+                    "DRY_RUN_DEV",
+                    "LIVE_APPLIED_UAT_DEV",
+                ]
+            )
+        if "REGISTERED_TARGETS" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "TARGET_TYPE": "Instance",
+                        "REGISTERED_TARGETS": 100,
+                        "CONFIRMED_TARGETS": 80,
+                        "TERMINALS_COVERED": 150,
+                    },
+                    {
+                        "TARGET_TYPE": "Terminal",
+                        "REGISTERED_TARGETS": 120,
+                        "CONFIRMED_TARGETS": 100,
+                        "TERMINALS_COVERED": 120,
+                    },
+                ]
+            )
+        if "LIVE_APPLIED_CALLS" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "FIX_BIT": bit,
+                        "LIVE_APPLIED_CALLS": 1 if bit == 2 else 0,
+                        "ALREADY_OK_CALLS": 0,
+                        "DRY_RUN_ATTEMPTS": 1,
+                        "REGISTERED_CHECKS": 1 if bit == 2 else 0,
+                        "PENDING_CONFIRMATION_CHECKS": 0,
+                        "CONFIRMED_CHECKS": 1 if bit == 2 else 0,
+                        "TERMINALS_COVERED": 1 if bit == 2 else 0,
+                    }
+                    for bit in (1, 2, 8, 16)
+                ]
+            )
         if "SUM(" in sql:
             # SUM over zero rows is NULL in Snowflake, not 0.
             totals = {
@@ -292,6 +339,23 @@ def test_overview_page_shows_kpis_beside_sidebar_disconnect():
     assert _problems(at) == []
     assert at.button(key="rem_sf_disconnect").label == "Disconnect"
     assert at.metric[0].value == "12,654"
+    labels = [metric.label for metric in at.metric]
+    assert "Already OK · PROD" in labels
+    assert "Dry runs · PROD" in labels
+    assert "Fixable" in labels
+    assert "Live applied · UAT/DEV" in labels
+    assert "Latest snapshot" in labels
+    latest_snapshot = next(metric for metric in at.metric if metric.label == "Latest snapshot")
+    assert latest_snapshot.value == "2026-09-28"
+    assert any(
+        "Target type" in frame.value.columns and "Terminals covered" in frame.value.columns
+        for frame in at.dataframe
+    )
+    bit_coverage = next(
+        frame.value for frame in at.dataframe if "Live applied calls" in frame.value.columns
+    )
+    assert bit_coverage["Bit"].tolist() == [1, 2, 8, 16]
+    assert bit_coverage.loc[bit_coverage["Bit"] == 2, "Live applied calls"].iloc[0] == 1
 
 
 @pytest.mark.parametrize("environment", ["DEV", "UAT", "PROD"])
