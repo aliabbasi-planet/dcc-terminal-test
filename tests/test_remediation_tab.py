@@ -20,6 +20,14 @@ from dcc_console.remediation.mapping import TRACKED_CHECK_COLUMNS
 from dcc_console.remediation.sf_connection import SnowflakeSettings
 
 
+def _render_connection_sidebar() -> None:
+    from dcc_console.state import init_state
+    from dcc_console.ui.sidebar import render_connection
+
+    init_state()
+    render_connection()
+
+
 def _row(tid: str, **broken) -> dict:
     """One V_CURRENT_BROKEN row covering every Snowflake type the view returns."""
     return {
@@ -284,6 +292,21 @@ def test_overview_page_shows_kpis_beside_sidebar_disconnect():
     assert _problems(at) == []
     assert at.button(key="rem_sf_disconnect").label == "Disconnect"
     assert at.metric[0].value == "12,654"
+
+
+@pytest.mark.parametrize("environment", ["DEV", "UAT", "PROD"])
+def test_sidebar_uses_per_environment_sql_credentials(monkeypatch, environment):
+    username = f"{environment.lower()}-example-user"
+    password = f"{environment.lower()}-example-password"
+    monkeypatch.setenv(f"{environment}_DB_USERNAME", username)
+    monkeypatch.setenv(f"{environment}_DB_PASSWORD", password)
+
+    at = AppTest.from_function(_render_connection_sidebar)
+    at.session_state["active_env"] = environment
+    at.run()
+
+    assert at.text_input(key=f"db_user_{environment}").value == username
+    assert at.text_input(key=f"db_pass_{environment}").value == password
 
 
 def test_single_page_shows_worklist_and_fixer_prompt():

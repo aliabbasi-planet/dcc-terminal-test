@@ -320,7 +320,23 @@ def _render_analytics(conn: SnowflakeConnection, objs: RemediationObjects) -> No
     if dim_error:
         st.error(f"Could not read breakdown: {dim_error}")
     elif dim_df is not None and not dim_df.empty:
-        st.bar_chart(dim_df.set_index("CATEGORY"))
+        figure = px.bar(
+            dim_df,
+            x="TERMINALS",
+            y="CATEGORY",
+            orientation="h",
+            text="TERMINALS",
+        )
+        figure.update_traces(textposition="outside", cliponaxis=False)
+        figure.update_layout(
+            height=max(520, 32 * len(dim_df)),
+            margin={"l": 360, "r": 50, "t": 20, "b": 45},
+            xaxis_title="Actionable broken terminals",
+            yaxis_title=None,
+            yaxis={"categoryorder": "total ascending", "automargin": True},
+            showlegend=False,
+        )
+        st.plotly_chart(figure, use_container_width=True)
 
 
 def _render_activity(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
