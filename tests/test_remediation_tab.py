@@ -532,6 +532,92 @@ def test_batch_page_plans_and_rehearses_dry_runs_for_the_selection():
     assert sql.version == "1"  # nothing applied live
 
 
+def test_campaign_rehearsal_requires_and_logs_campaign_reference():
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    sql = FakeSql()
+    state = _batch_state("UAT", sql)
+    state["rem_page"] = "Campaign"
+    at = _render(snow, **state)
+
+    assert _problems(at) == []
+    assert not any(widget.key == "rem_campaign_name" for widget in at.text_input)
+    at.button(key="rem_campaign_load_targets").click().run()
+    terminal_targets = at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER")
+    assert terminal_targets.value == []
+    terminal_targets.set_value(["T-9"]).run()
+    assert at.text_input(key="rem_campaign_ref").value == ""
+    assert at.button(key="rem_campaign_run").disabled
+
+    at.text_input(key="rem_campaign_ref").set_value("UAT-DCC-20261008").run()
+    assert not at.button(key="rem_campaign_run").disabled
+    at.button(key="rem_campaign_run").click().run()
+
+    assert _problems(at) == []
+    assert [rollback for _, rollback in sql.calls] == [True]
+    rows = snow.fix_log_rows()
+    assert len(rows) == 1
+    assert rows[0]["MODE"] == "SIMULATION"
+    assert rows[0]["CHANGE_REF"] == "UAT-DCC-20261008"
+    assert "Campaign " in rows[0]["NOTES"]
+    assert not any("DCC_FIX_REGISTRY" in sql for sql, _ in snow.writes)
+
+
+def test_campaign_runs_only_the_selected_checks():
+    row = _row(
+        "T-9",
+        CONFIGDOWNLOAD_VERSION_CHECK_C=1,
+        HANDLER_DCCENABLE_CHECK_O=1,
+    )
+    snow = FakeSnowflake(rows=[row])
+    sql = FakeSql()
+    state = _batch_state("UAT", sql)
+    state["rem_page"] = "Campaign"
+    at = _render(snow, **state)
+
+    checks = at.multiselect(key="rem_campaign_checks")
+    checks.set_value(["CONFIGDOWNLOAD_VERSION_CHECK_C"]).run()
+    at.button(key="rem_campaign_load_targets").click().run()
+    at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER").set_value(["T-9"]).run()
+    at.text_input(key="rem_campaign_ref").set_value("UAT-BIT2-001").run()
+    at.button(key="rem_campaign_run").click().run()
+
+    assert _problems(at) == []
+    assert len(sql.calls) == 1
+    assert sql.calls[0][0][0] == 2
+    assert all(
+        row["CHECK_COLUMN"] == "CONFIGDOWNLOAD_VERSION_CHECK_C"
+        for row in snow.fix_log_rows()
+    )
+
+
+def test_campaign_live_uat_logs_and_registers_shared_reference():
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    sql = FakeSql()
+    state = _batch_state("UAT", sql, armed=True)
+    state["rem_page"] = "Campaign"
+    at = _render(snow, **state)
+    at.button(key="rem_campaign_load_targets").click().run()
+    at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER").set_value(["T-9"]).run()
+    at.radio(key="rem_campaign_mode").set_value("Apply live").run()
+    at.text_input(key="rem_campaign_ref").set_value("UAT-CAMPAIGN-002").run()
+    next(check for check in at.checkbox if check.label.startswith("I reviewed these")).check().run()
+
+    assert not at.button(key="rem_campaign_run").disabled
+    at.button(key="rem_campaign_run").click().run()
+
+    assert _problems(at) == []
+    assert sql.version == "2"
+    records = snow.fix_log_rows()
+    assert [record["MODE"] for record in records] == ["SIMULATION", "LIVE"]
+    assert all(record["CHANGE_REF"] == "UAT-CAMPAIGN-002" for record in records)
+    assert all(record["NOTES"].startswith("Campaign ") for record in records)
+    registry_writes = [
+        params for sql_text, params in snow.writes if "MERGE INTO" in sql_text
+        and "DCC_FIX_REGISTRY" in sql_text
+    ]
+    assert registry_writes and "UAT-CAMPAIGN-002" in registry_writes[0]
+
+
 def test_batch_prod_apply_is_blocked_without_approval_and_change_ref():
     snow = FakeSnowflake(rows=[_bit2_row()], can_prod=False)
     at = _render(snow, **_batch_state("PROD", FakeSql(), armed=True))

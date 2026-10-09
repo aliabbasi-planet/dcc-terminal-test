@@ -86,12 +86,14 @@ def _run_item(
     apply_live: bool,
     change_ref: str,
     batch_id: str,
+    campaign_mode: bool = False,
 ) -> ItemResult:
     """Run one call through pre-check → (dry run) → (apply + verify), logging each step."""
     step = item.step
     covered = list(item.covered_rows)
     correlation = fixer.new_correlation_id()
-    notes = f"Batch {batch_id}"
+    run_label = "Campaign" if campaign_mode else "Batch"
+    notes = f"{run_label} {batch_id}"
     target = f"{step.target_kind.split('_')[0].lower()} {step.target_identifier}"
     log_context = dict(
         step=step,
@@ -258,6 +260,7 @@ def _execute(
     armed_live: bool,
     apply_live: bool,
     change_ref: str,
+    campaign_mode: bool = False,
 ) -> list[ItemResult]:
     batch_id = fixer.new_correlation_id()[:12]
     results: list[ItemResult] = []
@@ -280,6 +283,7 @@ def _execute(
                 apply_live=apply_live,
                 change_ref=change_ref,
                 batch_id=batch_id,
+                campaign_mode=campaign_mode,
             )
         )
     progress.empty()
@@ -389,7 +393,7 @@ def render_batch_panel(
     *,
     armed_live: bool,
 ) -> None:
-    """Select terminals from the filtered worklist and fix all their broken checks."""
+    """Select terminals and fix all their broken checks using the batch workflow."""
     writes.show_notices()
     if worklist is None or worklist.empty:
         st.info("No terminals match the current filters. Adjust the filters above.")

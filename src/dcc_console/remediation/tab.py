@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from . import (
@@ -26,6 +27,7 @@ from . import (
     RemediationObjects,
     agent_panel,
     batch_panel,
+    campaign_panel,
     ddl,
     fix_panel,
     fixer,
@@ -294,7 +296,24 @@ def _render_analytics(conn: SnowflakeConnection, objs: RemediationObjects) -> No
             st.caption("No actionable broken terminals in the current snapshot.")
         else:
             st.caption("Actionable broken terminals per check")
-            st.bar_chart(totals.rename_axis("check").to_frame("terminals"))
+            chart_data = totals.rename_axis("check").reset_index(name="terminals")
+            figure = px.bar(
+                chart_data,
+                x="terminals",
+                y="check",
+                orientation="h",
+                text="terminals",
+            )
+            figure.update_traces(textposition="outside", cliponaxis=False)
+            figure.update_layout(
+                height=max(360, 34 * len(chart_data)),
+                margin={"l": 360, "r": 50, "t": 20, "b": 45},
+                xaxis_title="Actionable broken terminals",
+                yaxis_title=None,
+                yaxis={"categoryorder": "total ascending", "automargin": True},
+                showlegend=False,
+            )
+            st.plotly_chart(figure, use_container_width=True)
 
     dimension = st.selectbox("Group by dimension", DIMENSION_COLUMNS, index=0, key="rem_group_by")
     dim_df, dim_error = _run(conn, an.build_breakdown_query(dimension, objs, top_n=20))
@@ -469,7 +488,7 @@ def _render_fixer(
 
 
 _PAGE_KEY = "rem_page"
-_PAGES = ("Overview", "Single fix", "Batch fix")
+_PAGES = ("Overview", "Single fix", "Batch fix", "Campaign")
 
 
 def _render_overview(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
@@ -515,14 +534,19 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
     batch_panel.render_batch_panel(conn, objs, df, armed_live=armed_live)
 
 
+def _render_campaign(conn: SnowflakeConnection, objs: RemediationObjects, armed_live: bool) -> None:
+    """Run explicitly selected checks and targets as one CAB-referenced campaign."""
+    campaign_panel.render_campaign_panel(conn, objs, armed_live=armed_live)
+
+
 def render_remediation(armed_live: bool = False) -> None:
     """Entry point wired into the console's tab strip / PROD-streamlined layout.
 
     ``armed_live`` is the console's own Mode control: Live selected, the environment
     name typed, and the readiness probes passed. Apply live needs it (and much more).
 
-    The experience is split into three pages — **Overview** (statistics + agent),
-    **Single fix** and **Batch fix** — with the DCC maintenance agent on each.
+    The experience is split into four pages — **Overview**, **Single fix**,
+    **Batch fix** and **Campaign**.
     """
     st.subheader("DCC Remediation")
     _show_flash()
@@ -553,6 +577,8 @@ def render_remediation(armed_live: bool = False) -> None:
         _render_single(conn, objs, armed_live)
     elif page == "Batch fix":
         _render_batch(conn, objs, armed_live)
+    elif page == "Campaign":
+        _render_campaign(conn, objs, armed_live)
     else:
         _render_overview(conn, objs)
 
