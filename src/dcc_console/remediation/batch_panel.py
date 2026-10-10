@@ -18,14 +18,15 @@ Bit 16 (receipt template) is never auto-applied here — see :mod:`.batch`.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 import streamlit as st
 
 from ..execution import build_call
 from ..state import add_result
-from . import RemediationObjects, agent_panel, batch, fixer, fixlog, writes
+from . import RemediationObjects, agent_panel, batch, batch_upload, fixer, fixlog, writes
+from . import worklist as wl
 from .fix_panel import operator_status
 from .sf_connection import SnowflakeConnection
 
@@ -158,7 +159,21 @@ def _run_item(
             correlation_id=correlation,
         )
     except Exception as exc:
-        return result("ERROR", None, f"Dry run did not start: {exc}")
+        detail = f"Dry run did not start: {exc}"
+        writes.write_log(
+            conn,
+            objs,
+            fixer.log_records(
+                **log_context,
+                outcome="FAILED",
+                mode="SIMULATION",
+                verified=None,
+                pre=pre,
+                error=detail,
+            ),
+            summary=f"batch dry run start failure on {target}",
+        )
+        return result("ERROR", None, detail)
     add_result(dry_result)
     dry = fixer.DryRun(step.signature(environment), dry_result.status, time.time())
     recorded = fixer.dry_run_outcome(dry_result)
@@ -298,8 +313,8 @@ def _execute(
 def _render_plan(plan: batch.BatchPlan) -> None:
     cols = st.columns(4)
     cols[0].metric(
-        "Terminals selected", f"{len(plan.selected_terminals):,}",
-        help="Unique selected terminals, not the number of fixes or procedure calls.",
+        "Terminals affected", f"{len(plan.selected_terminals):,}",
+        help="Distinct broken terminals covered by the selected target-scope fix groups.",
     )
     cols[1].metric(
         "Fixes to run", f"{len(plan.items):,}",
@@ -328,8 +343,9 @@ def _render_plan(plan: batch.BatchPlan) -> None:
     extra = plan.terminals_with_extra_fixes
     if extra:
         st.info(
-            f"**{len(extra)}** selected terminal(s) are broken on more than one fixable check — "
-            "batch fixes **all** of them, not just the check you filtered on."
+            f"**{len(extra)}** affected terminal(s) are covered by more than one selected fix "
+            "group. Shared Instance/Location groups may also cover other broken terminals "
+            "shown in the coverage table."
         )
     if plan.items:
         rows = []
@@ -349,8 +365,8 @@ def _render_plan(plan: batch.BatchPlan) -> None:
     if plan.templates:
         with st.expander(f"Templates needing a manual choice ({len(plan.templates)})"):
             st.caption(
-                "Bit 16 templates are chosen per terminal and confirmed by an operator — fix "
-                "these on the **Single fix** page."
+                "Bit 16 is instance-level and requires an operator-selected receipt template. "
+                "Batch does not auto-apply it; handle these on the **Single fix** page."
             )
             st.dataframe(
                 pd.DataFrame(
@@ -415,118 +431,278 @@ def render_batch_panel(
     worklist: pd.DataFrame | None,
     *,
     armed_live: bool,
+    terminal_limit: int = MAX_BATCH_TERMINALS,
 ) -> None:
     """Select terminals and fix all their broken checks using the batch workflow."""
     writes.show_notices()
-    if (worklist is None or worklist.empty) and "rem_batch_loaded_rows" not in st.session_state:
-        st.info("No terminals match the current filters. Adjust the filters above.")
-        return
-
     available_rows = [] if worklist is None else worklist.to_dict("records")
     if "rem_batch_loaded_rows" not in st.session_state:
-        initial_rows = available_rows[:MAX_BATCH_TERMINALS]
-        st.session_state["rem_batch_loaded_rows"] = initial_rows
-        initial_ids = [str(row["TERMINAL_IDENTIFIER"]) for row in initial_rows]
-        st.session_state["rem_batch_loaded_ids"] = initial_ids
-        st.session_state["rem_batch_terminals"] = initial_ids
+        st.session_state["rem_batch_loaded_rows"] = []
+        st.session_state["rem_batch_loaded_ids"] = []
+        st.session_state["rem_batch_selected_fix_keys"] = []
+        st.session_state["rem_batch_known_fix_keys"] = []
+        st.session_state["rem_batch_scope_rows"] = {}
         st.session_state["rem_batch_editor_revision"] = 1
-    rows_all = st.session_state["rem_batch_loaded_rows"]
+    rows_all = list(st.session_state["rem_batch_loaded_rows"])
     ids_all = [str(r["TERMINAL_IDENTIFIER"]) for r in rows_all]
-    loaded_ids = st.session_state["rem_batch_loaded_ids"]
-    selected = set(st.session_state["rem_batch_terminals"])
-    table = pd.DataFrame(rows_all).copy()
-    if table.empty:
-        table = pd.DataFrame(columns=[
-            "TERMINAL_IDENTIFIER", "INSTANCE_IDENTIFIER", "LOCATION_NO", "MERCHANT_NAME",
-            "COUNTRY_NAME", "REMEDIATION_STATE",
-        ])
-    table["Broken checks"] = [fixer.describe_checks(row) for row in table.to_dict("records")]
-    columns = [column for column in (
-        "TERMINAL_IDENTIFIER", "INSTANCE_IDENTIFIER", "LOCATION_NO", "MERCHANT_NAME",
-        "COUNTRY_NAME", "REMEDIATION_STATE", "Broken checks",
-    ) if column in table.columns]
-    table = table[columns]
-    table.insert(0, "Include", table["TERMINAL_IDENTIFIER"].astype(str).isin(selected))
+    if available_rows:
+        indexes = {terminal_id: index for index, terminal_id in enumerate(ids_all)}
+        added_ids: list[str] = []
+        changed = False
+        for incoming in available_rows:
+            row = dict(incoming)
+            terminal_id = str(row["TERMINAL_IDENTIFIER"])
+            current_index = indexes.get(terminal_id)
+            if current_index is None:
+                if len(rows_all) >= terminal_limit:
+                    continue
+                indexes[terminal_id] = len(rows_all)
+                rows_all.append(row)
+                ids_all.append(terminal_id)
+                added_ids.append(terminal_id)
+                changed = True
+                continue
+
+            current = rows_all[current_index]
+            incoming_checks = row.get("_BATCH_CHECK_COLUMNS")
+            current_checks = current.get("_BATCH_CHECK_COLUMNS")
+            if incoming_checks is not None:
+                checks = set(incoming_checks)
+                if current_checks is not None:
+                    checks.update(current_checks)
+                updated = batch_upload.scope_row_to_checks(row, tuple(checks))
+                if current_checks is None or set(current_checks) != checks:
+                    rows_all[current_index] = updated
+                    changed = True
+            elif current_checks is not None or current != row:
+                rows_all[current_index] = row
+                changed = True
+
+        if changed:
+            st.session_state["rem_batch_loaded_rows"] = rows_all
+            st.session_state["rem_batch_loaded_ids"] = ids_all
+            st.session_state["rem_batch_authorise"] = False
+    terminal_limit = max(terminal_limit, len(rows_all))
+
+    planning_rows = [
+        batch_upload.scope_row_to_checks(row, tuple(row["_BATCH_CHECK_COLUMNS"]))
+        if row.get("_BATCH_CHECK_COLUMNS") is not None
+        else row
+        for row in rows_all
+    ]
+    candidate_plan = batch.plan_batch(planning_rows)
+    items = candidate_plan.items
+    scope_cache: dict = st.session_state["rem_batch_scope_rows"]
+    shared_items = [
+        item for item in items
+        if item.step.target_kind in ("INSTANCE_IDENTIFIER", "LOCATION_NO")
+    ]
+    missing_coverage = [item for item in shared_items if item.key not in scope_cache]
+    coverage_error = None
+    if missing_coverage:
+        targets = tuple(
+            (item.step.target_kind, item.step.target_identifier, item.step.check_column)
+            for item in missing_coverage
+        )
+        try:
+            coverage_sql, coverage_params = wl.build_shared_targets_query(targets, objs)
+            coverage_frame = conn.query(coverage_sql, coverage_params)
+        except Exception as exc:
+            coverage_frame = None
+            coverage_error = f"Could not verify all terminals covered by shared targets: {exc}"
+        if coverage_frame is not None:
+            coverage_rows = coverage_frame.to_dict("records")
+            for item in missing_coverage:
+                step = item.step
+                covered = [
+                    row for row in coverage_rows
+                    if str(row.get(step.target_kind) or "") == step.target_identifier
+                    and str(row.get(step.check_column) or "") == "1"
+                ]
+                row_ids = {str(row.get("TERMINAL_IDENTIFIER")) for row in covered}
+                for row in item.covered_rows:
+                    if str(row.get("TERMINAL_IDENTIFIER")) not in row_ids:
+                        covered.append(row)
+                        row_ids.add(str(row.get("TERMINAL_IDENTIFIER")))
+                if not covered:
+                    coverage_error = (
+                        f"Coverage lookup returned no broken terminals for "
+                        f"{step.flag.flag_name} on {step.target_identifier}."
+                    )
+                    covered = list(item.covered_rows)
+                scope_cache[item.key] = tuple(
+                    sorted(covered, key=lambda row: str(row.get("TERMINAL_IDENTIFIER")))
+                )
+        st.session_state["rem_batch_scope_rows"] = scope_cache
+
+    covered_items = tuple(
+        replace(item, covered_rows=scope_cache.get(item.key, item.covered_rows))
+        for item in items
+    )
+    candidate_plan = replace(candidate_plan, items=covered_items)
+
+    known_keys = set(st.session_state["rem_batch_known_fix_keys"])
+    current_keys = {item.key for item in candidate_plan.items}
+    selected_keys = set(st.session_state["rem_batch_selected_fix_keys"])
+    if available_rows:
+        new_fix_keys = current_keys - known_keys
+        if new_fix_keys:
+            selected_keys.update(new_fix_keys)
+            st.session_state["rem_batch_editor_revision"] += 1
+            st.session_state["rem_batch_authorise"] = False
+        st.session_state["rem_batch_selected_fix_keys"] = list(selected_keys)
+    st.session_state["rem_batch_known_fix_keys"] = list(known_keys | current_keys)
+    selected_keys.intersection_update(current_keys)
+
+    scope_labels = {
+        "TERMINAL_IDENTIFIER": "Terminal",
+        "INSTANCE_IDENTIFIER": "Instance",
+        "LOCATION_NO": "Location",
+    }
+
+    def joined_coverage_values(item: batch.BatchItem, column: str) -> str:
+        values = sorted(
+            {
+                str(row.get(column)).strip()
+                for row in item.covered_rows
+                if row.get(column) is not None and str(row.get(column)).strip()
+            }
+        )
+        return ", ".join(values) if values else "—"
+
+    selection_rows = []
+    selection_identity_to_key = {}
+    for item in candidate_plan.items:
+        step = item.step
+        scope = scope_labels.get(step.target_kind, step.target_kind)
+        identity = (
+            step.definition.bit,
+            step.flag.flag_name,
+            scope,
+            step.target_identifier,
+            str(step.config_value or ""),
+        )
+        selection_identity_to_key[identity] = item.key
+        selection_rows.append(
+            {
+                "Include": item.key in selected_keys,
+                "Bit": step.definition.bit,
+                "Check": step.flag.flag_name,
+                "Target scope": scope,
+                "Target": step.target_identifier,
+                "Value": step.config_value or "—",
+                "Terminals covered": len(item.covered_rows),
+                "Country": joined_coverage_values(item, "COUNTRY_NAME"),
+                "Region": joined_coverage_values(item, "REGION"),
+                "Terminal brand": joined_coverage_values(item, "TERMINAL_BRAND_NAME"),
+                "Acquirer": joined_coverage_values(item, "ACQUIRER_NAME"),
+            }
+        )
+    selection_table = pd.DataFrame(
+        selection_rows,
+        columns=[
+            "Include", "Bit", "Check", "Target scope", "Target", "Value",
+            "Terminals covered", "Country", "Region", "Terminal brand", "Acquirer",
+        ],
+    )
     with st.form("rem_batch_selection_form"):
-        requested_count = int(st.number_input(
-            "Terminal limit per run",
-            min_value=1,
-            max_value=5000,
-            value=MAX_BATCH_TERMINALS,
-            step=1,
-            key="rem_batch_terminal_limit",
-            help=(
-                "200 is the default safety setting, not a procedure limit. Set the total "
-                "maximum total rows to load, then press Load / add terminals. Newly added rows "
-                "are checked; existing rows and exclusions are preserved. Only filtered terminals "
-                "are available. Increase Max rows above if needed. The 300-fix cap remains."
-            ),
-        ))
+        st.caption(
+            "Each checkbox selects one procedure call at its actual scope. Instance and "
+            "Location rows include every currently broken terminal that the shared target "
+            "call can affect."
+        )
         edited = st.data_editor(
-            table,
+            selection_table,
             column_config={"Include": st.column_config.CheckboxColumn("Include")},
-            disabled=columns,
+            disabled=[column for column in selection_table.columns if column != "Include"],
             hide_index=True,
             use_container_width=True,
             key=f"rem_batch_selection_{st.session_state['rem_batch_editor_revision']}",
         )
-        controls = st.columns(3)
+        controls = st.columns(2)
         apply_selection = controls[0].form_submit_button(
             "Apply selection",
-            help="Save the checked rows to the plan. Does not load targets or execute fixes.",
-        )
-        load_more = controls[1].form_submit_button(
-            "Load / add terminals",
             help=(
-                "Add terminals matching the current filters up to the requested total. "
-                "Existing rows and exclusions stay unchanged; new rows are checked. "
-                "This also saves your checkbox changes but does not execute fixes."
+                "Save the checked target-scope fix groups. Does not load targets or execute "
+                "fixes."
             ),
         )
-        clear_table = controls[2].form_submit_button(
+        clear_table = controls[1].form_submit_button(
             "Empty table",
             help=(
-                "Remove all loaded terminals and clear the plan and live authorisation. "
-                "Filters stay unchanged. Load / add terminals fills the table again. "
-                "No database fixes or logs are deleted."
+                "Clear loaded terminals, fix groups and live authorisation. "
+                "Filters stay unchanged."
             ),
         )
     if clear_table:
         st.session_state["rem_batch_loaded_rows"] = []
         st.session_state["rem_batch_loaded_ids"] = []
-        st.session_state["rem_batch_terminals"] = []
+        st.session_state["rem_batch_selected_fix_keys"] = []
+        st.session_state["rem_batch_known_fix_keys"] = []
+        st.session_state["rem_batch_scope_rows"] = {}
         st.session_state["rem_batch_editor_revision"] += 1
         st.session_state["rem_batch_authorise"] = False
         st.rerun()
-    if apply_selection or load_more:
-        checked_ids = edited.loc[edited["Include"], "TERMINAL_IDENTIFIER"].astype(str).tolist()
-        if load_more:
-            additions = [
-                row for row in available_rows
-                if str(row["TERMINAL_IDENTIFIER"]) not in set(ids_all)
-            ][:max(0, requested_count - len(rows_all))]
-            new_rows = rows_all + additions
-            checked_ids.extend(str(row["TERMINAL_IDENTIFIER"]) for row in additions)
-            st.session_state["rem_batch_loaded_rows"] = new_rows
-            st.session_state["rem_batch_loaded_ids"] = [
-                str(row["TERMINAL_IDENTIFIER"]) for row in new_rows
-            ]
-        st.session_state["rem_batch_terminals"] = checked_ids
+    if apply_selection:
+        checked_keys = []
+        for _, row in edited.iterrows():
+            identity = (
+                int(row["Bit"]),
+                str(row["Check"]),
+                str(row["Target scope"]),
+                str(row["Target"]),
+                "" if str(row["Value"]) == "—" else str(row["Value"]),
+            )
+            key = selection_identity_to_key.get(identity)
+            if bool(row["Include"]) and key is not None:
+                checked_keys.append(key)
+        st.session_state["rem_batch_selected_fix_keys"] = checked_keys
         st.session_state["rem_batch_editor_revision"] += 1
         st.session_state["rem_batch_authorise"] = False
         st.rerun()
-    terminal_limit = len(loaded_ids)
-    selected_rows = [r for r in rows_all if str(r["TERMINAL_IDENTIFIER"]) in selected]
-    if not selected_rows:
-        st.info("Select at least one terminal to plan a batch.")
-        return
 
-    plan = batch.plan_batch(selected_rows)
+    selected_items = tuple(item for item in candidate_plan.items if item.key in selected_keys)
+    affected_rows_by_id = {}
+    fixes_per_terminal = {}
+    for item in selected_items:
+        for row in item.covered_rows:
+            terminal_id = str(row.get("TERMINAL_IDENTIFIER"))
+            affected_rows_by_id[terminal_id] = row
+            fixes_per_terminal[terminal_id] = fixes_per_terminal.get(terminal_id, 0) + 1
+    plan = replace(
+        candidate_plan,
+        items=selected_items,
+        selected_terminals=tuple(sorted(affected_rows_by_id)),
+        fixes_per_terminal=fixes_per_terminal,
+    )
+    if plan.items:
+        with st.expander("Terminals covered by the selected fix groups"):
+            coverage_table = [
+                {
+                    "Bit": item.step.definition.bit,
+                    "Check": item.step.flag.flag_name,
+                    "Target scope": scope_labels.get(item.step.target_kind, item.step.target_kind),
+                    "Target": item.step.target_identifier,
+                    "Terminal": str(row.get("TERMINAL_IDENTIFIER")),
+                    "Location": row.get("LOCATION_NO"),
+                    "Instance": row.get("INSTANCE_IDENTIFIER"),
+                }
+                for item in plan.items
+                for row in item.covered_rows
+            ]
+            st.dataframe(pd.DataFrame(coverage_table), use_container_width=True, hide_index=True)
     _render_plan(plan)
     agent_panel.render_account_agent(conn, context_key="batch")
 
+    if coverage_error:
+        st.error(coverage_error)
+        return
+
     if not plan.has_work:
-        st.info("Nothing to run for this selection (see manual / template items above).")
+        st.info(
+            "Check at least one automatic fix group to plan a Batch. "
+            "See manual/template items below."
+        )
         return
 
     over_cap = (

@@ -143,3 +143,58 @@ def build_shared_target_query(
         f"WHERE {target_column} = %s AND {check_column} = 1\n"
         f"ORDER BY TERMINAL_IDENTIFIER\nLIMIT {capped}"
     )
+
+
+def build_shared_targets_query(
+    targets: tuple[tuple[str, str, str], ...],
+    objs: RemediationObjects,
+    limit: int = 5000,
+) -> tuple[str, list]:
+    """Return all broken rows covered by selected shared-target fix groups.
+
+    Each target is ``(target_column, target_identifier, check_column)``. Identifiers are
+    bound parameters; columns are validated against mapping allowlists.
+    """
+    if not targets:
+        raise ValueError("At least one shared target is required.")
+    clauses: list[str] = []
+    params: list[str] = []
+    for target_column, target_identifier, check_column in targets:
+        if target_column not in ("INSTANCE_IDENTIFIER", "LOCATION_NO"):
+            raise ValueError(f"Unknown shared target column: {target_column!r}")
+        if check_column not in TRACKED_CHECK_COLUMNS:
+            raise ValueError(f"Unknown check column: {check_column!r}")
+        clauses.append(f"({target_column} = %s AND {check_column} = 1)")
+        params.append(target_identifier)
+    capped = max(1, min(int(limit), _MAX_LIMIT))
+    sql = (
+        f"SELECT * FROM {objs.v_current_broken}\n"  # noqa: S608
+        f"WHERE {' OR '.join(clauses)}\n"
+        f"ORDER BY TERMINAL_IDENTIFIER\nLIMIT {capped}"
+    )
+    return sql, params
+
+
+def build_uploaded_targets_query(
+    targets: tuple[tuple[str, str], ...],
+    objs: RemediationObjects,
+    limit: int = 5000,
+) -> tuple[str, list]:
+    """Return current actionable rows matching uploaded terminal/check pairs."""
+    if not targets:
+        raise ValueError("At least one uploaded terminal/check target is required.")
+    clauses: list[str] = []
+    params: list[str] = []
+    for terminal_id, check_column in targets:
+        if check_column not in FIXABLE_CHECK_COLUMNS:
+            raise ValueError(f"Unknown or non-fixable uploaded check: {check_column!r}")
+        clauses.append(f"(TERMINAL_IDENTIFIER = %s AND {check_column} = 1)")
+        params.append(terminal_id)
+    capped = max(1, min(int(limit), _MAX_LIMIT))
+    sql = (
+        f"SELECT * FROM {objs.v_current_broken}\n"  # noqa: S608
+        "WHERE REMEDIATION_STATE = 'ACTIONABLE'\n"
+        f"  AND ({' OR '.join(clauses)})\n"
+        f"ORDER BY TERMINAL_IDENTIFIER\nLIMIT {capped}"
+    )
+    return sql, params

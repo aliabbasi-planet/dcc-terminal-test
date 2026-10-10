@@ -27,6 +27,7 @@ from . import (
     RemediationObjects,
     agent_panel,
     batch_panel,
+    batch_upload,
     campaign_panel,
     ddl,
     fix_panel,
@@ -544,6 +545,7 @@ def _render_filters(
     *,
     key_prefix: str,
     include_target_filters: bool = False,
+    cache_distinct_values: bool = False,
 ) -> wl.WorklistFilters:
     """Shared filters, with optional exact target IDs for the Single-fix page."""
     top = st.columns(3)
@@ -566,9 +568,17 @@ def _render_filters(
     dimensions: dict[str, tuple[str, ...]] = {}
     dim_cols = st.columns(len(_FILTER_DIMS))
     for idx, column in enumerate(_FILTER_DIMS):
+        if cache_distinct_values:
+            cache = st.session_state.setdefault("rem_batch_filter_values", {})
+            cache_key = (id(conn), objs.v_current_broken, column)
+            if cache_key not in cache:
+                cache[cache_key] = _distinct_values(conn, column, objs)
+            options = cache[cache_key]
+        else:
+            options = _distinct_values(conn, column, objs)
         chosen = dim_cols[idx].multiselect(
             column.replace("_", " ").title(),
-            _distinct_values(conn, column, objs),
+            options,
             key=f"{key_prefix}_dim_{column}",
         )
         if chosen:
@@ -602,7 +612,11 @@ def _render_filters(
 
 
 def _run_worklist(
-    conn: SnowflakeConnection, objs: RemediationObjects, filters: wl.WorklistFilters
+    conn: SnowflakeConnection,
+    objs: RemediationObjects,
+    filters: wl.WorklistFilters,
+    *,
+    show_empty: bool = True,
 ) -> pd.DataFrame | None:
     """Run the worklist query for ``filters``; returns the rows (or None on empty/error)."""
     try:
@@ -615,9 +629,85 @@ def _run_worklist(
         st.error(f"Could not read worklist: {error}")
         return None
     if df is None or df.empty:
-        st.info("No terminals match the current filters.")
+        if show_empty:
+            st.info("No terminals match the current filters.")
         return None
     return df
+
+
+def _uploaded_batch_rows(
+    conn: SnowflakeConnection, objs: RemediationObjects, content: bytes
+) -> tuple[pd.DataFrame, list[str]]:
+    """Resolve uploaded requests to actionable, currently broken Snowflake rows."""
+    targets = batch_upload.parse_workbook(content)
+    query, params = wl.build_uploaded_targets_query(
+        tuple((target.terminal_identifier, target.check_column) for target in targets),
+        objs,
+    )
+    frame = conn.query(query, params)
+    by_terminal = {
+        str(row.get("TERMINAL_IDENTIFIER")): row for row in frame.to_dict("records")
+    }
+    checks_by_terminal: dict[str, set[str]] = {}
+    warnings: list[str] = []
+    metadata_columns = {
+        "INSTANCE_IDENTIFIER": "INSTANCE_IDENTIFIER",
+        "LOCATION_NO": "LOCATION_NO",
+        "LOCATION_NAME": "LOCATION_NAME",
+        "COUNTRY_NAME": "COUNTRY_NAME",
+        "BANK_MERCHANT_ID": "BANK_MERCHANT_ID",
+        "ACQUIRER_NAME": "ACQUIRER_NAME",
+    }
+    for target in targets:
+        row = by_terminal.get(target.terminal_identifier)
+        if row is None or str(row.get(target.check_column) or "") != "1":
+            warnings.append(
+                f"Excel row {target.row_number}: terminal {target.terminal_identifier} "
+                f"is not currently ACTIONABLE and broken on {target.check_column}; skipped."
+            )
+            continue
+        mismatches = []
+        for uploaded_column, row_column in metadata_columns.items():
+            uploaded_value = target.metadata.get(uploaded_column)
+            actual_value = row.get(row_column)
+            if not uploaded_value or actual_value is None:
+                continue
+            if uploaded_column == "LOCATION_NO":
+                matches = (
+                    batch_upload.normalise_location_no(uploaded_value)
+                    == batch_upload.normalise_location_no(actual_value)
+                )
+            else:
+                uploaded_text = str(uploaded_value).strip().casefold()
+                actual_text = str(actual_value).strip().casefold()
+                matches = uploaded_text == actual_text
+            if not matches:
+                mismatches.append(uploaded_column)
+        if mismatches:
+            warnings.append(
+                f"Excel row {target.row_number}: uploaded metadata differs from the current "
+                f"snapshot ({', '.join(mismatches)}); skipped."
+            )
+            continue
+        checks_by_terminal.setdefault(target.terminal_identifier, set()).add(target.check_column)
+
+    rows = [
+        batch_upload.scope_row_to_checks(by_terminal[terminal_id], tuple(checks))
+        for terminal_id, checks in checks_by_terminal.items()
+    ]
+    return pd.DataFrame(rows), warnings
+
+
+def _load_batch_targets(
+    conn: SnowflakeConnection,
+    objs: RemediationObjects,
+    filters: wl.WorklistFilters,
+    uploaded_file,
+) -> tuple[pd.DataFrame | None, list[str]]:
+    """Load from the workbook exclusively, or use filters when no workbook is supplied."""
+    if uploaded_file is not None:
+        return _uploaded_batch_rows(conn, objs, uploaded_file.getvalue())
+    return _run_worklist(conn, objs, filters), []
 
 
 def _render_worklist_grid(
@@ -689,7 +779,7 @@ _PAGES = ("Overview", "Single fix", "Batch fix", "Campaign")
 
 
 def _render_overview(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
-    """Main page: insightful fleet statistics, recent activity, handoff, and the agent."""
+    """Main page: fleet statistics, recent activity, handoff, and the agent."""
     st.caption("Fleet health, recent activity, and the daily fix-confirmation handoff.")
     _render_kpis(conn, objs)
     with st.container(border=True):
@@ -722,14 +812,78 @@ def _render_single(conn: SnowflakeConnection, objs: RemediationObjects, armed_li
 
 
 def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_live: bool) -> None:
-    """Batch-fix page: filter + select terminals + fix every broken check they have."""
+    """Batch-fix page: filter terminals, then select fixes at their actual target scope."""
     st.caption(
-        "Fix many terminals at once: filter, choose terminals, and apply every fixable broken "
-        "check they have — not only the check you filtered on. Every attempt is logged."
+        "Filter broken terminals, then choose procedure calls by their real target scope: "
+        "Location (Bit 1), Terminal (Bit 2), or Instance (Bit 8). Shared-target calls include "
+        "all matching broken terminals in the coverage table. Bit 16 is also instance-level, "
+        "but remains manual here because its receipt template needs operator selection. "
+        "Every attempt is logged."
     )
-    filters = _render_filters(conn, objs, key_prefix="rembatch", include_target_filters=True)
-    df = _run_worklist(conn, objs, filters)
-    batch_panel.render_batch_panel(conn, objs, df, armed_live=armed_live)
+    with st.form("rem_batch_filter_form"):
+        filters = _render_filters(
+            conn,
+            objs,
+            key_prefix="rembatch",
+            include_target_filters=True,
+            cache_distinct_values=True,
+        )
+        terminal_limit = int(
+            st.number_input(
+                "Terminal limit per run",
+                min_value=1,
+                max_value=5000,
+                value=batch_panel.MAX_BATCH_TERMINALS,
+                step=1,
+                key="rem_batch_terminal_limit",
+                help=(
+                    "Set the maximum total number of matching terminals to load into the "
+                    "Batch table. Only submitted by Load / add terminals. The separate "
+                    "300-fix cap still applies."
+                ),
+            )
+        )
+        uploaded_file = st.file_uploader(
+            "Add targets from Excel (.xlsx)",
+            type=["xlsx"],
+            key="rem_batch_upload_file",
+            help=(
+                "Upload the target list with Change Type, instance_identifier, location_no, "
+                "location_desc, country_name, bank_merchant_id, acquirer_name and TerminalID. "
+                "When a file is supplied, only validated file targets are loaded; filter results "
+                "are not added. Rows must match current actionable broken data."
+            ),
+        )
+        load_terminals = st.form_submit_button(
+            "Load / add terminals",
+            type="primary",
+            help=(
+                "Apply the filters and optional Excel target list, then add matching broken "
+                "targets. Changing filters or uploading a file alone does not query or change "
+                "the Batch table. Existing rows and unchecked selections are preserved."
+            ),
+        )
+    df = None
+    if load_terminals:
+        try:
+            df, load_warnings = _load_batch_targets(conn, objs, filters, uploaded_file)
+            for warning in load_warnings[:10]:
+                st.warning(warning)
+            if len(load_warnings) > 10:
+                st.caption(f"{len(load_warnings) - 10} additional upload row(s) were skipped.")
+            if uploaded_file is not None and (df is None or df.empty):
+                st.warning("The Excel upload produced no actionable broken targets.")
+        except ValueError as exc:
+            st.error(f"Excel file validation failed: {exc}")
+        except Exception as exc:
+            st.error(f"Could not load Batch targets: {exc}")
+    batch_panel.render_batch_panel(
+        conn,
+        objs,
+        df,
+        armed_live=armed_live,
+        terminal_limit=terminal_limit,
+    )
 
 
 def _render_campaign(conn: SnowflakeConnection, objs: RemediationObjects, armed_live: bool) -> None:
