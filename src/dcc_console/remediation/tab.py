@@ -727,7 +727,7 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
         "Fix many terminals at once: filter, choose terminals, and apply every fixable broken "
         "check they have — not only the check you filtered on. Every attempt is logged."
     )
-    filters = _render_filters(conn, objs, key_prefix="rembatch")
+    filters = _render_filters(conn, objs, key_prefix="rembatch", include_target_filters=True)
     df = _run_worklist(conn, objs, filters)
     batch_panel.render_batch_panel(conn, objs, df, armed_live=armed_live)
 

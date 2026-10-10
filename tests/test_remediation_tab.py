@@ -384,7 +384,7 @@ def test_single_page_shows_worklist_and_fixer_prompt():
     assert at.text_input(key="rem_target_TERMINAL_IDENTIFIER")
 
 
-def test_batch_page_does_not_show_single_target_filters():
+def test_batch_page_shows_exact_target_filters():
     at = _render(FakeSnowflake(), rem_page="Batch fix")
 
     assert _problems(at) == []
@@ -393,7 +393,7 @@ def test_batch_page_does_not_show_single_target_filters():
         "rembatch_target_INSTANCE_IDENTIFIER",
         "rembatch_target_TERMINAL_IDENTIFIER",
     }
-    assert not target_filter_keys.intersection({widget.key for widget in at.text_input})
+    assert target_filter_keys.issubset({widget.key for widget in at.text_input})
 
 
 def test_empty_snapshot_renders_without_errors():
@@ -617,6 +617,99 @@ def test_batch_page_plans_and_rehearses_dry_runs_for_the_selection():
     assert [rollback for _, rollback in sql.calls] == [True]
     assert [(r["MODE"], r["OUTCOME"]) for r in snow.fix_log_rows()] == [("SIMULATION", "SIMULATED")]
     assert sql.version == "1"  # nothing applied live
+
+
+def test_batch_terminal_limit_updates_selection_and_allows_more_than_200():
+    snow = FakeSnowflake(rows=[_bit2_row(f"T-{index:04}") for index in range(201)])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+
+    assert at.number_input(key="rem_batch_terminal_limit").value == 200
+    assert not any(widget.key == "rem_batch_terminals" for widget in at.multiselect)
+    assert len(at.session_state["rem_batch_terminals"]) == 200
+    selection_table = next(frame.value for frame in at.dataframe if "Include" in frame.value)
+    assert selection_table["Include"].all()
+    batch_metrics = [metric for metric in at.metric if metric.label in (
+        "Terminals selected", "Fixes to run", "Need manual template", "Manual follow-up"
+    )]
+    assert len(batch_metrics) == 4
+    assert all(metric.proto.help for metric in batch_metrics)
+
+    at.number_input(key="rem_batch_terminal_limit").set_value(250).run()
+    assert len(at.session_state["rem_batch_terminals"]) == 200
+    revision = at.session_state["rem_batch_editor_revision"]
+    at.session_state[f"rem_batch_selection_{revision}"] = {
+        "edited_rows": {0: {"Include": False}}, "added_rows": [], "deleted_rows": [],
+    }
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert len(at.session_state["rem_batch_terminals"]) == 200
+    assert "T-0000" not in at.session_state["rem_batch_terminals"]
+    assert "T-0200" in at.session_state["rem_batch_terminals"]
+    assert not at.button(key="rem_batch_run").disabled
+
+    at.number_input(key="rem_batch_terminal_limit").set_value(10).run()
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert len(at.session_state["rem_batch_terminals"]) == 200
+    revision = at.session_state["rem_batch_editor_revision"]
+    at.session_state[f"rem_batch_selection_{revision}"] = {
+        "edited_rows": {1: {"Include": False}}, "added_rows": [], "deleted_rows": [],
+    }
+    assert len(at.session_state["rem_batch_terminals"]) == 200
+    next(button for button in at.button if button.label == "Apply selection").click().run()
+    assert len(at.session_state["rem_batch_terminals"]) == 199
+    assert "T-0001" not in at.session_state["rem_batch_terminals"]
+
+
+def test_batch_filters_preserve_loaded_rows_until_explicit_add():
+    snow = FakeSnowflake(rows=[_bit2_row("T-OLD")])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    snow.frame = pd.DataFrame([_bit2_row("T-NEW")])
+    at.text_input(key="rembatch_target_TERMINAL_IDENTIFIER").set_value("T-NEW").run()
+
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-OLD"]
+    assert at.session_state["rem_batch_terminals"] == ["T-OLD"]
+    next(button for button in at.button if button.label == "Apply selection").click().run()
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-OLD"]
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-OLD", "T-NEW"]
+    assert at.session_state["rem_batch_terminals"] == ["T-OLD", "T-NEW"]
+    assert all(button.proto.help for button in at.button if button.label in (
+        "Apply selection", "Load / add terminals",
+    ))
+
+
+def test_batch_empty_table_stays_empty_until_explicit_load():
+    snow = FakeSnowflake(rows=[_bit2_row("T-OLD")])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    at.session_state["rem_batch_authorise"] = True
+    next(button for button in at.button if button.label == "Empty table").click().run()
+
+    assert _problems(at) == []
+    assert at.session_state["rem_batch_loaded_rows"] == []
+    assert at.session_state["rem_batch_terminals"] == []
+    assert not at.session_state["rem_batch_authorise"]
+    assert not any(button.key == "rem_batch_run" for button in at.button)
+
+    snow.frame = pd.DataFrame([_bit2_row("T-NEW")])
+    at.text_input(key="rembatch_target_TERMINAL_IDENTIFIER").set_value("T-NEW").run()
+    assert at.session_state["rem_batch_loaded_rows"] == []
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-NEW"]
+    assert at.session_state["rem_batch_terminals"] == ["T-NEW"]
+
+
+def test_batch_configurable_limit_keeps_procedure_call_cap():
+    snow = FakeSnowflake(rows=[_bit2_row(f"T-{index:04}") for index in range(301)])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    at.number_input(key="rem_batch_terminal_limit").set_value(301).run()
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert len(at.exception) == 0
+    assert at.button(key="rem_batch_run").disabled
+    assert any("300 fixes" in error.value for error in at.error)
 
 
 def test_campaign_rehearsal_requires_and_logs_campaign_reference():

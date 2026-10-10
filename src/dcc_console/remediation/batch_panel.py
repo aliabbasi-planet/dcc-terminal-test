@@ -297,10 +297,33 @@ def _execute(
 
 def _render_plan(plan: batch.BatchPlan) -> None:
     cols = st.columns(4)
-    cols[0].metric("Terminals selected", f"{len(plan.selected_terminals):,}")
-    cols[1].metric("Fixes to run", f"{len(plan.items):,}")
-    cols[2].metric("Need manual template", f"{len(plan.templates):,}")
-    cols[3].metric("Manual follow-up", f"{len(plan.manual):,}")
+    cols[0].metric(
+        "Terminals selected", f"{len(plan.selected_terminals):,}",
+        help="Unique selected terminals, not the number of fixes or procedure calls.",
+    )
+    cols[1].metric(
+        "Fixes to run", f"{len(plan.items):,}",
+        help=(
+            "Planned automatic procedure calls for unresolved broken checks. Shared "
+            "instance/location checks are grouped into one call. Each live fix also "
+            "requires a dry run; already-correct targets are skipped after pre-check."
+        ),
+    )
+    cols[2].metric(
+        "Need manual template", f"{len(plan.templates):,}",
+        help=(
+            "Bit 16 target/check groups needing an operator-selected receipt template. "
+            "These are excluded from automatic Batch execution; use Single fix."
+        ),
+    )
+    cols[3].metric(
+        "Manual follow-up", f"{len(plan.manual):,}",
+        help=(
+            "Terminal/check findings that cannot be planned automatically, such as "
+            "unsupported checks or missing target identifiers. These require investigation "
+            "and are not included in Fixes to run."
+        ),
+    )
 
     extra = plan.terminals_with_extra_fixes
     if extra:
@@ -395,21 +418,104 @@ def render_batch_panel(
 ) -> None:
     """Select terminals and fix all their broken checks using the batch workflow."""
     writes.show_notices()
-    if worklist is None or worklist.empty:
+    if (worklist is None or worklist.empty) and "rem_batch_loaded_rows" not in st.session_state:
         st.info("No terminals match the current filters. Adjust the filters above.")
         return
 
-    rows_all = worklist.to_dict("records")
+    available_rows = [] if worklist is None else worklist.to_dict("records")
+    if "rem_batch_loaded_rows" not in st.session_state:
+        initial_rows = available_rows[:MAX_BATCH_TERMINALS]
+        st.session_state["rem_batch_loaded_rows"] = initial_rows
+        initial_ids = [str(row["TERMINAL_IDENTIFIER"]) for row in initial_rows]
+        st.session_state["rem_batch_loaded_ids"] = initial_ids
+        st.session_state["rem_batch_terminals"] = initial_ids
+        st.session_state["rem_batch_editor_revision"] = 1
+    rows_all = st.session_state["rem_batch_loaded_rows"]
     ids_all = [str(r["TERMINAL_IDENTIFIER"]) for r in rows_all]
-    default = ids_all[:MAX_BATCH_TERMINALS]
-    selected_ids = st.multiselect(
-        "Terminals in this batch",
-        ids_all,
-        default=default,
-        key="rem_batch_terminals",
-        help="Batch fixes every fixable broken check on each selected terminal.",
-    )
-    selected = set(selected_ids)
+    loaded_ids = st.session_state["rem_batch_loaded_ids"]
+    selected = set(st.session_state["rem_batch_terminals"])
+    table = pd.DataFrame(rows_all).copy()
+    if table.empty:
+        table = pd.DataFrame(columns=[
+            "TERMINAL_IDENTIFIER", "INSTANCE_IDENTIFIER", "LOCATION_NO", "MERCHANT_NAME",
+            "COUNTRY_NAME", "REMEDIATION_STATE",
+        ])
+    table["Broken checks"] = [fixer.describe_checks(row) for row in table.to_dict("records")]
+    columns = [column for column in (
+        "TERMINAL_IDENTIFIER", "INSTANCE_IDENTIFIER", "LOCATION_NO", "MERCHANT_NAME",
+        "COUNTRY_NAME", "REMEDIATION_STATE", "Broken checks",
+    ) if column in table.columns]
+    table = table[columns]
+    table.insert(0, "Include", table["TERMINAL_IDENTIFIER"].astype(str).isin(selected))
+    with st.form("rem_batch_selection_form"):
+        requested_count = int(st.number_input(
+            "Terminal limit per run",
+            min_value=1,
+            max_value=5000,
+            value=MAX_BATCH_TERMINALS,
+            step=1,
+            key="rem_batch_terminal_limit",
+            help=(
+                "200 is the default safety setting, not a procedure limit. Set the total "
+                "maximum total rows to load, then press Load / add terminals. Newly added rows "
+                "are checked; existing rows and exclusions are preserved. Only filtered terminals "
+                "are available. Increase Max rows above if needed. The 300-fix cap remains."
+            ),
+        ))
+        edited = st.data_editor(
+            table,
+            column_config={"Include": st.column_config.CheckboxColumn("Include")},
+            disabled=columns,
+            hide_index=True,
+            use_container_width=True,
+            key=f"rem_batch_selection_{st.session_state['rem_batch_editor_revision']}",
+        )
+        controls = st.columns(3)
+        apply_selection = controls[0].form_submit_button(
+            "Apply selection",
+            help="Save the checked rows to the plan. Does not load targets or execute fixes.",
+        )
+        load_more = controls[1].form_submit_button(
+            "Load / add terminals",
+            help=(
+                "Add terminals matching the current filters up to the requested total. "
+                "Existing rows and exclusions stay unchanged; new rows are checked. "
+                "This also saves your checkbox changes but does not execute fixes."
+            ),
+        )
+        clear_table = controls[2].form_submit_button(
+            "Empty table",
+            help=(
+                "Remove all loaded terminals and clear the plan and live authorisation. "
+                "Filters stay unchanged. Load / add terminals fills the table again. "
+                "No database fixes or logs are deleted."
+            ),
+        )
+    if clear_table:
+        st.session_state["rem_batch_loaded_rows"] = []
+        st.session_state["rem_batch_loaded_ids"] = []
+        st.session_state["rem_batch_terminals"] = []
+        st.session_state["rem_batch_editor_revision"] += 1
+        st.session_state["rem_batch_authorise"] = False
+        st.rerun()
+    if apply_selection or load_more:
+        checked_ids = edited.loc[edited["Include"], "TERMINAL_IDENTIFIER"].astype(str).tolist()
+        if load_more:
+            additions = [
+                row for row in available_rows
+                if str(row["TERMINAL_IDENTIFIER"]) not in set(ids_all)
+            ][:max(0, requested_count - len(rows_all))]
+            new_rows = rows_all + additions
+            checked_ids.extend(str(row["TERMINAL_IDENTIFIER"]) for row in additions)
+            st.session_state["rem_batch_loaded_rows"] = new_rows
+            st.session_state["rem_batch_loaded_ids"] = [
+                str(row["TERMINAL_IDENTIFIER"]) for row in new_rows
+            ]
+        st.session_state["rem_batch_terminals"] = checked_ids
+        st.session_state["rem_batch_editor_revision"] += 1
+        st.session_state["rem_batch_authorise"] = False
+        st.rerun()
+    terminal_limit = len(loaded_ids)
     selected_rows = [r for r in rows_all if str(r["TERMINAL_IDENTIFIER"]) in selected]
     if not selected_rows:
         st.info("Select at least one terminal to plan a batch.")
@@ -424,12 +530,12 @@ def render_batch_panel(
         return
 
     over_cap = (
-        len(plan.selected_terminals) > MAX_BATCH_TERMINALS or len(plan.items) > MAX_BATCH_ITEMS
+        len(plan.selected_terminals) > terminal_limit or len(plan.items) > MAX_BATCH_ITEMS
     )
     if over_cap:
         st.error(
             f"This batch is too large ({len(plan.selected_terminals)} terminals, "
-            f"{len(plan.items)} fixes). The cap is {MAX_BATCH_TERMINALS} terminals / "
+            f"{len(plan.items)} fixes). The cap is {terminal_limit} terminals / "
             f"{MAX_BATCH_ITEMS} fixes — narrow the filters or deselect some terminals."
         )
 
