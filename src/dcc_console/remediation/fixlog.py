@@ -167,6 +167,23 @@ def build_terminal_history_query(objs: RemediationObjects, limit: int = 50) -> s
     )
 
 
+def build_batch_history_query(
+    objs: RemediationObjects, terminals: tuple[str, ...]
+) -> tuple[str, list]:
+    """All audit rows for every terminal covered by a Batch selection."""
+    identifiers = list(dict.fromkeys(terminals))
+    if not identifiers:
+        raise ValueError("At least one covered terminal is required.")
+    placeholders = ", ".join(["%s"] * len(identifiers))
+    sql = (
+        f"SELECT {', '.join(_HISTORY_COLUMNS)}, TERMINAL_IDENTIFIER, CHANGE_REF\n"
+        f"FROM {objs.fix_log_table}\n"
+        f"WHERE TERMINAL_IDENTIFIER IN ({placeholders})\n"
+        "ORDER BY APPLIED_AT DESC, FIX_ID DESC"
+    )
+    return sql, identifiers
+
+
 def build_operator_check_query(objs: RemediationObjects) -> str:
     """The signed-in Snowflake user, whether they may fix live, and whether on PROD.
 

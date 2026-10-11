@@ -692,6 +692,19 @@ def render_batch_panel(
             ]
             st.dataframe(pd.DataFrame(coverage_table), use_container_width=True, hide_index=True)
     _render_plan(plan)
+    if plan.selected_terminals:
+        with st.expander("Fix history for terminals covered by this batch"):
+            history_sql, history_params = fixlog.build_batch_history_query(
+                objs, plan.selected_terminals
+            )
+            history, history_error = _query(conn, history_sql, history_params)
+            if history_error:
+                st.caption(f"History unavailable: {history_error}")
+            elif history is None or history.empty:
+                st.caption("No attempts logged yet for the covered terminals.")
+            else:
+                st.caption("All audit rows for covered terminals, including previous runs.")
+                st.dataframe(history, use_container_width=True, hide_index=True)
     agent_panel.render_account_agent(conn, context_key="batch")
 
     if coverage_error:
@@ -735,7 +748,28 @@ def render_batch_panel(
     )
     apply_live = mode.startswith("Apply")
 
-    change_ref = ""
+    rehearsal_signature = (
+        id(sql_conn), environment, sql_conn.server, sql_conn.database,
+        tuple((item.key, item.terminals) for item in plan.items),
+    )
+    rehearsal = st.session_state.get("rem_batch_rehearsal")
+    rehearsal_ready = bool(
+        rehearsal
+        and rehearsal[0] == rehearsal_signature
+        and time.time() - rehearsal[1] <= fixer.FRESHNESS_S
+        and rehearsal[2]
+    )
+    change_ref = st.text_input(
+        "Change / CAB reference",
+        key="rem_batch_change_ref",
+        max_chars=120,
+        placeholder="e.g. CHG0043215 or batch reference",
+        help=(
+            "Recorded in CHANGE_REF on every APP_FIX_LOG row for this Batch, including "
+            "pre-check outcomes, dry runs and live attempts, and on eligible registry entries. "
+            "Required for Apply live on PROD; optional for other runs."
+        ),
+    ).strip()
     authorised = False
     if apply_live:
         where = f"{environment} · {sql_conn.server}/{sql_conn.database}"
@@ -743,13 +777,12 @@ def render_batch_panel(
             f"**{where}{' — PRODUCTION' if is_prod else ''}.** Apply live runs the gated "
             "pre-check → dry run → apply → verify cycle on every fix below."
         )
-        if is_prod:
-            change_ref = st.text_input(
-                "Change / CAB reference (required for PROD)",
-                key="rem_batch_change_ref",
-                placeholder="e.g. CHG0043215",
-            ).strip()
-        with st.expander(f"Exact statements Apply live will run ({len(plan.items)})"):
+        with st.expander(f"Conditional live statements for selected fixes ({len(plan.items)})"):
+            st.caption(
+                "Every target gets a fresh pre-check. Already OK and NOT_FOUND outcomes "
+                "are logged and skipped without calling the procedure. Targets needing a "
+                "fix get another dry run before the live gates permit Apply."
+            )
             for it in plan.items:
                 _, _, rendered = build_call(
                     it.step.definition,
@@ -766,6 +799,8 @@ def render_batch_panel(
 
     if apply_live:
         blockers = []
+        if not rehearsal_ready:
+            blockers.append("run a successful rehearsal of this exact selection within 15 minutes")
         if not is_operator:
             blockers.append("not on the operator list")
         if not armed_live:
@@ -782,6 +817,8 @@ def render_batch_panel(
     run_disabled = over_cap or (
         apply_live
         and not (
+            rehearsal_ready
+            and
             is_operator
             and armed_live
             and authorised
@@ -816,6 +853,18 @@ def render_batch_panel(
                 change_ref=change_ref,
             )
         st.session_state[_RESULTS_KEY] = results
+        if not apply_live:
+            successful = (
+                any(result.outcome == "REHEARSED" for result in results)
+                and all(result.outcome in (
+                    "REHEARSED", "SKIPPED_ALREADY_OK", "NOT_FOUND"
+                ) for result in results)
+            )
+            st.session_state["rem_batch_rehearsal"] = (
+                rehearsal_signature, time.time(), successful,
+            )
+        else:
+            st.session_state.pop("rem_batch_rehearsal", None)
         st.rerun()
 
     _render_results(st.session_state.get(_RESULTS_KEY) or [])

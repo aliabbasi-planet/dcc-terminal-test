@@ -623,12 +623,19 @@ def test_batch_page_plans_and_rehearses_dry_runs_for_the_selection():
     assert _problems(at) == []
     assert any(m.label == "Fixes to run" and m.value == "1" for m in at.metric)
     assert at.button(key="rem_batch_run").label == "Rehearse 1 fix(es)"
+    assert any(
+        expander.label == "Fix history for terminals covered by this batch"
+        for expander in at.expander
+    )
+    assert any("TERMINAL_IDENTIFIER IN (%s)" in query for query in snow.reads)
 
+    at.text_input(key="rem_batch_change_ref").set_value("BATCH-REHEARSAL-001").run()
     at.button(key="rem_batch_run").click().run()
     assert _problems(at) == []
     # A rehearse is a dry run only: the SP was called once and rolled back, logged SIMULATED.
     assert [rollback for _, rollback in sql.calls] == [True]
     assert [(r["MODE"], r["OUTCOME"]) for r in snow.fix_log_rows()] == [("SIMULATION", "SIMULATED")]
+    assert all(row["CHANGE_REF"] == "BATCH-REHEARSAL-001" for row in snow.fix_log_rows())
     assert sql.version == "1"  # nothing applied live
 
 
@@ -653,6 +660,39 @@ def test_batch_dry_run_start_exception_is_logged_as_failed_simulation(monkeypatc
     assert rows[0]["OUTCOME"] == "FAILED"
     assert "dry-run setup failed" in rows[0]["ERROR"]
     assert rows[0]["TERMINAL_IDENTIFIER"] == "T-9"
+
+
+def test_batch_live_requires_fresh_rehearsal_and_logs_every_execution():
+    snow = FakeSnowflake(rows=[_bit2_row()], can_prod=True)
+    sql = FakeSql()
+    at = _render(snow, **_batch_state("PROD", sql, armed=True))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    at.text_input(key="rem_batch_change_ref").set_value("CHG-BATCH-001").run()
+    at.radio(key="rem_batch_mode").set_value("Apply live").run()
+    at.checkbox(key="rem_batch_authorise").check().run()
+    assert at.button(key="rem_batch_run").disabled
+
+    at.radio(key="rem_batch_mode").set_value("Rehearse (dry run only)").run()
+    at.button(key="rem_batch_run").click().run()
+    at.radio(key="rem_batch_mode").set_value("Apply live").run()
+    at.checkbox(key="rem_batch_authorise").check().run()
+    assert not at.button(key="rem_batch_run").disabled
+
+    rehearsal = at.session_state["rem_batch_rehearsal"]
+    at.session_state["rem_batch_rehearsal"] = (rehearsal[0], 0, rehearsal[2])
+    at.run()
+    assert at.button(key="rem_batch_run").disabled
+    at.session_state["rem_batch_rehearsal"] = rehearsal
+    at.run()
+    at.button(key="rem_batch_run").click().run()
+
+    assert _problems(at) == []
+    assert [rollback for _, rollback in sql.calls] == [True, True, False]
+    assert [row["MODE"] for row in snow.fix_log_rows()] == [
+        "SIMULATION", "SIMULATION", "LIVE",
+    ]
+    assert all(row["CHANGE_REF"] == "CHG-BATCH-001" for row in snow.fix_log_rows())
+    assert at.button(key="rem_batch_run").disabled
 
 
 def test_batch_terminal_limit_updates_selection_and_allows_more_than_200():

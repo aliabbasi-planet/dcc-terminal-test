@@ -460,6 +460,19 @@ def test_view_reads_the_fix_registry_for_prod_resolutions():
     assert ddl.VIEW_MARKER_COLUMN in view
 
 
+def test_batch_history_query_uses_bound_covered_terminal_ids():
+    sql, params = fixlog.build_batch_history_query(OBJS, ("T-A", "T-B", "T-A"))
+    assert OBJS.fix_log_table in sql
+    assert "TERMINAL_IDENTIFIER IN (%s, %s)" in sql
+    assert "CHANGE_REF" in sql
+    assert "ORDER BY APPLIED_AT DESC, FIX_ID DESC" in sql
+    assert "LIMIT" not in sql
+    assert params == ["T-A", "T-B"]
+    assert "T-A" not in sql and "T-B" not in sql
+    with pytest.raises(ValueError, match="covered terminal"):
+        fixlog.build_batch_history_query(OBJS, ())
+
+
 def test_kpis_separate_prod_fixes_from_rehearsals():
     kpis = next(s for s in ddl.build_create_statements(OBJS) if "V_REMEDIATION_KPIS AS" in s)
     assert "AS TOTAL_LIVE_FIXES" in kpis and "AS REHEARSAL_FIXES" in kpis
