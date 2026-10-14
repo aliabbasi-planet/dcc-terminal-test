@@ -12,7 +12,7 @@ Two run modes:
   gate as the single fixer (operator, Mode armed, and on PROD a CAN_PROD operator + a
   change/CAB reference), plus one batch-wide authorisation of the exact statements.
 
-Bit 16 (receipt template) is never auto-applied here — see :mod:`.batch`.
+Bit 16 receipt templates use the workbook allowlist and require operator confirmation per instance.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from ..execution import build_call
 from ..state import add_result
 from . import RemediationObjects, agent_panel, batch, batch_upload, fixer, fixlog, writes
 from . import worklist as wl
-from .fix_panel import operator_status
+from .fix_panel import _choose_template, operator_status
 from .sf_connection import SnowflakeConnection
 
 # Guard-rails: one batch run is capped so a mis-click can't fan out across the fleet.
@@ -328,7 +328,7 @@ def _render_plan(plan: batch.BatchPlan) -> None:
         "Need manual template", f"{len(plan.templates):,}",
         help=(
             "Bit 16 target/check groups needing an operator-selected receipt template. "
-            "These are excluded from automatic Batch execution; use Single fix."
+            "Confirm a suggested template or choose another above to include them in Batch."
         ),
     )
     cols[3].metric(
@@ -366,7 +366,7 @@ def _render_plan(plan: batch.BatchPlan) -> None:
         with st.expander(f"Templates needing a manual choice ({len(plan.templates)})"):
             st.caption(
                 "Bit 16 is instance-level and requires an operator-selected receipt template. "
-                "Batch does not auto-apply it; handle these on the **Single fix** page."
+                "Choose and confirm a template above before this group can be run."
             )
             st.dataframe(
                 pd.DataFrame(
@@ -491,7 +491,12 @@ def render_batch_panel(
         for row in rows_all
     ]
     candidate_plan = batch.plan_batch(planning_rows)
-    items = candidate_plan.items
+    template_items = []
+    for template in candidate_plan.templates:
+        steps, _ = fixer.plan_for_row(template.covered_rows[0])
+        step = next(step for step in steps if step.check_column == template.check_column)
+        template_items.append(batch.BatchItem(step, template.covered_rows))
+    items = (*candidate_plan.items, *template_items)
     scope_cache: dict = st.session_state["rem_batch_scope_rows"]
     shared_items = [
         item for item in items
@@ -539,20 +544,48 @@ def render_batch_panel(
         replace(item, covered_rows=scope_cache.get(item.key, item.covered_rows))
         for item in items
     )
-    candidate_plan = replace(candidate_plan, items=covered_items)
+    executable_items = [item for item in covered_items if not item.step.needs_template]
+    pending_templates = []
+    receipt_items = [item for item in covered_items if item.step.needs_template]
+    if receipt_items:
+        with st.expander(
+            f"Bit 16 receipt templates ({len(receipt_items)} instances)", expanded=True
+        ):
+            for item in receipt_items:
+                with st.container(border=True):
+                    st.markdown(f"**Instance {item.step.target_identifier}**")
+                    chosen = _choose_template(
+                        conn,
+                        item.covered_rows[0],
+                        item.step,
+                        candidate_rows=item.covered_rows,
+                        batch_selection=True,
+                    )
+                if chosen.config_value is not None:
+                    executable_items.append(replace(item, step=chosen))
+                else:
+                    pending_templates.append(batch.TemplateItem(
+                        item.step.check_column, item.step.flag.flag_name, item.step.target_kind,
+                        item.step.target_identifier, item.covered_rows,
+                    ))
+    candidate_plan = replace(
+        candidate_plan, items=tuple(executable_items), templates=tuple(pending_templates)
+    )
 
     known_keys = set(st.session_state["rem_batch_known_fix_keys"])
     current_keys = {item.key for item in candidate_plan.items}
     selected_keys = set(st.session_state["rem_batch_selected_fix_keys"])
-    if available_rows:
-        new_fix_keys = current_keys - known_keys
-        if new_fix_keys:
-            selected_keys.update(new_fix_keys)
-            st.session_state["rem_batch_editor_revision"] += 1
-            st.session_state["rem_batch_authorise"] = False
-        st.session_state["rem_batch_selected_fix_keys"] = list(selected_keys)
+    new_fix_keys = {
+        item.key for item in candidate_plan.items
+        if item.key not in known_keys and (available_rows or item.step.needs_template)
+    }
+    if new_fix_keys:
+        selected_keys.update(new_fix_keys)
+        st.session_state["rem_batch_editor_revision"] += 1
+        st.session_state["rem_batch_authorise"] = False
     st.session_state["rem_batch_known_fix_keys"] = list(known_keys | current_keys)
     selected_keys.intersection_update(current_keys)
+    st.session_state["rem_batch_selected_fix_keys"] = list(selected_keys)
 
     scope_labels = {
         "TERMINAL_IDENTIFIER": "Terminal",
@@ -635,6 +668,28 @@ def render_batch_panel(
             ),
         )
     if clear_table:
+        for item in receipt_items:
+            terminal_id = str(item.covered_rows[0]["TERMINAL_IDENTIFIER"])
+            for key in (
+                f"rem_tpl_{terminal_id}",
+                f"rem_tpl_source_{terminal_id}",
+                f"rem_tpl_custom_{terminal_id}",
+                f"rem_tpl_selection_{terminal_id}",
+            ):
+                st.session_state.pop(key, None)
+            st.session_state.pop(
+                f"rem_batch_template_choice_{item.step.target_identifier}", None
+            )
+            for key in list(st.session_state):
+                if key.startswith(
+                    (
+                        f"rem_tpl_ok_{terminal_id}_",
+                        f"rem_tpl_rule_ok_{terminal_id}_",
+                        f"rem_tpl_confirm_{terminal_id}_",
+                    )
+                ):
+                    del st.session_state[key]
+        st.session_state.pop("rem_batch_rehearsal", None)
         st.session_state["rem_batch_loaded_rows"] = []
         st.session_state["rem_batch_loaded_ids"] = []
         st.session_state["rem_batch_selected_fix_keys"] = []

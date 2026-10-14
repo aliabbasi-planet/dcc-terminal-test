@@ -59,6 +59,18 @@ def test_parse_workbook_maps_handler_change_and_normalises_location_padding():
     assert target.metadata["COUNTRY_NAME"] == "Spain"
 
 
+@pytest.mark.parametrize("change_type", ["Receipt template DCC", "receipt TEMPLATE dcc"])
+def test_parse_workbook_accepts_receipt_template_dcc(change_type):
+    content = _workbook_bytes([
+        [change_type, "I0001", "011276", "Shop", "Spain", "00123", "Planet", "T-123"]
+    ])
+
+    [target] = parse_workbook(content)
+
+    assert target.check_column == "PRINTOUTTYPETEMPLATEDCC_CHECK_C"
+    assert target.terminal_identifier == "T-123"
+
+
 def test_parse_workbook_preserves_terminal_zeroes_from_excel_number_format():
     workbook = Workbook()
     sheet = workbook.active

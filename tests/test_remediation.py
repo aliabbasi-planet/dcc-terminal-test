@@ -622,25 +622,71 @@ def test_shared_target_query_validates_and_binds():
         wl.build_shared_target_query("LOCATION_NO", "NOT_A_CHECK", OBJS)
 
 
-def test_template_suggestions_bind_profile_and_skip_missing_levels():
-    full = suggest.build_template_suggestion_queries(
-        {"TERMINAL_BRAND_NAME": "PAX", "TERMINAL_MODEL_NAME": "A920", "ACQUIRER_NAME": "Elavon"}
+@pytest.mark.parametrize(
+    ("provider", "brand", "expected"),
+    [
+        ("PLANETPAYMENT", "PAX", ("PLANET_PAX",)),
+        ("PLANETPAYMENT", "Ingenico", ("PLANET_ING_5000", "PLANET_ING_LANE3000")),
+        ("PLANETPAYMENT", "ATOS WORLDLINE", ("PLANET",)),
+        ("PLANETPAYMENT", "VERIFONE", ("PLANET_VERIFONE",)),
+        ("Elavon", "PAX", ("ELAVONEUROPE_PAX",)),
+        ("ELAVON", "ATOS WORLDLINE", ("ELAVONEUROPE",)),
+        ("ELAVON", "INGENICO", ("ELAVONEUROPE_ING_5000",)),
+        ("FCC", "ATOS WORLDLINE", ("GLOBALBLUE",)),
+        ("FCC", "INGENICO", ("GLOBALBLUE_ING_5000",)),
+        ("FCC", "Verifone", ("GLOBALBLUEE355",)),
+        ("FCC", "PAX", ("GLOBALBLUE_PAX",)),
+        ("SIXPAYMENT", "ATOS WORLDLINE", ("SIX_WORDLINE",)),
+        ("SIXPAYMENT", "INGENICO", ("SIX_ING_5000", "SIX_ING_5000_UK")),
+        ("SIXPAYMENT", "PAX", ("SIX_PAX",)),
+        ("SIXMULTIPAY", "PAX", ("SIX_PAX",)),
+        ("FEXCO", "PAX", ("FEXCOEUROPE_PAX",)),
+        ("FEXCO", "ATOS WORLDLINE", ("FEXCOEUROPE_WORLDLINE",)),
+        ("Fexco", "Ingenico", ("FEXCOEUROPE_ING",)),
+        ("GLOBALBLUE", "PAX", ()),
+        ("Unknown", "PAX", ()),
+    ],
+)
+def test_template_rules_match_workbook_provider_and_brand(provider, brand, expected):
+    assert suggest.allowed_templates(
+        {"DCCPROVIDER_CODE": provider, "TERMINAL_BRAND_NAME": brand}
+    ) == expected
+
+
+def test_template_rule_intersection_requires_a_choice_valid_for_every_instance_terminal():
+    rows = [
+        {"DCCPROVIDER_CODE": "PLANETPAYMENT", "TERMINAL_BRAND_NAME": "INGENICO"},
+        {"DCCPROVIDER_CODE": "PLANETPAYMENT", "TERMINAL_BRAND_NAME": "Ingenico"},
+    ]
+    assert suggest.common_allowed_templates(rows) == (
+        "PLANET_ING_5000",
+        "PLANET_ING_LANE3000",
     )
-    assert [len(q.params) for q in full] == [3, 2]
-    assert full[0].params == ["PAX", "A920", "Elavon"]
-    assert "%s" in full[0].sql and "PAX" not in full[0].sql
-    no_acquirer = suggest.build_template_suggestion_queries(
-        {"TERMINAL_BRAND_NAME": "PAX", "TERMINAL_MODEL_NAME": "A920", "ACQUIRER_NAME": None}
+    rows.append({"DCCPROVIDER_CODE": "ELAVON", "TERMINAL_BRAND_NAME": "Ingenico"})
+    assert suggest.common_allowed_templates(rows) == ()
+
+
+def test_template_rules_use_dcc_provider_not_acquirer_name():
+    row = {
+        "DCCPROVIDER_CODE": "ELAVON",
+        "ACQUIRER_NAME": "PLANETPAYMENT",
+        "TERMINAL_BRAND_NAME": "PAX",
+    }
+    assert suggest.allowed_templates(row) == ("ELAVONEUROPE_PAX",)
+    assert suggest.allowed_templates(
+        {"ACQUIRER_NAME": "PLANETPAYMENT", "TERMINAL_BRAND_NAME": "PAX"}
+    ) == ()
+
+
+def test_provider_lookup_binds_unique_terminal_identifiers():
+    sql, params = suggest.build_provider_lookup_query(
+        [
+            {"TERMINAL_IDENTIFIER": "T-2"},
+            {"TERMINAL_IDENTIFIER": "T-1"},
+            {"TERMINAL_IDENTIFIER": "T-2"},
+        ]
     )
-    assert [len(q.params) for q in no_acquirer] == [2]
-    assert suggest.build_template_suggestion_queries({}) == []
-    assert MAINTENANCE_SOURCE in suggest.build_known_templates_query()
-
-
-def test_template_suggestion_summary_has_shares():
-    import pandas as pd
-
-    frame = pd.DataFrame({"TEMPLATE": ["Planet_PAX", "Six_PAX"], "TERMINALS": [95, 5]})
-    ranked = suggest.summarise(frame)
-    assert ranked[0].template == "Planet_PAX" and ranked[0].share == pytest.approx(0.95)
-    assert suggest.summarise(None) == []
+    assert MAINTENANCE_SOURCE in sql
+    assert "DCCPROVIDER_CODE" in sql
+    assert "TERMINAL_IDENTIFIER IN (%s, %s)" in sql
+    assert params == ["T-1", "T-2"]

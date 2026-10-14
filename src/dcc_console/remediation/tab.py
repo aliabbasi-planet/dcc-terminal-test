@@ -33,6 +33,7 @@ from . import (
     fix_panel,
     fixer,
     parse_schema_fqn,
+    registry,
     writes,
 )
 from . import analytics as an
@@ -227,6 +228,31 @@ def _render_kpis(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
         value = row.get(column)
         return f"{int(value or 0):,}"
 
+    fix_confirmed_df, fix_confirmed_error = _run(
+        conn,
+        f"SELECT COUNT(*) AS FIX_CONFIRMED_PROD FROM {objs.registry_table} "  # noqa: S608
+        f"WHERE ENVIRONMENT = 'PROD' AND STATUS = '{registry.STATUS_CONFIRMED}' "
+        "AND RESOLUTION = 'APPLIED'",
+    )
+    fix_confirmed = (
+        f"{int(fix_confirmed_df.iloc[0]['FIX_CONFIRMED_PROD'] or 0):,}"
+        if not fix_confirmed_error and fix_confirmed_df is not None and not fix_confirmed_df.empty
+        else "—"
+    )
+    fixed_terminals_df, fixed_terminals_error = _run(
+        conn,
+        f"SELECT COUNT(DISTINCT TERMINAL_IDENTIFIER) AS UNIQUE_FIXED_TERMINALS_PROD "  # noqa: S608
+        f"FROM {objs.confirmed_table} "  # noqa: S608
+        "WHERE ENVIRONMENT = 'PROD' AND RESOLUTION = 'APPLIED'",
+    )
+    fixed_terminals = (
+        f"{int(fixed_terminals_df.iloc[0]['UNIQUE_FIXED_TERMINALS_PROD'] or 0):,}"
+        if not fixed_terminals_error
+        and fixed_terminals_df is not None
+        and not fixed_terminals_df.empty
+        else "—"
+    )
+
     first_row = st.columns(4)
     first_row[0].metric(
         "Actionable broken",
@@ -297,8 +323,8 @@ def _render_kpis(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
         "Confirmed · PROD",
         count("CONFIRMED_FIXES"),
         help=(
-            "Registered PROD fixes confirmed healthy by a newer Cortex source load and "
-            "handed off by Reconcile."
+            "All registry resolutions confirmed by Cortex. Includes APPLIED fixes and "
+            "ALREADY_OK checks where the app did not change the value."
         ),
     )
     third_row[1].metric(
@@ -315,6 +341,21 @@ def _render_kpis(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
         help=(
             "Distinct successful LIVE procedure calls applied in UAT or DEV. These are "
             "committed outside PROD and are not included in PROD fix counts."
+        ),
+    )
+
+    app_fix_row = st.columns(2)
+    app_fix_row[0].metric(
+        "Fix confirmed · PROD",
+        fix_confirmed,
+        help="Confirmed PROD registry entries with RESOLUTION=APPLIED; excludes ALREADY_OK.",
+    )
+    app_fix_row[1].metric(
+        "Terminals fixed · PROD",
+        fixed_terminals,
+        help=(
+            "Distinct PROD terminals with an APPLIED row in DCC_CONFIRMED_FIXES. "
+            "A terminal with multiple fixes is counted once."
         ),
     )
 
@@ -351,9 +392,62 @@ def _render_reconcile(conn: SnowflakeConnection, objs: RemediationObjects) -> No
             return f"{int(row.get(column) or 0):,}"
 
         cols = st.columns(3)
-        cols[0].metric("Pending confirmation", count("PENDING_CONFIRMATION"))
-        cols[1].metric("Confirmed (registry)", count("CONFIRMED_IN_REGISTRY"))
-        cols[2].metric("Handed off to profit", count("HANDED_OFF"))
+        cols[0].metric(
+            "Pending confirmation",
+            count("PENDING_CONFIRMATION"),
+            help=(
+                "All FIXED PROD registry entries awaiting Cortex confirmation; "
+                "includes APPLIED and ALREADY_OK."
+            ),
+        )
+        cols[1].metric(
+            "Confirmed (registry)",
+            count("CONFIRMED_IN_REGISTRY"),
+            help="All confirmed registry entries; includes APPLIED and ALREADY_OK resolutions.",
+        )
+        cols[2].metric(
+            "Handed off to profit",
+            count("HANDED_OFF"),
+            help="All rows in DCC_CONFIRMED_FIXES; includes APPLIED and ALREADY_OK resolutions.",
+        )
+        applied_df, applied_error = _run(
+            conn,
+            f"SELECT\n"  # noqa: S608
+            f"    (SELECT COUNT(*) FROM {objs.registry_table}\n"
+            f"        WHERE ENVIRONMENT = 'PROD' AND STATUS = '{rec.registry.STATUS_FIXED}' "
+            "AND RESOLUTION = 'APPLIED') AS PENDING_CONFIRMATION_APPLIED,\n"
+            f"    (SELECT COUNT(*) FROM {objs.registry_table}\n"
+            f"        WHERE ENVIRONMENT = 'PROD' AND STATUS = '{rec.registry.STATUS_CONFIRMED}' "
+            "AND RESOLUTION = 'APPLIED') AS CONFIRMED_IN_REGISTRY_APPLIED,\n"
+            f"    (SELECT COUNT(*) FROM {objs.confirmed_table}\n"
+            "        WHERE ENVIRONMENT = 'PROD' AND RESOLUTION = 'APPLIED') AS HANDED_OFF_APPLIED",
+        )
+
+        def applied_count(column: str) -> str:
+            if applied_error or applied_df is None or applied_df.empty:
+                return "—"
+            return f"{int(applied_df.iloc[0].get(column) or 0):,}"
+
+        st.caption("App-applied fixes only (RESOLUTION = APPLIED; excludes ALREADY_OK)")
+        app_fix_cols = st.columns(3)
+        app_fix_cols[0].metric(
+            "Pending confirmation · App fixes",
+            applied_count("PENDING_CONFIRMATION_APPLIED"),
+            help=(
+                "PROD registry entries fixed by the app that are still awaiting "
+                "Cortex confirmation."
+            ),
+        )
+        app_fix_cols[1].metric(
+            "Confirmed · App fixes",
+            applied_count("CONFIRMED_IN_REGISTRY_APPLIED"),
+            help="App-applied PROD registry entries confirmed healthy by Cortex.",
+        )
+        app_fix_cols[2].metric(
+            "Handed off · App fixes",
+            applied_count("HANDED_OFF_APPLIED"),
+            help="App-applied rows in DCC_CONFIRMED_FIXES; excludes ALREADY_OK.",
+        )
     if st.button("Reconcile confirmed fixes now", use_container_width=True, key="rem_reconcile"):
         with st.spinner("Confirming fixes against the Cortex source..."):
             try:
@@ -530,6 +624,43 @@ def _render_fix_coverage(conn: SnowflakeConnection, objs: RemediationObjects) ->
             }
         )
         st.dataframe(by_bit, use_container_width=True, hide_index=True)
+
+    st.subheader("PROD terminals fixed by bit")
+    st.caption(
+        "Distinct terminals with an APPLIED PROD fix in DCC_FIX_REGISTRY; excludes ALREADY_OK. "
+        "A terminal fixed under multiple bits appears once under each bit."
+    )
+    applied_by_bit_df, applied_by_bit_error = _run(
+        conn,
+        f"SELECT FIX_BIT, COUNT(DISTINCT TERMINAL_IDENTIFIER) AS APP_FIXED_TERMINALS_BY_BIT\n"
+        f"FROM {objs.registry_table}\n"  # noqa: S608
+        f"WHERE ENVIRONMENT = 'PROD' AND STATUS IN ('{registry.STATUS_FIXED}', "
+        f"'{registry.STATUS_CONFIRMED}')\n"
+        "  AND RESOLUTION = 'APPLIED' AND FIX_BIT IN (1, 2, 8, 16)\n"
+        "GROUP BY FIX_BIT",
+    )
+    if applied_by_bit_error:
+        st.info(f"App-applied PROD terminal counts by bit unavailable: {applied_by_bit_error}")
+    else:
+        app_fixed_by_bit = (
+            {}
+            if applied_by_bit_df is None or applied_by_bit_df.empty
+            else {
+                int(row["FIX_BIT"]): int(row["APP_FIXED_TERMINALS_BY_BIT"] or 0)
+                for _, row in applied_by_bit_df.iterrows()
+            }
+        )
+        app_fixed_coverage = pd.DataFrame(
+            [
+                {
+                    "Bit": bit,
+                    "Fix area": bit_labels[bit],
+                    "Terminals fixed": app_fixed_by_bit.get(bit, 0),
+                }
+                for bit in (1, 2, 8, 16)
+            ]
+        )
+        st.dataframe(app_fixed_coverage, use_container_width=True, hide_index=True)
 
 
 def _distinct_values(conn: SnowflakeConnection, column: str, objs: RemediationObjects) -> list[str]:
@@ -816,8 +947,8 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
     st.caption(
         "Filter broken terminals, then choose procedure calls by their real target scope: "
         "Location (Bit 1), Terminal (Bit 2), or Instance (Bit 8). Shared-target calls include "
-        "all matching broken terminals in the coverage table. Bit 16 is also instance-level, "
-        "but remains manual here because its receipt template needs operator selection. "
+        "all matching broken terminals in the coverage table. Bit 16 is also instance-level "
+        "and requires confirming a suggested receipt template or selecting an override. "
         "Every attempt is logged."
     )
     with st.form("rem_batch_filter_form"):

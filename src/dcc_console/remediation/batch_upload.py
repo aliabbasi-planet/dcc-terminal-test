@@ -88,6 +88,8 @@ def _change_type_map() -> dict[str, str]:
         if not flag.fixable:
             continue
         names = [flag.check_column, flag.flag_name]
+        if flag.fix_bit == 16:
+            names.append("Receipt template DCC")
         if flag.fix_value and flag.fix_bit in (1, 8):
             names.append(flag.fix_value)
             if flag.fix_bit == 8:

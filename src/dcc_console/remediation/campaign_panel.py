@@ -54,7 +54,9 @@ def _campaign_plan(
         if step is None:
             missing_templates.append(template.flag_name)
             continue
-        chosen = fix_panel._choose_template(conn, row, step)
+        chosen = fix_panel._choose_template(
+            conn, row, step, candidate_rows=template.covered_rows
+        )
         if chosen.config_value is None:
             missing_templates.append(
                 f"{template.flag_name} for instance {template.target_identifier}"

@@ -43,6 +43,7 @@ def _row(tid: str, **broken) -> dict:
         "TERMINAL_BRAND_NAME": "PAX",
         "TERMINAL_MODEL_NAME": "A920",
         "ACQUIRER_NAME": "Planet",
+        "DCCPROVIDER_CODE": "PLANETPAYMENT",
         "BANK_MERCHANT_ID": "BM-1",
         "FIRMWARE_VERSION": "1.2.3",
         "IS_DCC_BROKEN": True,  # BOOLEAN
@@ -126,6 +127,35 @@ class FakeSnowflake:
                     }
                 ]
             )
+        if "DCC_PROVIDER_COUNT" in sql:
+            rows_by_terminal = self.frame.set_index("TERMINAL_IDENTIFIER")
+            return pd.DataFrame(
+                [
+                    {
+                        "TERMINAL_IDENTIFIER": terminal_id,
+                        "DCC_PROVIDER_CODE": rows_by_terminal.loc[terminal_id][
+                            "DCCPROVIDER_CODE"
+                        ],
+                        "DCC_PROVIDER_COUNT": 1,
+                    }
+                    for terminal_id in params
+                    if terminal_id in rows_by_terminal.index
+                ]
+            )
+        if "FIX_CONFIRMED_PROD" in sql:
+            return pd.DataFrame([{"FIX_CONFIRMED_PROD": 368}])
+        if "UNIQUE_FIXED_TERMINALS_PROD" in sql:
+            return pd.DataFrame([{"UNIQUE_FIXED_TERMINALS_PROD": 367}])
+        if "PENDING_CONFIRMATION_APPLIED" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "PENDING_CONFIRMATION_APPLIED": 2,
+                        "CONFIRMED_IN_REGISTRY_APPLIED": 3,
+                        "HANDED_OFF_APPLIED": 4,
+                    }
+                ]
+            )
         if "PENDING_CONFIRMATION" in sql and "FIX_BIT" not in sql:  # reconcile summary
             return pd.DataFrame(
                 [
@@ -190,6 +220,13 @@ class FakeSnowflake:
                         "TERMINALS_COVERED": 1 if bit == 2 else 0,
                     }
                     for bit in (1, 2, 8, 16)
+                ]
+            )
+        if "APP_FIXED_TERMINALS_BY_BIT" in sql:
+            return pd.DataFrame(
+                [
+                    {"FIX_BIT": bit, "APP_FIXED_TERMINALS_BY_BIT": value}
+                    for bit, value in ((1, 12), (2, 367), (8, 22), (16, 4))
                 ]
             )
         if "SUM(" in sql:
@@ -351,6 +388,13 @@ def test_overview_page_shows_kpis_beside_sidebar_disconnect():
     assert at.metric[0].value == "12,654"
     labels = [metric.label for metric in at.metric]
     assert "Already OK · PROD" in labels
+    assert "Fix confirmed · PROD" in labels
+    fix_confirmed = next(metric for metric in at.metric if metric.label == "Fix confirmed · PROD")
+    assert fix_confirmed.value == "368"
+    fixed_terminals = next(
+        metric for metric in at.metric if metric.label == "Terminals fixed · PROD"
+    )
+    assert fixed_terminals.value == "367"
     assert "Dry runs · PROD" in labels
     assert "Fixable" in labels
     assert "Live applied · UAT/DEV" in labels
@@ -366,6 +410,11 @@ def test_overview_page_shows_kpis_beside_sidebar_disconnect():
     )
     assert bit_coverage["Bit"].tolist() == [1, 2, 8, 16]
     assert bit_coverage.loc[bit_coverage["Bit"] == 2, "Live applied calls"].iloc[0] == 1
+    fixed_by_bit = next(
+        frame.value for frame in at.dataframe if "Terminals fixed" in frame.value.columns
+    )
+    assert fixed_by_bit["Bit"].tolist() == [1, 2, 8, 16]
+    assert fixed_by_bit.loc[fixed_by_bit["Bit"] == 2, "Terminals fixed"].iloc[0] == 367
 
 
 @pytest.mark.parametrize("environment", ["DEV", "UAT", "PROD"])
@@ -574,12 +623,35 @@ def test_bit16_needs_a_confirmed_template_before_anything_runs():
     at = _render(FakeSnowflake(rows=[row]), **_fixer_state("UAT", FakeSql(), tid="T-16"))
 
     assert _problems(at) == []
-    assert any("Planet_PAX" in s.value for s in at.success)  # 95% of peers → strong
     assert at.button(key="rem_pre_T-16").disabled
-    assert at.selectbox(key="rem_tpl_T-16").value == "Planet_PAX"
+    assert at.selectbox(key="rem_tpl_T-16").value == "PLANET_PAX"
+    assert at.radio(key="rem_tpl_source_T-16").value == "Workbook list"
+    confirm_key = "rem_tpl_confirm_T-16_Workbook list_PLANET_PAX"
+    assert not at.checkbox(key=confirm_key).value
 
-    next(c for c in at.checkbox if c.label.startswith("I confirm")).check().run()
+    at.checkbox(key=confirm_key).check().run()
     assert not at.button(key="rem_pre_T-16").disabled
+
+
+def test_bit16_without_a_workbook_rule_cannot_proceed():
+    row = _row(
+        "T-16-UNMAPPED",
+        DCCPROVIDER_CODE="GLOBALBLUE",
+        PRINTOUTTYPETEMPLATEDCC_CHECK_C=1,
+    )
+    at = _render(
+        FakeSnowflake(rows=[row]),
+        **_fixer_state("UAT", FakeSql(), tid="T-16-UNMAPPED"),
+    )
+
+    assert at.exception == []
+    assert "rem_tpl_custom_T-16-UNMAPPED" in [item.key for item in at.text_input]
+    assert at.button(key="rem_pre_T-16-UNMAPPED").disabled
+    at.text_input(key="rem_tpl_custom_T-16-UNMAPPED").set_value("NEW_GLOBALBLUE_TEMPLATE").run()
+    assert at.button(key="rem_pre_T-16-UNMAPPED").disabled
+    exception_confirm = "rem_tpl_confirm_T-16-UNMAPPED_Custom exception_NEW_GLOBALBLUE_TEMPLATE"
+    at.checkbox(key=exception_confirm).check().run()
+    assert not at.button(key="rem_pre_T-16-UNMAPPED").disabled
 
 
 def test_failed_fix_log_write_is_queued_and_retried():
@@ -886,6 +958,80 @@ def test_batch_selection_groups_bit1_location_bit2_terminal_and_bit8_instance():
     assert len(bit8) == 2
     assert set(bit8["Target scope"]) == {"Instance"}
     assert set(bit8["Target"]) == {"I-A", "I-B"}
+
+
+def test_batch_bit16_rule_or_custom_template_requires_individual_confirmation():
+    class FakeReceiptSql(FakeSql):
+        def query(self, sql: str, params=()):
+            if "handler_type" in sql:
+                return pd.DataFrame([{
+                    "handler_name": "handlerTerminalRequester",
+                    "receipt_config": "<receipt_config>OldTemplate</receipt_config>",
+                }])
+            return super().query(sql, params)
+
+    snow = FakeSnowflake(rows=[
+        _row("T-A", TERMINAL_BRAND_NAME="INGENICO", PRINTOUTTYPETEMPLATEDCC_CHECK_C=1),
+        _row("T-B", TERMINAL_BRAND_NAME="INGENICO", PRINTOUTTYPETEMPLATEDCC_CHECK_C=1),
+    ])
+    sql = FakeReceiptSql()
+    at = _render(snow, **_batch_state("UAT", sql))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert _problems(at) == []
+    assert at.selectbox(key="rem_tpl_T-A").value == "PLANET_ING_5000"
+    assert at.selectbox(key="rem_tpl_T-B").value == "PLANET_ING_5000"
+    assert sum(
+        expander.label == "Bit 16 receipt templates (2 instances)"
+        for expander in at.expander
+    ) == 1
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000"
+    ).value
+    at.radio(key="rem_tpl_source_T-B").set_value("Custom exception").run()
+    at.text_input(key="rem_tpl_custom_T-B").set_value("CUSTOM_ING_LANE3000").run()
+    custom_confirmation = "rem_tpl_confirm_T-B_Custom exception_CUSTOM_ING_LANE3000"
+    assert not at.checkbox(key=custom_confirmation).value
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000"
+    ).value
+    at.checkbox(key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000").check().run()
+    at.checkbox(key=custom_confirmation).check().run()
+
+    selection = next(frame.value for frame in at.dataframe if "Include" in frame.value)
+    assert set(selection["Value"]) == {
+        "Add:PLANET_ING_5000",
+        "Add:CUSTOM_ING_LANE3000",
+    }
+    assert set(selection["Target scope"]) == {"Instance"}
+    at.button(key="rem_batch_run").click().run()
+    assert _problems(at) == []
+    assert [params[2] for params, _ in sql.calls] == [
+        "PLANET_ING_5000",
+        "CUSTOM_ING_LANE3000",
+    ]
+    assert all(rollback for _, rollback in sql.calls)
+    records = snow.fix_log_rows()
+    assert {row["VALUE_SENT"] for row in records} == {
+        "Add:PLANET_ING_5000",
+        "Add:CUSTOM_ING_LANE3000",
+    }
+    assert all(row["MODE"] == "SIMULATION" for row in records)
+    at.radio(key="rem_tpl_source_T-B").set_value("Workbook list").run()
+    assert not at.checkbox(
+        key="rem_tpl_confirm_T-B_Workbook list_PLANET_ING_5000"
+    ).value
+    assert "rem_batch_rehearsal" not in at.session_state
+    next(button for button in at.button if button.label == "Empty table").click().run()
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert at.selectbox(key="rem_tpl_T-B").value == "PLANET_ING_5000"
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000"
+    ).value
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-B_Workbook list_PLANET_ING_5000"
+    ).value
 
 
 def test_batch_configurable_limit_keeps_procedure_call_cap():

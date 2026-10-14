@@ -20,7 +20,9 @@ Design:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from . import DCC_AGENT_FQN, validate_identifier
 
@@ -41,12 +43,33 @@ class AgentAnswer:
         return self.error is None and bool(self.text.strip())
 
 
-def agent_path(agent_fqn: str = DCC_AGENT_FQN) -> str:
+def _configured_agent_fqn(agent_fqn: str | None = None) -> str:
+    if agent_fqn is not None:
+        return agent_fqn
+    parts = tuple(
+        os.getenv(name, "").strip()
+        for name in (
+            "CORTEX_AGENT_DATABASE",
+            "CORTEX_AGENT_SCHEMA",
+            "CORTEX_AGENT_NAME",
+        )
+    )
+    if not any(parts):
+        return DCC_AGENT_FQN
+    if not all(parts):
+        raise ValueError(
+            "Set CORTEX_AGENT_DATABASE, CORTEX_AGENT_SCHEMA, and CORTEX_AGENT_NAME together."
+        )
+    return ".".join(parts)
+
+
+def agent_path(agent_fqn: str | None = None) -> str:
     """REST path for the ``:run`` endpoint of a ``DATABASE.SCHEMA.NAME`` agent.
 
     Each identifier is validated as a bare identifier (the same guard the rest of the
     package uses), so the FQN cannot inject path segments.
     """
+    agent_fqn = _configured_agent_fqn(agent_fqn)
     parts = agent_fqn.split(".")
     if len(parts) != 3:
         raise ValueError(f"Expected DATABASE.SCHEMA.NAME agent, got {agent_fqn!r}")
@@ -73,7 +96,9 @@ def scoped_question(row: dict | None, question: str) -> str:
     return f"For {' / '.join(bits)}: {text}"
 
 
-def build_payload(question: str, history: list[dict] | None = None) -> dict:
+def build_payload(
+    question: str, history: list[dict] | None = None, *, warehouse: str | None = None
+) -> dict:
     """The ``:run`` request body: prior turns (if any) then the new user question.
 
     ``history`` items are ``{"role": "user"|"assistant", "text": "..."}``.
@@ -85,7 +110,10 @@ def build_payload(question: str, history: list[dict] | None = None) -> dict:
         if role in ("user", "assistant") and text:
             messages.append({"role": role, "content": [{"type": "text", "text": text}]})
     messages.append({"role": "user", "content": [{"type": "text", "text": question}]})
-    return {"messages": messages}
+    payload = {"messages": messages}
+    if warehouse and warehouse.strip():
+        payload["warehouse"] = warehouse.strip()
+    return payload
 
 
 def _collect_text(payload: dict, answer: AgentAnswer, *, is_delta: bool) -> None:
@@ -154,64 +182,127 @@ def parse_sse(lines) -> AgentAnswer:
     return answer
 
 
+class CortexClient:
+    """Call Cortex Agent REST API with an existing external-browser Snowflake session."""
+
+    def __init__(
+        self,
+        conn,
+        *,
+        agent_fqn: str | None = None,
+        warehouse: str | None = None,
+    ) -> None:
+        self.conn = conn
+        self.agent_fqn = agent_fqn
+        self.warehouse = warehouse
+
+    def ask(
+        self,
+        question: str,
+        *,
+        row: dict | None = None,
+        history: list[dict] | None = None,
+    ) -> AgentAnswer:
+        """Ask one question using the session token from SnowflakeConnection.
+
+        Never raises: transport, authentication, and permission failures are returned
+        in ``AgentAnswer.error``. No PAT or separate login is used.
+        """
+        text = (question or "").strip()
+        if not text:
+            return AgentAnswer(error="Type a question for the agent.")
+        raw = getattr(self.conn, "connection", None)
+        host = getattr(raw, "host", None)
+        rest = getattr(raw, "rest", None)
+        token = getattr(rest, "token", None) if rest is not None else None
+        if not raw or not host or not token:
+            return AgentAnswer(error="Connect to Snowflake before asking the agent.")
+        try:
+            agent_fqn = _configured_agent_fqn(self.agent_fqn)
+            path = agent_path(agent_fqn)
+        except ValueError as exc:
+            return AgentAnswer(error=str(exc))
+        try:
+            import requests
+        except Exception as exc:  # pragma: no cover - requests is a declared dependency
+            return AgentAnswer(error=f"The `requests` package is unavailable: {exc}")
+
+        account_url = os.getenv("SNOWFLAKE_ACCOUNT_URL", "").strip().rstrip("/")
+        if account_url:
+            parsed_url = urlsplit(account_url)
+            hostname = (parsed_url.hostname or "").lower()
+            if (
+                parsed_url.scheme.lower() != "https"
+                or not hostname.endswith(".snowflakecomputing.com")
+                or parsed_url.username is not None
+                or parsed_url.password is not None
+                or parsed_url.port not in (None, 443)
+                or parsed_url.path not in ("", "/")
+                or parsed_url.query
+                or parsed_url.fragment
+            ):
+                return AgentAnswer(
+                    error=(
+                        "SNOWFLAKE_ACCOUNT_URL must be a clean HTTPS Snowflake account URL "
+                        "(no credentials, custom port, path, query, or fragment)."
+                    )
+                )
+        else:
+            account_url = f"https://{host}"
+
+        url = f"{account_url}{path}"
+        headers = {
+            "Authorization": f'Snowflake Token="{token}"',
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        warehouse = (self.warehouse or os.getenv("CORTEX_AGENT_WAREHOUSE", "")).strip()
+        if not warehouse:
+            warehouse = os.getenv("SNOWFLAKE_WAREHOUSE", "").strip()
+        if not warehouse:
+            settings = getattr(self.conn, "settings", None)
+            warehouse = str(getattr(settings, "warehouse", "") or "").strip()
+        if warehouse:
+            headers["X-Snowflake-Warehouse"] = warehouse
+        payload = build_payload(scoped_question(row, text), history, warehouse=warehouse)
+        try:
+            response = requests.post(
+                url, headers=headers, json=payload, stream=True, timeout=_TIMEOUT_S
+            )
+        except Exception as exc:
+            return AgentAnswer(error=f"Could not reach the agent: {exc}")
+        if response.status_code == 404:
+            return AgentAnswer(
+                error=(
+                    f"Agent {agent_fqn} was not found, or your role cannot see it. "
+                    "Ask the owner for USAGE on the agent and its semantic view."
+                )
+            )
+        if response.status_code in (401, 403):
+            return AgentAnswer(
+                error=(
+                    "Your Snowflake role is not allowed to run this agent. Ask the owner for "
+                    "USAGE on the agent and its Cortex Analyst semantic view."
+                )
+            )
+        if response.status_code >= 400:
+            detail = (response.text or "").strip()
+            return AgentAnswer(
+                error=f"The agent call failed ({response.status_code}). {detail[:500]}"
+            )
+        try:
+            return parse_sse(response.iter_lines())
+        except Exception as exc:
+            return AgentAnswer(error=f"Could not read the agent's reply: {exc}")
+
+
 def ask(
     conn,
     question: str,
     *,
     row: dict | None = None,
     history: list[dict] | None = None,
-    agent_fqn: str = DCC_AGENT_FQN,
+    agent_fqn: str | None = None,
 ) -> AgentAnswer:
-    """Ask the agent one question over the operator's live Snowflake session.
-
-    ``conn`` is a :class:`~dcc_console.remediation.sf_connection.SnowflakeConnection`.
-    Never raises: any transport / auth / permission problem comes back as ``error``.
-    """
-    text = (question or "").strip()
-    if not text:
-        return AgentAnswer(error="Type a question for the agent.")
-    raw = getattr(conn, "connection", None)
-    host = getattr(raw, "host", None)
-    rest = getattr(raw, "rest", None)
-    token = getattr(rest, "token", None) if rest is not None else None
-    if not raw or not host or not token:
-        return AgentAnswer(error="Connect to Snowflake before asking the agent.")
-    try:
-        import requests
-    except Exception as exc:  # pragma: no cover - requests is a declared dependency
-        return AgentAnswer(error=f"The `requests` package is unavailable: {exc}")
-
-    url = f"https://{host}{agent_path(agent_fqn)}"
-    headers = {
-        "Authorization": f'Snowflake Token="{token}"',
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-    }
-    payload = build_payload(scoped_question(row, text), history)
-    try:
-        response = requests.post(
-            url, headers=headers, json=payload, stream=True, timeout=_TIMEOUT_S
-        )
-    except Exception as exc:
-        return AgentAnswer(error=f"Could not reach the agent: {exc}")
-    if response.status_code == 404:
-        return AgentAnswer(
-            error=(
-                f"Agent {agent_fqn} was not found, or your role cannot see it. Ask the owner "
-                "for USAGE on the agent and its semantic view."
-            )
-        )
-    if response.status_code in (401, 403):
-        return AgentAnswer(
-            error=(
-                "Your Snowflake role is not allowed to run this agent. Ask the owner for "
-                "USAGE on the agent and its Cortex Analyst semantic view."
-            )
-        )
-    if response.status_code >= 400:
-        detail = (response.text or "").strip()
-        return AgentAnswer(error=f"The agent call failed ({response.status_code}). {detail[:500]}")
-    try:
-        return parse_sse(response.iter_lines())
-    except Exception as exc:
-        return AgentAnswer(error=f"Could not read the agent's reply: {exc}")
+    """Compatibility wrapper for callers using the module-level API."""
+    return CortexClient(conn, agent_fqn=agent_fqn).ask(question, row=row, history=history)

@@ -26,18 +26,12 @@ from .sf_connection import SnowflakeConnection
 SELECTED_KEY = "rem_selected_terminal"
 _WORK_KEY = "rem_fix_work"
 _OPERATOR_KEY = "rem_operator"
-_TEMPLATES_KEY = "rem_template_cache"
 
 _KIND_LABELS = {
     "INSTANCE_IDENTIFIER": "instance",
     "LOCATION_NO": "location",
     "TERMINAL_IDENTIFIER": "terminal",
 }
-# A suggestion is "strong" when most peers agree and there are enough of them.
-_STRONG_SHARE = 0.9
-_STRONG_PEERS = 20
-
-
 # --------------------------------------------------------------------------- #
 # small helpers
 # --------------------------------------------------------------------------- #
@@ -91,61 +85,130 @@ def operator_status(conn: SnowflakeConnection, objs: RemediationObjects):
 # --------------------------------------------------------------------------- #
 
 
-def _load_templates(conn: SnowflakeConnection, row: dict):
-    label, ranked, error = "", [], None
-    for query in suggest.build_template_suggestion_queries(row):
-        frame, error = _query(conn, query.sql, query.params)
-        ranked = suggest.summarise(frame)
-        if ranked:
-            label = query.label
-            break
-    frame, known_error = _query(conn, suggest.build_known_templates_query())
-    known = [s.template for s in suggest.summarise(frame)]
-    return label, ranked, known, error or known_error
-
-
-def _choose_template(conn: SnowflakeConnection, row: dict, step: fixer.FixStep) -> fixer.FixStep:
+def _choose_template(
+    conn: SnowflakeConnection,
+    row: dict,
+    step: fixer.FixStep,
+    *,
+    candidate_rows: list[dict] | None = None,
+    batch_selection: bool = False,
+) -> fixer.FixStep:
     tid = str(row["TERMINAL_IDENTIFIER"])
-    cache = _state(_TEMPLATES_KEY, {})
-    if tid not in cache:
-        with st.spinner("Looking up templates used by healthy peers…"):
-            cache[tid] = _load_templates(conn, row)
-    label, ranked, known, error = cache[tid]
-    if error:
-        st.warning(f"Template lookup was incomplete: {error}")
-    suggested = [s.template for s in ranked]
-    options = suggested + [t for t in known if t not in suggested]
-    if not options:
-        st.error("No templates are in use on healthy terminals — prepare this fix manually.")
-        return step
-    if ranked:
-        top = ranked[0]
-        message = (
-            f"Suggested template **{top.template}** — used by {top.terminals:,} {label} "
-            f"({top.share:.0%})."
+    source_rows = candidate_rows or [row]
+    provider_sql, provider_params = suggest.build_provider_lookup_query(source_rows)
+    provider_df, provider_error = _query(conn, provider_sql, provider_params)
+    if provider_error:
+        st.warning(f"Could not load DCC providers from the maintenance source: {provider_error}")
+        provider_df = None
+    providers = {}
+    if provider_df is not None and not provider_df.empty:
+        providers = {
+            str(provider_row["TERMINAL_IDENTIFIER"]): (
+                str(provider_row["DCC_PROVIDER_CODE"])
+                if int(provider_row["DCC_PROVIDER_COUNT"] or 0) == 1
+                else None
+            )
+            for _, provider_row in provider_df.iterrows()
+        }
+    rule_rows = [
+        {**candidate, "DCCPROVIDER_CODE": providers.get(str(candidate["TERMINAL_IDENTIFIER"]))}
+        for candidate in source_rows
+    ]
+    provider_values = {
+        str(rule_row.get("DCCPROVIDER_CODE") or "") for rule_row in rule_rows
+    }
+    if len(provider_values) > 1:
+        st.warning(
+            "This instance covers different DCC providers. Only templates allowed for every "
+            "provider and terminal brand can be selected."
         )
-        if top.share >= _STRONG_SHARE and top.terminals >= _STRONG_PEERS:
-            st.success(message)
-        else:
-            st.warning(f"{message} Low confidence — check it before using it.")
+    if any(not rule_row.get("DCCPROVIDER_CODE") for rule_row in rule_rows):
+        st.warning(
+            "A single DCC provider could not be determined for every covered terminal. "
+            "Workbook templates will not be offered for ambiguous or missing providers."
+        )
+    rules = suggest.common_allowed_templates(rule_rows)
+    provider = str(rule_rows[0].get("DCCPROVIDER_CODE") or "unknown DCC provider")
+    brand = str(row.get("TERMINAL_BRAND_NAME") or "unknown brand")
+    if not rules:
+        st.warning(
+            f"No workbook rule is defined for DCC provider {provider} / brand {brand} "
+            "across this instance. "
+            "Enter a verified custom exception to continue."
+        )
+
+    if rules:
+        st.caption(f"Workbook rule for DCC provider **{provider}** and brand **{brand}**.")
+        if len(rules) > 1:
+            st.info(
+                "The workbook allows multiple templates. The first is prefilled; "
+                "review or change it."
+            )
+        source = st.radio(
+            "Template source",
+            ("Workbook list", "Custom exception"),
+            horizontal=True,
+            key=f"rem_tpl_source_{tid}",
+        )
+    else:
+        source = "Custom exception"
+
+    if source == "Workbook list":
+        options = list(rules)
+        choice_key = f"rem_tpl_{tid}"
+        existing_choice = st.session_state.get(choice_key)
+        choice_index = options.index(existing_choice) if existing_choice in options else 0
+        choice = st.selectbox(
+            "DCC receipt template",
+            options,
+            index=choice_index,
+            key=choice_key,
+        )
     else:
         st.warning(
-            "No healthy terminal shares this brand/model, so there is no suggestion. "
-            "Pick the template yourself."
+            "Custom templates are outside the workbook allowlist. Verify the name before use."
         )
-    choice = st.selectbox(
-        "DCC receipt template",
-        options,
-        index=0 if ranked else None,
-        placeholder="Choose a template",
-        key=f"rem_tpl_{tid}",
-    )
+        choice = st.text_input(
+            "Custom DCC receipt template",
+            key=f"rem_tpl_custom_{tid}",
+            placeholder="Enter the exact template name",
+        ).strip()
+
+    confirmation_key = f"rem_tpl_confirm_{tid}_{source}_{choice}"
+    selection_key = f"rem_tpl_selection_{tid}"
+    selection = (source, choice)
+    previous_selection = st.session_state.get(selection_key)
+    if previous_selection is not None and previous_selection != selection:
+        previous_source, previous_choice = previous_selection
+        st.session_state.pop(
+            f"rem_tpl_confirm_{tid}_{previous_source}_{previous_choice}", None
+        )
+        st.session_state.pop(confirmation_key, None)
+    elif batch_selection and source == "Workbook list" and choice:
+        st.session_state.setdefault(confirmation_key, True)
+    st.session_state[selection_key] = selection
+
+    if batch_selection:
+        previous_key = f"rem_batch_template_choice_{step.target_identifier}"
+        if previous_key in st.session_state and st.session_state[previous_key] != selection:
+            st.session_state.pop("rem_batch_rehearsal", None)
+            st.session_state["rem_batch_authorise"] = False
+        st.session_state[previous_key] = selection
     if not choice:
         return step
+    if source == "Custom exception":
+        confirmation_label = (
+            f"I confirm custom template **{choice}** is a valid exception for instance "
+            f"{step.target_identifier}"
+        )
+    else:
+        confirmation_label = (
+            f"Use workbook-approved template **{choice}** for instance "
+            f"{step.target_identifier}"
+        )
     confirmed = st.checkbox(
-        f"I confirm **{choice}** is the correct receipt template for instance "
-        f"{step.target_identifier}",
-        key=f"rem_tpl_ok_{tid}_{choice}",
+        confirmation_label,
+        key=confirmation_key,
     )
     return step.with_template(choice) if confirmed else step
 

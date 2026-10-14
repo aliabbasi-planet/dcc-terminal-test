@@ -117,8 +117,8 @@ FLAG_FIXES: tuple[FlagFix, ...] = (
         "PRINTOUTTYPETEMPLATEDCC_CHECK_C", "PRINTOUTTYPETEMPLATEDCC_BASE",
         "DCC Receipt Template", "TEMPLATE", 16, INSTANCE, None, "receipt_config", True,
         catalog_key="Bit 16 — DCC Receipt Template (instance)",
-        notes="Bit 16; template chosen per terminal (suggested from healthy peers, confirmed "
-        "by the operator) — the row only holds the current, broken value.",
+        notes="Bit 16; template is prefilled from the workbook provider/brand rules and "
+        "confirmed by the operator.",
     ),
     FlagFix(
         "CONFIGDOWNLOAD_VERSION_CHECK_C", "CONFIGDOWNLOAD_VERSION_CHECK_BASE",
