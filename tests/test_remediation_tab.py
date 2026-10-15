@@ -826,6 +826,26 @@ def test_batch_filters_preserve_loaded_rows_until_explicit_add():
     ))
 
 
+def test_batch_add_at_terminal_limit_preserves_rows_and_deduplicates():
+    snow = FakeSnowflake(rows=[_bit2_row(f"T-{index:04}") for index in range(200)])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 200
+
+    snow.frame = pd.DataFrame([_bit2_row("T-0000"), _bit2_row("T-NEW")])
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert at.session_state["rem_batch_loaded_ids"].count("T-0000") == 1
+    assert "T-NEW" in at.session_state["rem_batch_loaded_ids"]
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 201
+
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 201
+
+
 def test_batch_empty_table_stays_empty_until_explicit_load():
     snow = FakeSnowflake(rows=[_bit2_row("T-OLD")])
     at = _render(snow, **_batch_state("UAT", FakeSql()))

@@ -454,7 +454,7 @@ def render_batch_panel(
             terminal_id = str(row["TERMINAL_IDENTIFIER"])
             current_index = indexes.get(terminal_id)
             if current_index is None:
-                if len(rows_all) >= terminal_limit:
+                if len(added_ids) >= terminal_limit:
                     continue
                 indexes[terminal_id] = len(rows_all)
                 rows_all.append(row)

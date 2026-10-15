@@ -968,8 +968,8 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
                 step=1,
                 key="rem_batch_terminal_limit",
                 help=(
-                    "Set the maximum total number of matching terminals to load into the "
-                    "Batch table. Only submitted by Load / add terminals. The separate "
+                    "Set the maximum number of new terminals to add per load. Existing "
+                    "rows are preserved and duplicate terminal IDs are not added. The separate "
                     "300-fix cap still applies."
                 ),
             )
