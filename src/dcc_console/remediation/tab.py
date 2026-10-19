@@ -28,7 +28,6 @@ from . import (
     agent_panel,
     batch_panel,
     batch_upload,
-    campaign_panel,
     ddl,
     fix_panel,
     fixer,
@@ -113,7 +112,7 @@ def _render_connection_panel() -> None:
             return
         st.caption(
             "Sign in with your own Snowflake identity (SSO / external browser). "
-            "Point 'Database' at your own DEV_CORE; your role scopes what you can do."
+            "Your role scopes what you can do."
         )
         c1, c2 = st.columns(2)
         account = c1.text_input(
@@ -129,8 +128,8 @@ def _render_connection_panel() -> None:
             key="rem_sf_warehouse",
         )
         database = c1.text_input(
-            "Database (your DEV_CORE)",
-            value=os.getenv("SNOWFLAKE_DATABASE", "DEV_CORE_AAB"),
+            "Database",
+            value=os.getenv("SNOWFLAKE_DATABASE", "AI_WORKSPACE"),
             key="rem_sf_database",
         )
         schema = c2.text_input(
@@ -180,8 +179,8 @@ def _render_init(conn: SnowflakeConnection, objs: RemediationObjects) -> bool:
         else ""
     )
     st.caption(
-        f"Target schema `{objs.schema_fqn}`.{shared_note} Initialise creates or upgrades the "
-        "tables/views and seeds the flag reference (idempotent — safe to re-run)."
+        f"Target schema `{objs.schema_fqn}`.{shared_note} Existing ready objects are verified "
+        "without changes. Missing objects or upgrades require schema-owner permissions."
     )
     df, error = _run(conn, ddl.build_objects_present_query(objs))
     status = ddl.schema_status({} if error or df is None or df.empty else df.iloc[0].to_dict())
@@ -192,10 +191,16 @@ def _render_init(conn: SnowflakeConnection, objs: RemediationObjects) -> bool:
             f"Schema needs initialising or an upgrade — missing: {', '.join(status.missing)}. "
             "Click **Initialise** below."
         )
-    if st.button("Initialise / verify my schema", use_container_width=True, key="rem_init"):
-        # Teammates only touch the shared schema when something there is missing; the
-        # owner (shared == own schema) always re-applies it, which is idempotent.
-        include_shared = not objs.uses_shared_log or not status.shared_ready
+    if st.button(
+        "Initialise / verify my schema",
+        use_container_width=True,
+        key="rem_init",
+        disabled=error is not None,
+    ):
+        if status.ready:
+            st.success(f"Schema {objs.schema_fqn} is ready. Verified without changes.")
+            return True
+        include_shared = not status.shared_ready
         with st.spinner(f"Creating objects in {objs.schema_fqn}..."):
             try:
                 for statement in ddl.build_initialise_statements(objs, include_shared):
@@ -781,14 +786,6 @@ def _uploaded_batch_rows(
     }
     checks_by_terminal: dict[str, set[str]] = {}
     warnings: list[str] = []
-    metadata_columns = {
-        "INSTANCE_IDENTIFIER": "INSTANCE_IDENTIFIER",
-        "LOCATION_NO": "LOCATION_NO",
-        "LOCATION_NAME": "LOCATION_NAME",
-        "COUNTRY_NAME": "COUNTRY_NAME",
-        "BANK_MERCHANT_ID": "BANK_MERCHANT_ID",
-        "ACQUIRER_NAME": "ACQUIRER_NAME",
-    }
     for target in targets:
         row = by_terminal.get(target.terminal_identifier)
         if row is None or str(row.get(target.check_column) or "") != "1":
@@ -798,12 +795,14 @@ def _uploaded_batch_rows(
             )
             continue
         mismatches = []
-        for uploaded_column, row_column in metadata_columns.items():
-            uploaded_value = target.metadata.get(uploaded_column)
-            actual_value = row.get(row_column)
-            if not uploaded_value or actual_value is None:
+        for column, uploaded_value in target.metadata.items():
+            actual_value = row.get(column)
+            if not uploaded_value:
                 continue
-            if uploaded_column == "LOCATION_NO":
+            if actual_value is None:
+                mismatches.append(column)
+                continue
+            if column == "LOCATION_NO":
                 matches = (
                     batch_upload.normalise_location_no(uploaded_value)
                     == batch_upload.normalise_location_no(actual_value)
@@ -813,7 +812,7 @@ def _uploaded_batch_rows(
                 actual_text = str(actual_value).strip().casefold()
                 matches = uploaded_text == actual_text
             if not matches:
-                mismatches.append(uploaded_column)
+                mismatches.append(column)
         if mismatches:
             warnings.append(
                 f"Excel row {target.row_number}: uploaded metadata differs from the current "
@@ -906,7 +905,7 @@ def _render_fixer(
 
 
 _PAGE_KEY = "rem_page"
-_PAGES = ("Overview", "Single fix", "Batch fix", "Campaign")
+_PAGES = ("Overview", "Single fix", "Batch fix")
 
 
 def _render_overview(conn: SnowflakeConnection, objs: RemediationObjects) -> None:
@@ -979,8 +978,9 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
             type=["xlsx"],
             key="rem_batch_upload_file",
             help=(
-                "Upload the target list with Change Type, instance_identifier, location_no, "
-                "location_desc, country_name, bank_merchant_id, acquirer_name and TerminalID. "
+                "The first column contains the check to fix; remaining columns must use supported "
+                "metadata headers such as instance_identifier, location_no, location_desc, country, "
+                "bank_merchant_id, acquirer_name and TerminalID. "
                 "When a file is supplied, only validated file targets are loaded; filter results "
                 "are not added. Rows must match current actionable broken data."
             ),
@@ -998,10 +998,12 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
     if load_terminals:
         try:
             df, load_warnings = _load_batch_targets(conn, objs, filters, uploaded_file)
-            for warning in load_warnings[:10]:
-                st.warning(warning)
-            if len(load_warnings) > 10:
-                st.caption(f"{len(load_warnings) - 10} additional upload row(s) were skipped.")
+            if load_warnings:
+                with st.expander(
+                    f"Skipped Excel rows ({len(load_warnings)})", expanded=False
+                ):
+                    for warning in load_warnings:
+                        st.caption(warning)
             if uploaded_file is not None and (df is None or df.empty):
                 st.warning("The Excel upload produced no actionable broken targets.")
         except ValueError as exc:
@@ -1017,19 +1019,14 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
     )
 
 
-def _render_campaign(conn: SnowflakeConnection, objs: RemediationObjects, armed_live: bool) -> None:
-    """Run explicitly selected checks and targets as one CAB-referenced campaign."""
-    campaign_panel.render_campaign_panel(conn, objs, armed_live=armed_live)
-
-
 def render_remediation(armed_live: bool = False) -> None:
     """Entry point wired into the console's tab strip / PROD-streamlined layout.
 
     ``armed_live`` is the console's own Mode control: Live selected, the environment
     name typed, and the readiness probes passed. Apply live needs it (and much more).
 
-    The experience is split into four pages — **Overview**, **Single fix**,
-    **Batch fix** and **Campaign**.
+    The experience is split into three pages — **Overview**, **Single fix**,
+    and **Batch fix**.
     """
     st.subheader("DCC Remediation")
     _show_flash()
@@ -1052,7 +1049,8 @@ def render_remediation(armed_live: bool = False) -> None:
     if not ready:  # every read below needs the schema; don't cascade errors
         return
 
-    st.session_state.setdefault(_PAGE_KEY, _PAGES[0])
+    if st.session_state.get(_PAGE_KEY) not in _PAGES:
+        st.session_state[_PAGE_KEY] = _PAGES[0]
     page = st.radio(
         "Section", _PAGES, horizontal=True, key=_PAGE_KEY, label_visibility="collapsed"
     )
@@ -1060,8 +1058,6 @@ def render_remediation(armed_live: bool = False) -> None:
         _render_single(conn, objs, armed_live)
     elif page == "Batch fix":
         _render_batch(conn, objs, armed_live)
-    elif page == "Campaign":
-        _render_campaign(conn, objs, armed_live)
     else:
         _render_overview(conn, objs)
 

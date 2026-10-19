@@ -33,6 +33,7 @@ ROW = {
     "TERMINAL_BRAND_NAME": "PAX",
     "TERMINAL_MODEL_NAME": "A920",
     "ACQUIRER_NAME": "Planet",
+    "DCCPROVIDER_CODE": "PLANETPAYMENT",
     **{column: 0 for column in mapping.TRACKED_CHECK_COLUMNS},
 }
 
@@ -145,7 +146,10 @@ class FakeSqlServer:
             grids.append(pd.DataFrame([{"rollback_script": "UPDATE handler SET ... prior"}]))
         elif bit == 16:
             for handler in self.handlers[target]:
-                handler["receipt_config"] = f'<receipt template="{params[2]}"/>'
+                handler["receipt_config"] = (
+                    "<receipt_config><printout_type_template_dcc>"
+                    f"{params[2]}</printout_type_template_dcc></receipt_config>"
+                )
             grids.append(pd.DataFrame([{"rollback_script": "UPDATE handler SET ... prior"}]))
         return ProcedureOutput(grids=grids, messages=[], return_code=0)
 
@@ -216,6 +220,52 @@ def test_bit1_fix_always_adds_never_removes(check):
 def test_missing_target_identifier_is_not_fixable():
     _, blocked = fixer.plan_for_row(_row(HANDLER_DCCENABLE_CHECK_O=1, INSTANCE_IDENTIFIER=None))
     assert blocked and "INSTANCE_IDENTIFIER" in blocked[0].reason
+
+
+@pytest.mark.parametrize("check", sorted(fixer.NFC_CHECKS))
+@pytest.mark.parametrize("provider,expected", [("FEXCO", False), ("PLANETPAYMENT", True)])
+def test_nfc_procedure_value_and_verification_follow_provider(check, provider, expected):
+    step = _step(check, DCCPROVIDER_CODE=provider)
+    _, params, _ = build_call(step.definition, step.target_identifier, step.config_value, True)
+    assert params[3] == int(expected)
+    assert step.signature("UAT") != _step(
+        check, DCCPROVIDER_CODE="PLANETPAYMENT" if provider == "FEXCO" else "FEXCO"
+    ).signature("UAT")
+    sql = FakeSqlServer()
+    sql.handlers["I1"] = [{
+        "handler_name": "h1",
+        "extra_config": _handler_xml(**{step.config_value: "true" if expected else "false"}),
+    }]
+    assert fixer.precheck(sql, step, "UAT").status == fixer.ALREADY_OK
+    sql.handlers["I1"][0]["extra_config"] = _handler_xml(
+        **{step.config_value: "false" if expected else "true"}
+    )
+    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
+
+
+def test_nfc_without_provider_is_blocked():
+    steps, blocked = fixer.plan_for_row(_row(
+        HANDLER_DCCENABLENFC_CHECK_O=1, DCCPROVIDER_CODE=None,
+    ))
+    assert not steps
+    assert "provider" in blocked[0].reason
+
+
+@pytest.mark.parametrize("check", sorted(fixer.NFC_CHECKS))
+def test_fexco_nfc_apply_sets_false_and_verifies(check):
+    step = _step(check, DCCPROVIDER_CODE="FEXCO")
+    sql = FakeSqlServer()
+    sql.handlers["I1"] = [{
+        "handler_name": "h1",
+        "extra_config": _handler_xml(**{step.config_value: "true"}),
+    }]
+    result = fixer.run_step(
+        sql, step, simulation=False, environment="UAT", login="svc", correlation_id="nfc",
+    )
+    assert sql.calls[0][0][3] == 0
+    post = fixer.precheck(sql, step, "UAT")
+    assert post.status == fixer.ALREADY_OK
+    assert fixer.live_outcome(result, post).verified
 
 
 def test_resolved_checks_come_from_fixed_checks_json():
@@ -387,11 +437,66 @@ def test_bit2_precheck_uses_the_version_code():
 def test_bit16_precheck_needs_a_template_and_matches_whole_names():
     step = _step("PRINTOUTTYPETEMPLATEDCC_CHECK_C")
     sql = FakeSqlServer()
-    sql.handlers["I1"] = [{"handler_name": "h1", "receipt_config": '<r template="Planet_PAX"/>'}]
+    sql.handlers["I1"] = [{
+        "handler_name": "h1",
+        "receipt_config": (
+            "<receipt_config><printout_type_template_dcc>Planet_PAX"
+            "</printout_type_template_dcc></receipt_config>"
+        ),
+    }]
     assert fixer.precheck(sql, step, "UAT").status == fixer.UNKNOWN
     assert fixer.precheck(sql, step.with_template("Planet"), "UAT").status == fixer.NEEDS_FIX
     ok = fixer.precheck(sql, step.with_template("Planet_PAX"), "UAT")
     assert ok.status == fixer.ALREADY_OK and not ok.authoritative
+
+
+@pytest.mark.parametrize(
+    ("document", "status"),
+    [
+        (
+            "<receipt_config><printout_type_template_dcc>WRONG</printout_type_template_dcc>"
+            "<printout_type_receipt>PLANET_PAX</printout_type_receipt></receipt_config>",
+            fixer.NEEDS_FIX,
+        ),
+        ("<receipt_config/>", fixer.NEEDS_FIX),
+        (None, fixer.NEEDS_FIX),
+        ("<receipt_config><printout_type_template_dcc/>", fixer.UNKNOWN),
+        (
+            '<!DOCTYPE receipt_config [<!ENTITY template "PLANET_PAX">]>'
+            "<receipt_config><printout_type_template_dcc>&template;"
+            "</printout_type_template_dcc></receipt_config>",
+            fixer.UNKNOWN,
+        ),
+        (
+            "<receipt_config><printout_type_template_dcc>PLANET_PAX</printout_type_template_dcc>"
+            "<printout_type_template_dcc>WRONG</printout_type_template_dcc></receipt_config>",
+            fixer.NEEDS_FIX,
+        ),
+    ],
+)
+def test_bit16_precheck_checks_only_the_dcc_template_node(document, status):
+    step = _step("PRINTOUTTYPETEMPLATEDCC_CHECK_C").with_template("PLANET_PAX")
+    sql = FakeSqlServer()
+    sql.handlers["I1"] = [{"handler_name": "h1", "receipt_config": document}]
+    assert fixer.precheck(sql, step, "UAT").status == status
+
+
+def test_bit16_precheck_requires_the_selected_template_on_every_handler():
+    step = _step("PRINTOUTTYPETEMPLATEDCC_CHECK_C").with_template("PLANET_PAX")
+    sql = FakeSqlServer()
+    sql.handlers["I1"] = [
+        {
+            "handler_name": "h1",
+            "receipt_config": (
+                "<receipt_config><printout_type_template_dcc>PLANET_PAX"
+                "</printout_type_template_dcc></receipt_config>"
+            ),
+        },
+        {"handler_name": "h2", "receipt_config": "<receipt_config/>"},
+    ]
+    assert fixer.precheck(sql, step, "UAT").status == fixer.NEEDS_FIX
+    sql.handlers["I1"][1]["receipt_config"] = sql.handlers["I1"][0]["receipt_config"]
+    assert fixer.precheck(sql, step, "UAT").status == fixer.ALREADY_OK
 
 
 def test_precheck_missing_target_and_read_errors():

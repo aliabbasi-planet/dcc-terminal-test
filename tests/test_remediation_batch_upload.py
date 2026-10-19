@@ -55,8 +55,72 @@ def test_parse_workbook_maps_handler_change_and_normalises_location_padding():
     assert target.terminal_identifier == "00012345"
     assert target.check_column == "HANDLER_DCCENABLENFC_CHECK_O"
     assert target.metadata["LOCATION_NO"] == "11276"
+    assert target.metadata["LOCATION_DESC"] == "Shop"
     assert target.metadata["BANK_MERCHANT_ID"] == "00123"
     assert target.metadata["COUNTRY_NAME"] == "Spain"
+
+
+def test_parse_workbook_accepts_country_header_alias():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Change Type", "instance_identifier", "location_no", "location_desc",
+                  "country", "bank_merchant_id", "acquirer_name", "TerminalID"])
+    sheet.append(["handler_dccEnableNfc", "I0001", "11276", "Shop", "Spain", "00123",
+                  "Planet", "T-123"])
+    output = BytesIO()
+    workbook.save(output)
+
+    [target] = parse_workbook(output.getvalue())
+
+    assert target.metadata["COUNTRY_NAME"] == "Spain"
+
+
+def test_parse_workbook_uses_first_column_as_check_and_maps_other_columns_by_name():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Any heading", "TerminalID", "location_desc", "instance_identifier"])
+    sheet.append(["HANDLER_DCCENABLENFC_CHECK_O", "T-123", "Shop", "I-001"])
+    output = BytesIO()
+    workbook.save(output)
+
+    [target] = parse_workbook(output.getvalue())
+
+    assert target.check_column == "HANDLER_DCCENABLENFC_CHECK_O"
+    assert target.terminal_identifier == "T-123"
+    assert target.metadata == {"LOCATION_DESC": "Shop", "INSTANCE_IDENTIFIER": "I-001"}
+
+
+def test_parse_workbook_maps_dcc_provider_code():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Check", "TerminalID", "dccprovider_code"])
+    sheet.append(["dccEnable", "T-123", "PLANETPAYMENT"])
+    output = BytesIO()
+    workbook.save(output)
+
+    [target] = parse_workbook(output.getvalue())
+
+    assert target.metadata["DCCPROVIDER_CODE"] == "PLANETPAYMENT"
+
+
+def test_parse_workbook_maps_cortex_printout_fields():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append([
+        "Check", "TerminalID", "printout_type_receipt", "printout_type_template_dcc",
+        "printout_type_display",
+    ])
+    sheet.append(["Receipt template DCC", "T-123", "DCC", "PLANET_PAX", "Customer"])
+    output = BytesIO()
+    workbook.save(output)
+
+    [target] = parse_workbook(output.getvalue())
+
+    assert target.metadata == {
+        "PRINTOUT_TYPE_RECEIPT": "DCC",
+        "PRINTOUT_TYPE_TEMPLATE_DCC": "PLANET_PAX",
+        "PRINTOUT_TYPE_DISPLAY": "Customer",
+    }
 
 
 @pytest.mark.parametrize("change_type", ["Receipt template DCC", "receipt TEMPLATE dcc"])
@@ -118,7 +182,7 @@ def test_parse_workbook_stops_at_first_fully_blank_row():
     assert target.terminal_identifier == "T-123"
 
 
-def test_parse_workbook_rejects_unknown_change_type_and_missing_columns():
+def test_parse_workbook_rejects_unknown_check_and_missing_terminal_column():
     content = _workbook_bytes(
         [["unknown_flag", "I0001", "11276", "Shop", "Spain", "123", "Planet", "T1"]]
     )
@@ -126,10 +190,22 @@ def test_parse_workbook_rejects_unknown_change_type_and_missing_columns():
         parse_workbook(content)
 
     workbook = Workbook()
-    workbook.active.append(["Change Type", "TerminalID"])
+    workbook.active.append(["Anything", "location_no"])
     output = BytesIO()
     workbook.save(output)
-    with pytest.raises(ValueError, match="Missing required Excel columns"):
+    with pytest.raises(ValueError, match="Missing required Excel column"):
+        parse_workbook(output.getvalue())
+
+
+def test_parse_workbook_rejects_unknown_metadata_header():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Check", "TerminalID", "Unknown field"])
+    sheet.append(["dccEnable", "T-1", "value"])
+    output = BytesIO()
+    workbook.save(output)
+
+    with pytest.raises(ValueError, match="Unsupported Excel column"):
         parse_workbook(output.getvalue())
 
 
@@ -174,7 +250,8 @@ def test_uploaded_rows_are_scoped_to_requested_broken_change_type_and_metadata()
         "TERMINAL_IDENTIFIER": "T-001",
         "INSTANCE_IDENTIFIER": "I-001",
         "LOCATION_NO": "11276",
-        "LOCATION_NAME": "Shop",
+        "LOCATION_NAME": "Pilot ENG) Shop",
+        "LOCATION_DESC": "Shop",
         "COUNTRY_NAME": "Spain",
         "BANK_MERCHANT_ID": "00123",
         "ACQUIRER_NAME": "Planet",
@@ -204,7 +281,8 @@ def test_uploaded_metadata_mismatch_skips_row():
         "TERMINAL_IDENTIFIER": "T-001",
         "INSTANCE_IDENTIFIER": "I-001",
         "LOCATION_NO": "11276",
-        "LOCATION_NAME": "Shop",
+        "LOCATION_NAME": "Pilot ENG) Shop",
+        "LOCATION_DESC": "Different description",
         "COUNTRY_NAME": "Spain",
         "BANK_MERCHANT_ID": "00123",
         "ACQUIRER_NAME": "Planet",
@@ -213,13 +291,36 @@ def test_uploaded_metadata_mismatch_skips_row():
         "HANDLER_DCCENABLENFC_CHECK_O": 1,
     }
     content = _workbook_bytes(
-        [["handler_dccEnableNfc", "I-001", "991276", "Shop", "Spain", "00123", "Planet", "T-001"]]
+        [["handler_dccEnableNfc", "I-001", "011276", "Shop", "Spain", "00123", "Planet", "T-001"]]
     )
 
     uploaded, warnings = _uploaded_batch_rows(_FakeSnowflake(row), DEFAULT_OBJECTS, content)
 
     assert uploaded.empty
-    assert any("LOCATION_NO" in warning for warning in warnings)
+    assert any("LOCATION_DESC" in warning for warning in warnings)
+
+
+def test_uploaded_provider_code_is_checked_against_snapshot():
+    row = {
+        "TERMINAL_IDENTIFIER": "T-001",
+        "DCCPROVIDER_CODE": "PLANETPAYMENT",
+        "REMEDIATION_STATE": "ACTIONABLE",
+        **{column: 0 for column in TRACKED_CHECK_COLUMNS},
+        "HANDLER_DCCENABLENFC_CHECK_O": 1,
+    }
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Check", "TerminalID", "dccprovider_code"])
+    sheet.append(["handler_dccEnableNfc", "T-001", "PLANETPAYMENT"])
+    output = BytesIO()
+    workbook.save(output)
+
+    uploaded, warnings = _uploaded_batch_rows(
+        _FakeSnowflake(row), DEFAULT_OBJECTS, output.getvalue()
+    )
+
+    assert warnings == []
+    assert len(uploaded) == 1
 
 
 def test_excel_batch_load_uses_uploaded_rows_only(monkeypatch):

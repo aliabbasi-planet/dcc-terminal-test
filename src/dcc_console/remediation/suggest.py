@@ -68,6 +68,24 @@ def allowed_templates(row: Mapping[str, object]) -> tuple[str, ...]:
     return _ALLOWED_TEMPLATES.get((provider_key, brand), ())
 
 
+def build_nfc_provider_lookup_query(rows: Iterable[Mapping[str, object]]) -> tuple[str, list[str]]:
+    """Read provider context for the full instance targeted by an NFC fix."""
+    instances = sorted({
+        str(row["INSTANCE_IDENTIFIER"]) for row in rows if row.get("INSTANCE_IDENTIFIER")
+    })
+    if not instances:
+        return "", []
+    placeholders = ", ".join("%s" for _ in instances)
+    return (
+        f"SELECT INSTANCE_IDENTIFIER, MAX(UPPER(TRIM(DCCPROVIDER_CODE))) AS NFC_PROVIDER_CODE, "
+        "COUNT(DISTINCT UPPER(TRIM(DCCPROVIDER_CODE))) AS NFC_PROVIDER_COUNT\n"
+        f"FROM {MAINTENANCE_SOURCE}\n"
+        f"WHERE INSTANCE_IDENTIFIER IN ({placeholders})\n"
+        "GROUP BY INSTANCE_IDENTIFIER",
+        instances,
+    )
+
+
 def common_allowed_templates(rows: Iterable[Mapping[str, object]]) -> tuple[str, ...]:
     """Return templates approved for every terminal covered by an instance fix."""
     iterator = iter(rows)

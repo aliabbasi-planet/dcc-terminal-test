@@ -160,11 +160,11 @@ class RemediationObjects:
         return f"{self.schema_fqn}.V_REMEDIATION_KPIS"
 
 
-# Convenience default (the schema created during initial development). The tab
+# Convenience default for the shared workspace. The tab
 # always constructs objects from the live connection instead of relying on this.
-DEFAULT_OBJECTS = RemediationObjects("DEV_CORE_AAB")
+DEFAULT_OBJECTS = RemediationObjects("AI_WORKSPACE")
 
 # Team-wide fix log + operator allowlist (decision 2026-09-29: named group, shared
 # log). Owned by role DATA_SCIENTIST; teammates on another role need the grants in
 # docs/plan_dcc_remediation.md §15.
-DEFAULT_SHARED_SCHEMA = "DEV_CORE_AAB.DCC_REMEDIATION"
+DEFAULT_SHARED_SCHEMA = "AI_WORKSPACE.DCC_REMEDIATION"

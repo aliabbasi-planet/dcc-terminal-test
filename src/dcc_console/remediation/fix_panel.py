@@ -85,6 +85,30 @@ def operator_status(conn: SnowflakeConnection, objs: RemediationObjects):
 # --------------------------------------------------------------------------- #
 
 
+def _load_nfc_providers(conn: SnowflakeConnection, rows: list[dict]) -> list[dict]:
+    affected = [
+        row for row in rows if any(str(row.get(check)) == "1" for check in fixer.NFC_CHECKS)
+    ]
+    if not affected:
+        return rows
+    sql, params = suggest.build_nfc_provider_lookup_query(affected)
+    frame, error = _query(conn, sql, params) if params else (None, None)
+    providers = {}
+    if error:
+        st.warning(f"Could not load NFC provider context; automatic NFC fixes are blocked: {error}")
+    if frame is not None and not frame.empty:
+        providers = {
+            str(record["INSTANCE_IDENTIFIER"]): record["NFC_PROVIDER_CODE"]
+            if int(record["NFC_PROVIDER_COUNT"] or 0) == 1 else None
+            for record in frame.to_dict("records")
+        }
+    return [
+        {**row, "DCCPROVIDER_CODE": providers.get(str(row.get("INSTANCE_IDENTIFIER")))}
+        if any(str(row.get(check)) == "1" for check in fixer.NFC_CHECKS) else row
+        for row in rows
+    ]
+
+
 def _choose_template(
     conn: SnowflakeConnection,
     row: dict,
@@ -292,7 +316,7 @@ def _render_coverage(step: fixer.FixStep, covered: list[dict]) -> None:
 
 
 def _step_label(step: fixer.FixStep) -> str:
-    value = step.config_value or "template to choose"
+    value = step.display_value or "template to choose"
     label = (
         f"{step.flag.flag_name} — Bit {step.definition.bit} on {_kind(step)} "
         f"{step.target_identifier} ({value})"
@@ -418,6 +442,7 @@ def render_fix_panel(
         who += f" Operator check failed: {operator_error}"
     st.caption(who)
 
+    row = _load_nfc_providers(conn, [row])[0]
     steps, blocked = fixer.plan_for_row(row)
     for item in blocked:
         st.caption(f"Manual follow-up — **{item.flag.flag_name}**: {item.reason}")

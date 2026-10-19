@@ -322,7 +322,10 @@ def build_call(
             f"EXEC {PROCEDURE} @display_config = ?, @instance_json = ?, "
             "@Extra_Config_Name = ?, @Config_value = ?, @is_simulation = ?"
         )
-        params = (bit, payload, config_value, 0 if config_value in BIT8_FALSE_FLAGS else 1, sim)
+        expected = definition.bit8_config_value
+        if expected is None:
+            expected = config_value not in BIT8_FALSE_FLAGS
+        params = (bit, payload, config_value, int(expected), sim)
     elif bit == 16:
         sql = (
             f"EXEC {PROCEDURE} @display_config = ?, @instance_json = ?, "

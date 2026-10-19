@@ -27,7 +27,7 @@ from ..execution import build_call
 from ..state import add_result
 from . import RemediationObjects, agent_panel, batch, batch_upload, fixer, fixlog, writes
 from . import worklist as wl
-from .fix_panel import _choose_template, operator_status
+from .fix_panel import _choose_template, _load_nfc_providers, operator_status
 from .sf_connection import SnowflakeConnection
 
 # Guard-rails: one batch run is capped so a mis-click can't fan out across the fleet.
@@ -490,6 +490,7 @@ def render_batch_panel(
         else row
         for row in rows_all
     ]
+    planning_rows = _load_nfc_providers(conn, planning_rows)
     candidate_plan = batch.plan_batch(planning_rows)
     template_items = []
     for template in candidate_plan.templates:
@@ -613,7 +614,7 @@ def render_batch_panel(
             step.flag.flag_name,
             scope,
             step.target_identifier,
-            str(step.config_value or ""),
+            step.display_value,
         )
         selection_identity_to_key[identity] = item.key
         selection_rows.append(
@@ -623,7 +624,7 @@ def render_batch_panel(
                 "Check": step.flag.flag_name,
                 "Target scope": scope,
                 "Target": step.target_identifier,
-                "Value": step.config_value or "—",
+                "Value": step.display_value or "—",
                 "Terminals covered": len(item.covered_rows),
                 "Country": joined_coverage_values(item, "COUNTRY_NAME"),
                 "Region": joined_coverage_values(item, "REGION"),

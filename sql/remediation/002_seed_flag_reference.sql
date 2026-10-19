@@ -21,7 +21,7 @@ USING (
         ('DCCXPRESSCOFALLBACK_CHECK_O', 'DCC Xpress CO Fallback', 'DCC_XPRESS', 1, 'LOCATION_NO', 'DCCXpressCOFallback', NULL, TRUE, 'Bit 1 location extra_function.'),
         ('DCCMERCHANT_NO_CHECK_O', 'DCC Merchant Number', 'MERCHANT', NULL, NULL, NULL, NULL, FALSE, 'Not fixable by spApplyDCCEnablementConfiguration.'),
         ('FIRMWARE_VERSION_CHECK', 'Firmware Version', 'FIRMWARE', 4, 'TERMINAL_IDENTIFIER', NULL, NULL, FALSE, 'Different SP (spManageEMVTerminalFirmwarePackage); heavier rollout — flag only.'),
-        ('PRINTOUTTYPETEMPLATEDCC_CHECK_C', 'DCC Receipt Template', 'TEMPLATE', 16, 'INSTANCE_IDENTIFIER', NULL, 'receipt_config', TRUE, 'Bit 16; template chosen per terminal (suggested from healthy peers, confirmed by the operator) — the row only holds the current, broken value.'),
+        ('PRINTOUTTYPETEMPLATEDCC_CHECK_C', 'DCC Receipt Template', 'TEMPLATE', 16, 'INSTANCE_IDENTIFIER', NULL, 'receipt_config', TRUE, 'Bit 16; template is prefilled from the workbook provider/brand rules and confirmed by the operator.'),
         ('CONFIGDOWNLOAD_VERSION_CHECK_C', 'Config Download Version', 'CONFIG', 2, 'TERMINAL_IDENTIFIER', 'ECB DCC', NULL, TRUE, 'Bit 2; sets ECB DCC (every healthy terminal has it; broken ones have Standard).')
     AS v(CHECK_COLUMN, FLAG_NAME, FLAG_TYPE, FIX_BIT, TARGET_ID_KIND,
          FIX_VALUE, SP_COLUMN, FIXABLE, NOTES)

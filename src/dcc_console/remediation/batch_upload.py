@@ -13,24 +13,29 @@ except ModuleNotFoundError:  # The rest of Remediation works without Excel uploa
 
 from .mapping import FLAG_FIXES, TRACKED_CHECK_COLUMNS
 
-_REQUIRED_HEADERS = {
-    "change_type": "Change Type",
-    "instance_identifier": "instance_identifier",
-    "location_no": "location_no",
-    "location_desc": "location_desc",
-    "country_name": "country_name",
-    "bank_merchant_id": "bank_merchant_id",
-    "acquirer_name": "acquirer_name",
-    "terminal_id": "TerminalID",
-}
-
-_COLUMN_TO_ROW_FIELD = {
-    "instance_identifier": "INSTANCE_IDENTIFIER",
-    "location_no": "LOCATION_NO",
-    "location_desc": "LOCATION_NAME",
-    "country_name": "COUNTRY_NAME",
-    "bank_merchant_id": "BANK_MERCHANT_ID",
-    "acquirer_name": "ACQUIRER_NAME",
+_HEADER_TO_ROW_FIELD = {
+    "instanceidentifier": "INSTANCE_IDENTIFIER",
+    "locationno": "LOCATION_NO",
+    "locationdesc": "LOCATION_DESC",
+    "locationname": "LOCATION_NAME",
+    "country": "COUNTRY_NAME",
+    "countryname": "COUNTRY_NAME",
+    "region": "REGION",
+    "industryname": "INDUSTRY_NAME",
+    "bankmerchantid": "BANK_MERCHANT_ID",
+    "merchantname": "MERCHANT_NAME",
+    "customername": "CUSTOMER_NAME",
+    "acquirername": "ACQUIRER_NAME",
+    "dccprovidercode": "DCCPROVIDER_CODE",
+    "printouttypereceipt": "PRINTOUT_TYPE_RECEIPT",
+    "printouttypetemplatedcc": "PRINTOUT_TYPE_TEMPLATE_DCC",
+    "printouttypedisplay": "PRINTOUT_TYPE_DISPLAY",
+    "terminalbrandname": "TERMINAL_BRAND_NAME",
+    "terminalmodelname": "TERMINAL_MODEL_NAME",
+    "firmwareversion": "FIRMWARE_VERSION",
+    "terminalid": "TERMINAL_IDENTIFIER",
+    "instanceterminalid": "TERMINAL_IDENTIFIER",
+    "terminalidentifier": "TERMINAL_IDENTIFIER",
 }
 
 
@@ -103,7 +108,7 @@ _CHANGE_TYPE_TO_CHECK = _change_type_map()
 
 
 def parse_workbook(content: bytes) -> tuple[UploadedTarget, ...]:
-    """Parse the first worksheet; fail closed on unknown checks or malformed rows."""
+    """Read checks from column A and validate named metadata columns in the first worksheet."""
     if load_workbook is None:
         raise ValueError(
             "Excel upload requires openpyxl. Install project dependencies with "
@@ -121,26 +126,30 @@ def parse_workbook(content: bytes) -> tuple[UploadedTarget, ...]:
         header_cells = next(rows)
     except StopIteration as exc:
         raise ValueError("The Excel worksheet is empty.") from exc
-    header_keys = [_token(cell.value) for cell in header_cells]
-    header_keys = ["terminalid" if key == "instanceterminalid" else key for key in header_keys]
-    header_index = {key: index for index, key in enumerate(header_keys) if key}
-    missing = [
-        label for key, label in _REQUIRED_HEADERS.items() if _token(key) not in header_index
-    ]
-    if missing:
-        raise ValueError("Missing required Excel columns: " + ", ".join(missing))
+    header_index: dict[str, int] = {}
+    for index, cell in enumerate(header_cells[1:], start=1):
+        header = _token(cell.value)
+        if not header:
+            continue
+        row_field = _HEADER_TO_ROW_FIELD.get(header)
+        if row_field is None:
+            raise ValueError(f"Unsupported Excel column: {cell.value!r}")
+        if row_field in header_index:
+            raise ValueError(f"Duplicate Excel column for {row_field}.")
+        header_index[row_field] = index
+    if "TERMINAL_IDENTIFIER" not in header_index:
+        raise ValueError(
+            "Missing required Excel column: TerminalID, InstanceTerminalID or terminal_identifier."
+        )
 
     parsed: dict[tuple[str, str], UploadedTarget] = {}
     errors: list[str] = []
     for row_number, cells in enumerate(rows, start=2):
         if not any(_excel_cell_text(cell).strip() for cell in cells):
             break
-        values = {
-            key: cells[header_index[_token(key)]]
-            for key in _REQUIRED_HEADERS
-        }
-        terminal_id = _excel_cell_text(values["terminal_id"], preserve_numeric_format=True)
-        raw_change = _excel_cell_text(values["change_type"])
+        terminal_cell = cells[header_index["TERMINAL_IDENTIFIER"]]
+        terminal_id = _excel_cell_text(terminal_cell, preserve_numeric_format=True)
+        raw_change = _excel_cell_text(cells[0])
         check_column = _CHANGE_TYPE_TO_CHECK.get(_token(raw_change))
         if not terminal_id:
             errors.append(f"row {row_number}: TerminalID is blank")
@@ -149,12 +158,15 @@ def parse_workbook(content: bytes) -> tuple[UploadedTarget, ...]:
             errors.append(f"row {row_number}: unsupported Change Type {raw_change!r}")
             continue
         metadata = {}
-        for upload_column, row_field in _COLUMN_TO_ROW_FIELD.items():
-            text = _excel_cell_text(values[upload_column], preserve_numeric_format=True)
+        for row_field, index in header_index.items():
+            if row_field == "TERMINAL_IDENTIFIER":
+                continue
+            cell = cells[index] if index < len(cells) else None
+            text = _excel_cell_text(cell, preserve_numeric_format=True) if cell else ""
             if not text:
                 continue
             metadata[row_field] = (
-                normalise_location_no(text) if upload_column == "location_no" else text
+                normalise_location_no(text) if row_field == "LOCATION_NO" else text
             )
         parsed.setdefault(
             (terminal_id, check_column),

@@ -17,6 +17,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from dcc_console.database import ProcedureOutput
+from dcc_console.remediation import ddl
 from dcc_console.remediation.mapping import TRACKED_CHECK_COLUMNS
 from dcc_console.remediation.sf_connection import SnowflakeSettings
 
@@ -100,6 +101,7 @@ class FakeSnowflake:
                         "FIX_LOG_COLUMNS": 3 * full,
                         "OPERATOR_COLUMNS": int(full),
                         "REGISTRY_COLUMNS": int(full),
+                        "SNAPSHOT_COLUMNS": len(ddl.SNAPSHOT_ADDED_COLUMNS) * int(full),
                         "VIEW_CURRENT": int(full),
                     }
                 ]
@@ -142,6 +144,18 @@ class FakeSnowflake:
                     if terminal_id in rows_by_terminal.index
                 ]
             )
+        if "NFC_PROVIDER_COUNT" in sql:
+            records = []
+            for instance in params:
+                rows = self.frame[self.frame["INSTANCE_IDENTIFIER"].astype(str) == instance]
+                providers = rows["DCCPROVIDER_CODE"].dropna().astype(str).str.strip().str.upper()
+                values = providers.unique().tolist()
+                records.append({
+                    "INSTANCE_IDENTIFIER": instance,
+                    "NFC_PROVIDER_CODE": values[0] if values else None,
+                    "NFC_PROVIDER_COUNT": len(values),
+                })
+            return pd.DataFrame(records)
         if "FIX_CONFIRMED_PROD" in sql:
             return pd.DataFrame([{"FIX_CONFIRMED_PROD": 368}])
         if "UNIQUE_FIXED_TERMINALS_PROD" in sql:
@@ -343,8 +357,20 @@ def _console_script() -> None:
     render_remediation(armed_live=st.session_state.get("_test_armed", False))
 
 
-def _render(fake: FakeSnowflake, **state) -> AppTest:
-    at = AppTest.from_function(_console_script, default_timeout=30)
+def _campaign_script() -> None:
+    import streamlit as st
+
+    from dcc_console.remediation import campaign_panel
+    from dcc_console.remediation.tab import _objects
+
+    conn = st.session_state["rem_sf_conn"]
+    campaign_panel.render_campaign_panel(
+        conn, _objects(conn), armed_live=st.session_state.get("_test_armed", False)
+    )
+
+
+def _render(fake: FakeSnowflake, *, script=_console_script, **state) -> AppTest:
+    at = AppTest.from_function(script, default_timeout=30)
     at.session_state["rem_sf_conn"] = fake
     at.session_state["results"] = []
     for key, value in state.items():
@@ -417,6 +443,30 @@ def test_overview_page_shows_kpis_beside_sidebar_disconnect():
     assert fixed_by_bit.loc[fixed_by_bit["Bit"] == 2, "Terminals fixed"].iloc[0] == 367
 
 
+def test_snowflake_connection_defaults_to_ai_workspace(monkeypatch):
+    monkeypatch.delenv("SNOWFLAKE_DATABASE", raising=False)
+    monkeypatch.delenv("DCC_SHARED_SCHEMA", raising=False)
+    fake = FakeSnowflake()
+    at = _render(fake)
+
+    assert _problems(at) == []
+    assert at.text_input(key="rem_sf_database").label == "Database"
+    assert at.text_input(key="rem_sf_database").value == "AI_WORKSPACE"
+    assert at.text_input(key="rem_sf_shared").value == "AI_WORKSPACE.DCC_REMEDIATION"
+    assert fake.settings.database == "AI_WORKSPACE"
+    assert fake.settings.shared_schema == "AI_WORKSPACE.DCC_REMEDIATION"
+
+
+def test_remediation_navigation_removes_campaign_and_resets_stale_selection():
+    at = _render(FakeSnowflake(), rem_page="Campaign")
+
+    assert _problems(at) == []
+    section = at.radio(key="rem_page")
+    assert section.options == ["Overview", "Single fix", "Batch fix"]
+    assert section.value == "Overview"
+    assert not any(button.key == "rem_campaign_run" for button in at.button)
+
+
 @pytest.mark.parametrize("environment", ["DEV", "UAT", "PROD"])
 def test_sidebar_uses_per_environment_sql_credentials(monkeypatch, environment):
     username = f"{environment.lower()}-example-user"
@@ -480,13 +530,13 @@ def test_uninitialised_schema_only_offers_initialise():
     ],
 )
 def test_action_outcome_is_visible_after_click(button_key, failure_text, success_text):
-    failing = _render(FakeSnowflake(fail_writes=True))
+    failing = _render(FakeSnowflake(fail_writes=True, initialised=button_key != "rem_init"))
     failing.button(key=button_key).click().run()
 
     assert [e.value for e in failing.exception] == []
     assert any(failure_text in e.value for e in failing.error)
 
-    fake = FakeSnowflake()
+    fake = FakeSnowflake(initialised=button_key != "rem_init")
     ok = _render(fake)
     ok.button(key=button_key).click().run()
 
@@ -496,7 +546,7 @@ def test_action_outcome_is_visible_after_click(button_key, failure_text, success
 
 
 def test_initialise_creates_the_shared_log_before_the_views():
-    fake = FakeSnowflake()
+    fake = FakeSnowflake(initialised=False)
     at = _render(fake)
     at.button(key="rem_init").click().run()
     statements = [sql for sql, _ in fake.writes]
@@ -506,6 +556,58 @@ def test_initialise_creates_the_shared_log_before_the_views():
     view_at = next(i for i, s in enumerate(statements) if "V_CURRENT_BROKEN AS" in s)
     assert log_at < view_at
     assert any("FIX_OPERATORS" in s for s in statements)
+
+
+def test_verify_ready_schema_does_not_write_even_without_ddl_permissions():
+    fake = FakeSnowflake(fail_writes=True)
+    at = _render(fake)
+    at.button(key="rem_init").click().run()
+
+    assert _problems(at) == []
+    assert fake.writes == []
+    assert any("Verified without changes" in item.value for item in at.success)
+
+
+def test_initialise_skips_ready_shared_tables_when_worklist_view_needs_upgrade():
+    class MissingWorklistView(FakeSnowflake):
+        def query(self, sql, params=None):
+            frame = super().query(sql, params)
+            if "INFORMATION_SCHEMA" in sql:
+                frame["VIEW_CURRENT"] = 0
+            return frame
+
+    fake = MissingWorklistView()
+    at = _render(fake)
+    at.button(key="rem_init").click().run()
+
+    assert _problems(at) == []
+    assert fake.writes
+    assert not any(
+        "ALTER TABLE" in sql and any(
+            table in sql for table in ("APP_FIX_LOG", "FIX_OPERATORS", "DCC_FIX_REGISTRY")
+        )
+        for sql, _ in fake.writes
+    )
+    assert not any(
+        "CREATE TABLE IF NOT EXISTS" in sql and "APP_FIX_LOG" in sql
+        for sql, _ in fake.writes
+    )
+
+
+def test_failed_schema_metadata_check_disables_initialise():
+    class FailedMetadataRead(FakeSnowflake):
+        def query(self, sql, params=None):
+            if "INFORMATION_SCHEMA" in sql:
+                raise RuntimeError("Metadata access denied")
+            return super().query(sql, params)
+
+    fake = FailedMetadataRead()
+    at = _render(fake)
+
+    assert not at.exception
+    assert at.button(key="rem_init").disabled
+    assert any("Metadata access denied" in item.value for item in at.error)
+    assert fake.writes == []
 
 
 def test_reconcile_button_runs_the_confirmation_handoff():
@@ -631,6 +733,44 @@ def test_bit16_needs_a_confirmed_template_before_anything_runs():
 
     at.checkbox(key=confirm_key).check().run()
     assert not at.button(key="rem_pre_T-16").disabled
+
+
+@pytest.mark.parametrize("page", ["Single fix", "Batch fix"])
+@pytest.mark.parametrize("check", [
+    "HANDLER_DCCENABLENFC_CHECK_O", "HANDLER_DCCENABLENFCSINGLETAP_CHECK_O",
+])
+def test_fexco_nfc_dry_run_uses_false_in_single_and_batch(page, check):
+    class NfcSql(FakeSql):
+        def query(self, sql, params=()):
+            if "handler_type" in sql:
+                return pd.DataFrame([{
+                    "handler_name": "handlerTerminalRequester",
+                    "extra_config": (
+                        '<extra_config><extra_config config_name="dccEnableNfc" '
+                        'config_value="true"/><extra_config config_name="dccEnableNfcSingleTap" '
+                        'config_value="true"/></extra_config>'
+                    ),
+                }])
+            return super().query(sql, params)
+
+    row = _row("T-NFC", DCCPROVIDER_CODE="FEXCO", **{check: 1})
+    snow = FakeSnowflake(rows=[row])
+    sql = NfcSql()
+    state = _fixer_state("UAT", sql, tid="T-NFC")
+    state["rem_page"] = page
+    at = _render(snow, **state)
+    if page == "Batch fix":
+        next(button for button in at.button if button.label == "Load / add terminals").click().run()
+        selection = next(frame.value for frame in at.dataframe if "Include" in frame.value)
+        assert selection["Value"].str.endswith("=false").all()
+        at.button(key="rem_batch_run").click().run()
+    else:
+        at.button(key="rem_pre_T-NFC").click().run()
+        at.button(key="rem_dry_T-NFC").click().run()
+    assert _problems(at) == []
+    assert len(sql.calls) == 1
+    assert sql.calls[0][0][3] == 0
+    assert sql.calls[0][1] is True
 
 
 def test_bit16_without_a_workbook_rule_cannot_proceed():
@@ -1071,7 +1211,7 @@ def test_campaign_rehearsal_requires_and_logs_campaign_reference():
     sql = FakeSql()
     state = _batch_state("UAT", sql)
     state["rem_page"] = "Campaign"
-    at = _render(snow, **state)
+    at = _render(snow, script=_campaign_script, **state)
 
     assert _problems(at) == []
     assert not any(widget.key == "rem_campaign_name" for widget in at.text_input)
@@ -1106,7 +1246,7 @@ def test_campaign_runs_only_the_selected_checks():
     sql = FakeSql()
     state = _batch_state("UAT", sql)
     state["rem_page"] = "Campaign"
-    at = _render(snow, **state)
+    at = _render(snow, script=_campaign_script, **state)
 
     checks = at.multiselect(key="rem_campaign_checks")
     checks.set_value(["CONFIGDOWNLOAD_VERSION_CHECK_C"]).run()
@@ -1129,7 +1269,7 @@ def test_campaign_live_uat_logs_and_registers_shared_reference():
     sql = FakeSql()
     state = _batch_state("UAT", sql, armed=True)
     state["rem_page"] = "Campaign"
-    at = _render(snow, **state)
+    at = _render(snow, script=_campaign_script, **state)
     at.button(key="rem_campaign_load_targets").click().run()
     at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER").set_value(["T-9"]).run()
     at.radio(key="rem_campaign_mode").set_value("Apply live").run()

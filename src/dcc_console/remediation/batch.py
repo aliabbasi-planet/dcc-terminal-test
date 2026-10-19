@@ -36,12 +36,13 @@ class BatchItem:
     covered_rows: tuple[dict, ...]
 
     @property
-    def key(self) -> tuple[str, str, str, str | None]:
+    def key(self) -> tuple:
         return (
             self.step.check_column,
             self.step.target_kind,
             self.step.target_identifier,
             self.step.config_value,
+            self.step.definition.bit8_config_value,
         )
 
     @property
@@ -134,7 +135,10 @@ def plan_batch(rows: list[dict]) -> BatchPlan:
                 template_rows.setdefault(tkey, []).append(row)
                 template_flag[tkey] = step.flag
                 continue
-            key = (step.check_column, step.target_kind, step.target_identifier, step.config_value)
+            key = (
+                step.check_column, step.target_kind, step.target_identifier,
+                step.config_value, step.definition.bit8_config_value,
+            )
             item_rows.setdefault(key, []).append(row)
             item_step.setdefault(key, step)
             fixes_per_terminal[tid] += 1

@@ -35,8 +35,8 @@ SHARED = RemediationObjects("DEV_CORE_XYZ", "MY_SCHEMA", "DEV_CORE_AAB", "DCC_RE
 # --------------------------------------------------------------------------- #
 
 
-def test_default_objects_is_dev_core_aab():
-    assert DEFAULT_OBJECTS.database == "DEV_CORE_AAB"
+def test_default_objects_is_ai_workspace():
+    assert DEFAULT_OBJECTS.database == "AI_WORKSPACE"
     assert DEFAULT_OBJECTS.schema == "DCC_REMEDIATION"
 
 
@@ -153,6 +153,13 @@ def test_refresh_merge_mentions_every_tracked_check():
     for col in mapping.TRACKED_CHECK_COLUMNS:
         assert col in sql
     assert "CONFIGDOWNLOAD_VERSION_CHECK_BASE" in sql
+    assert "MAX(DCCPROVIDER_CODE) AS DCCPROVIDER_CODE" in sql
+    for column in (
+        "PRINTOUT_TYPE_RECEIPT",
+        "PRINTOUT_TYPE_TEMPLATE_DCC",
+        "PRINTOUT_TYPE_DISPLAY",
+    ):
+        assert f"MAX({column}) AS {column}" in sql
 
 
 def test_refresh_merge_is_terminal_grain_upsert():
@@ -519,6 +526,7 @@ def test_bit_fix_coverage_separates_calls_registry_checks_and_terminals():
 def test_snapshot_stores_source_load_time_in_utc():
     merge = snapshot.build_refresh_merge(OBJS)
     assert "CONVERT_TIMEZONE('UTC', LAST_ALTERED)::TIMESTAMP_NTZ" in merge
+    assert "MAX(LOCATION_DESC) AS LOCATION_DESC" in merge
 
 
 def test_ddl_seed_has_all_flags_from_mapping():
@@ -543,6 +551,16 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
     assert "TABLE_NAME = 'DCC_FIX_REGISTRY'" in sql and "'CONFIRMED_AT_UTC'" in sql
     assert "TABLE_NAME = 'FIX_OPERATORS'" in sql and "'CAN_PROD'" in sql
     assert f"COLUMN_NAME = '{ddl.VIEW_MARKER_COLUMN}'" in sql
+    expected_snapshot_columns = ", ".join(
+        f"'{name}'" for name, _ in ddl.SNAPSHOT_ADDED_COLUMNS
+    )
+    assert f"COLUMN_NAME IN ({expected_snapshot_columns})" in sql
+    create_statements = ddl.build_create_statements(OBJS)
+    for name, _ in ddl.SNAPSHOT_ADDED_COLUMNS:
+        assert any(
+            f"ADD COLUMN IF NOT EXISTS {name}" in statement
+            for statement in create_statements
+        )
 
 
 @pytest.mark.parametrize(
@@ -555,6 +573,7 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 3,
                 "OPERATOR_COLUMNS": 1,
                 "REGISTRY_COLUMNS": 1,
+                "SNAPSHOT_COLUMNS": len(ddl.SNAPSHOT_ADDED_COLUMNS),
                 "VIEW_CURRENT": 1,
             },
             True,
@@ -568,10 +587,11 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 0,
                 "OPERATOR_COLUMNS": 0,
                 "REGISTRY_COLUMNS": 0,
+                "SNAPSHOT_COLUMNS": 0,
                 "VIEW_CURRENT": 0,
             },
             False,
-            2,
+                3,
         ),
         # Fix log present, but the operator allowlist (CAN_PROD) and registry (CONFIRMED_AT_UTC)
         # upgrades are missing, and the handoff table is absent.
@@ -582,6 +602,7 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 3,
                 "OPERATOR_COLUMNS": 0,
                 "REGISTRY_COLUMNS": 0,
+                "SNAPSHOT_COLUMNS": len(ddl.SNAPSHOT_ADDED_COLUMNS),
                 "VIEW_CURRENT": 1,
             },
             False,
@@ -594,6 +615,7 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 0,
                 "OPERATOR_COLUMNS": 0,
                 "REGISTRY_COLUMNS": 0,
+                "SNAPSHOT_COLUMNS": 0,
                 "VIEW_CURRENT": 0,
             },
             False,

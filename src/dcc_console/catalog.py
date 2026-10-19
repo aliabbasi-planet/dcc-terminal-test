@@ -70,6 +70,7 @@ class TestDefinition:
     # is called with that value NULLed out; choosing "Add" keeps the normal value
     # widget so the tester still supplies it. See Bit 16 (DCC Receipt Template).
     add_remove_toggle: bool = False
+    bit8_config_value: bool | None = None
 
     @property
     def json_field(self) -> str:

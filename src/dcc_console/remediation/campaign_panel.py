@@ -41,7 +41,7 @@ def _campaign_plan(
         if any(_is_broken(scoped.get(column)) for column in checks):
             scoped_rows.append(scoped)
 
-    plan = batch.plan_batch(scoped_rows)
+    plan = batch.plan_batch(fix_panel._load_nfc_providers(conn, scoped_rows))
     items = list(plan.items)
     missing_templates: list[str] = []
     for template in plan.templates:
