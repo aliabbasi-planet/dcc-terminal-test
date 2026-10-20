@@ -7,6 +7,7 @@ only ever taken from :mod:`dcc_console.catalog`, never from user input.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import pandas as pd
@@ -167,7 +168,13 @@ class DatabaseConnection:
             connection.rollback()
             raise
 
-    def call_procedure(self, sql: str, params: tuple, rollback: bool) -> ProcedureOutput:
+    def call_procedure(
+        self,
+        sql: str,
+        params: tuple,
+        rollback: bool,
+        validate: Callable[[ProcedureOutput], None] | None = None,
+    ) -> ProcedureOutput:
         """Execute a procedure, drain every result set, then commit or roll back.
 
         Server messages (``PRINT``, ``RAISERROR`` severity <= 10) are drained
@@ -178,6 +185,9 @@ class DatabaseConnection:
         Commits only when the whole call succeeded and ``rollback`` is False. Any
         error rolls the transaction back before re-raising, so a live call that
         fails part-way never leaves a half-applied change committed.
+
+        ``validate`` runs after draining the output but before commit. It may read
+        restored values on this connection and must raise to abort the transaction.
         """
         connection = self._require_connection()
         cursor = connection.cursor()
@@ -218,6 +228,9 @@ class DatabaseConnection:
                     break
                 _drain_messages()
             _drain_messages()
+            output = ProcedureOutput(grids=grids, messages=messages, return_code=return_code)
+            if validate is not None:
+                validate(output)
             succeeded = True
         finally:
             cursor.close()
@@ -225,7 +238,7 @@ class DatabaseConnection:
                 connection.rollback()
             else:
                 connection.commit()
-        return ProcedureOutput(grids=grids, messages=messages, return_code=return_code)
+        return output
 
     def safe_rollback(self) -> None:
         if self.connection is not None:

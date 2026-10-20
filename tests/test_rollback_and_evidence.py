@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dcc_console.catalog import TEST_CATALOG
+from dcc_console.database import ProcedureOutput
 from dcc_console.execution import TestResult
 from dcc_console.rollback import restore_state
 
@@ -33,6 +34,7 @@ def make_result(**overrides) -> TestResult:
         grid_frames=[],
         duration_s=0.5,
         timestamp="2026-09-11T10:00:00",
+        rollback_plan={"operation": "rollback"},
     )
     defaults.update(overrides)
     return TestResult(**defaults)
@@ -46,7 +48,7 @@ class TestRollbackAvailability:
         assert make_result(mode="SIMULATION").can_rollback is False
 
     def test_no_restore_point_blocks_rollback(self):
-        assert make_result(restore_point=None).can_rollback is False
+        assert make_result(rollback_plan={}).can_rollback is False
 
     def test_nothing_persisted_means_nothing_to_undo(self):
         assert make_result(change_persisted=False).can_rollback is False
@@ -68,10 +70,23 @@ class RestoreConnection:
         self.writes = []
 
     def execute_write(self, sql, params):
+        raise AssertionError("Rollback must never execute direct DML.")
+
+    def query(self, sql, params):
+        import pandas as pd
+
+        return pd.DataFrame([[self.value]])
+
+    def safe_rollback(self):
+        pass
+
+    def call_procedure(self, sql, params, rollback, validate=None):
         if self.fail:
             raise RuntimeError("restore failed")
         self.writes.append((sql, params))
-        return 1
+        output = ProcedureOutput([], [], 0)
+        validate(output)
+        return output
 
     def scalar(self, sql, params):
         return self.value
@@ -89,7 +104,9 @@ def test_restore_state_writes_and_verifies_original_value():
     assert outcome.ok is True
     assert outcome.rows == 1
     assert outcome.trigger == "manual"
-    assert connection.writes[0][1] == ("1", "T-1")
+    assert connection.writes[0][1][0] == 2
+    assert '"object_value": "1"' in connection.writes[0][1][1]
+    assert "@is_rollback = 1" in connection.writes[0][0]
 
 
 def test_restore_state_reports_write_failure():

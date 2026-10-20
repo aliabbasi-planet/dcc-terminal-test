@@ -106,12 +106,18 @@ class FakeSqlServer:
         raise AssertionError(f"unexpected scalar: {sql}")
 
     def query(self, sql: str, params=()):
+        if "[ccc].[location]" in sql:
+            return pd.DataFrame([[self.locations[params[0]]]]) if params[0] in self.locations \
+                else pd.DataFrame([])
+        if "[emv_terminal]" in sql:
+            return pd.DataFrame([[self.terminals[params[0]]]]) if params[0] in self.terminals \
+                else pd.DataFrame([])
         column = "receipt_config" if "receipt_config" in sql else "extra_config"
         rows = [
-            {"handler_name": h["handler_name"], column: h[column]}
-            for h in self.handlers.get(params[0], [])
+            {"handler_id": str(index), "handler_name": h["handler_name"], column: h[column]}
+            for index, h in enumerate(self.handlers.get(params[0], []), start=1)
         ]
-        return pd.DataFrame(rows, columns=["handler_name", column])
+        return pd.DataFrame(rows, columns=["handler_id", "handler_name", column])
 
     # -- the procedure ---------------------------------------------------------------
     def call_procedure(self, sql: str, params, rollback: bool) -> ProcedureOutput:
@@ -653,12 +659,12 @@ def test_should_register_and_resolution():
     assert not fixer.should_register(simulated)
 
 
-def test_registry_records_cover_every_terminal_with_change_ref_and_script():
+def test_registry_records_cover_every_terminal_with_change_ref_and_json():
     step = _step("HANDLER_DCCENABLE_CHECK_O")
     covered = [_row(TERMINAL_IDENTIFIER="T1"), _row(TERMINAL_IDENTIFIER="T2")]
 
     class R:
-        sp_rollback_scripts = ["UPDATE handler SET ... prior"]
+        rollback_plan = {"version": 1, "operation": "rollback", "originals": ["x" * 17000]}
 
     records = fixer.registry_records(
         step=step,
@@ -674,6 +680,7 @@ def test_registry_records_cover_every_terminal_with_change_ref_and_script():
     assert all(r["ENVIRONMENT"] == "PROD" for r in records)
     assert all(r["CHANGE_REF"] == "CHG0042" for r in records)
     assert all(r["SP_ROLLBACK_SCRIPT"] for r in records)
+    assert all(json.loads(r["SP_ROLLBACK_SCRIPT"]) == R.rollback_plan for r in records)
     assert all(r["CHECK_COLUMN"] == "HANDLER_DCCENABLE_CHECK_O" for r in records)
     for record in records:  # every key is an allowed, well-formed registry column
         fixer_registry_ok(record)
@@ -768,7 +775,8 @@ def test_bit8_live_fix_verifies_every_handler(journal):
     post = fixer.precheck(sql, step, "UAT")
     assert fixer.live_outcome(live, post).verified is True
     entry = journal.get_entry(live.journal_id)
-    assert entry["restore_kind"] == "SP_SCRIPT"  # crash recovery would run the SP's script
+    assert entry["restore_kind"] == "SP_JSON"
+    assert json.loads(entry["restore_sql"]) == live.rollback_plan
 
 
 def test_live_outcome_and_precheck_outcome_rules():

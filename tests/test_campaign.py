@@ -63,6 +63,13 @@ def test_campaign_summary_counts_statuses_and_pending_rollbacks():
         status="FAIL",
         change_persisted=True,
         state_after="2",
+        rollback_plan={
+            "version": 1, "operation": "rollback", "bit": 2,
+            "test_key": "Bit 2 — Config Download Version (terminal)",
+            "target_type": "terminal", "target": "T-1", "field": "configdownload_version",
+            "records": [{"terminal_identifier": "T-1", "object_value": "1"}],
+            "originals": [{"terminal_identifier": "T-1", "original": "1"}],
+        },
     )
     summary = campaign_summary([make_result(), live])
     assert summary == {

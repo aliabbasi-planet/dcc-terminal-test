@@ -185,7 +185,7 @@ and therefore share one SHA-256 integrity hash.
 
 | Section | Content |
 |---|---|
-| **A** — Procedure execution evidence | The database code exercised (`EXEC`, the verification `SELECT`, the compensating `UPDATE`, and any rollback statements actually executed), input JSON, before/applied-change/after verified column, return code, procedure preview output, the verbatim database message stream, and rollback verification |
+| **A** — Procedure execution evidence | The database code exercised (`EXEC` for apply/rollback and the verification `SELECT`), input and rollback JSON, before/applied-change/after verified values, return code, procedure preview output, the verbatim database message stream, and rollback verification |
 | **B** — Coverage matrix | All 13 configuration areas with covered/blocked/not-tested state |
 | **C** — Negative validation | Every case across all three families (non-existent, invalid, duplicate) with the rejection evidence captured |
 | **D** — Capability & limitation analysis | Confirmed tested, placeholder-exercised, blocked, not tested, assumptions |
@@ -252,16 +252,66 @@ several layers, all replaying the value captured **before** the test:
 Every live result renders the rollback panel unconditionally — including the restore
 point and the full rollback history — so the control is never hidden.
 
-The restore statement is fixed in shape:
+All rollback entry points (Single Test, Campaigns, Remediation and crash recovery)
+call the extended procedure with `@is_rollback = 1`. Normal apply calls explicitly
+use `@is_rollback = 0`. The extended procedure must be deployed to the target
+environment first; the app does not deploy or alter it.
+
+| Bit | JSON parameter | Record identifier | Original `object_value` |
+|---|---|---|---|
+| 1 | `@location_json` | `location_no` | Function presence: `"1"` or `"0"`; function selected with `@extra_function_name` |
+| 2 | `@terminal_json` | `terminal_identifier` | Original config-download code (`"1"`, `"2"` or NULL sentinel) |
+| 8 | `@instance_json` | `handler_id` | Original flag (`"1"`, `"0"` or NULL sentinel); flag selected with `@Extra_Config_Name` |
+| 16 | `@instance_json` | `handler_id` | Each handler's original template, or NULL sentinel for an absent element |
+
+For example, Bit 16 restores different templates on the same instance independently:
 
 ```sql
-UPDATE <catalog.table>
-SET    <catalog.column> = CONVERT(<catalog.cast>, ?)
-WHERE  CONVERT(nvarchar(50), <catalog.key>) = ?
+EXEC @dcc_rc = [cccai].[spApplyDCCEnablementConfiguration]
+    @display_config = ?,
+    @instance_json = ?,
+    @is_simulation = 0,
+    @is_rollback = 1;
 ```
 
-Table, column, key and cast come only from `catalog.py`. The value and row key are
-bound parameters, so a rollback cannot be redirected at another row or table.
+```json
+[{"handler_id":"292","object_value":"NULL"},{"handler_id":"6521","object_value":"ElavonEurope"}]
+```
+
+The client stores a versioned JSON envelope identifying the rollback operation,
+bit, target, field, per-record values and original-value evidence. Only the record
+array is sent to the SP; the operation and bit are separate SP parameters. SQL
+NULL/missing values are JSON `null` internally and converted to the literal string
+`"NULL"` at the SP boundary, as specified by the UAT examples. Empty templates
+remain empty strings, not missing elements. A literal template named `"NULL"`,
+duplicate XML nodes, invalid XML, unknown fields or unsupported values are refused.
+
+Original values and stable handler IDs are captured **before** any live apply.
+If capture fails, live execution is blocked; simulations remain available.
+Bit 4 has no supported JSON rollback contract and is therefore simulation-only.
+No rollback path executes direct `UPDATE` statements or the SP's returned
+`rollback_script`, including older journal entries.
+
+The rollback runs in one client transaction. It commits only after return code `0`
+and a fresh read confirm every original value. Verification compares record IDs,
+SQL NULL versus non-NULL XML, missing versus existing XML elements and the changed
+field's contents, without undoing unrelated later fixes. Boolean XML values `0/1`
+and `false/true` are compared semantically. A read failure, missing return code,
+scope mismatch or failed verification aborts the transaction and leaves recovery
+pending. The reported record count is the number verified, not a rowcount from SQL.
+
+**UAT validation required:** the supplied Bit 16 rollback example contains a log
+labelled Bit 8, so it is not proof of Bit 16 restoration. Confirm each supported
+bit against the deployed SP, including empty templates, missing XML nodes, SQL NULL
+columns, heterogeneous handlers and an invalid second record. If the SP cannot
+recreate a SQL NULL XML document (rather than leaving an empty root), verification
+will reject that rollback; the app does not silently substitute an empty document.
+
+New journals are tagged `SP_JSON` and contain the full envelope before live writes.
+For compatibility, the existing Snowflake columns `APP_FIX_LOG.ROLLBACK_SCRIPT`
+and `DCC_FIX_REGISTRY.SP_ROLLBACK_SCRIPT` now store the **untruncated JSON envelope**,
+not executable SQL. No Snowflake DDL migration is needed. Legacy SQL-only restore
+points are refused and require DBA review; they are never interpreted as commands.
 
 ### What rollback is not
 
@@ -271,7 +321,7 @@ failure is:
 ```
 COMMIT (new value written)
   → error detected
-    → UPDATE (old value written back)
+    → EXEC SP with @is_rollback = 1 (old values restored internally)
       → COMMIT
 ```
 
@@ -405,7 +455,8 @@ manual region), and rollback availability. No database connection is required to
 - Credentials are entered per session and never persisted, logged or exported.
 - Every SQL value is a bound parameter; identifiers come only from `catalog.py`.
 - Live mode needs a checkbox *and* the typed environment name.
-- A failed live run auto-restores its captured pre-test value.
+- A failed live run attempts SP JSON rollback if a persisted change is detected;
+  failures remain visible and recoverable rather than being marked restored.
 - The restore journal stores original column values on the local disk in
   `~/.dcc_console/` — treat that directory as sensitive on shared machines.
 - The container runs as a non-root user (`uid 10001`).

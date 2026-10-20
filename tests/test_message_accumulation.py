@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from dcc_console.database import DatabaseConnection
 
@@ -134,3 +135,32 @@ def test_cursor_is_closed_even_on_success():
     cursor = FakeCursor([{"messages": [], "rows": None}])
     _db(cursor).call_procedure("EXEC x", (), rollback=True)
     assert cursor.closed
+
+
+def test_validation_failure_rolls_back_without_committing():
+    cursor = FakeCursor([{"rows": [{"dcc_return_code": 0}]}])
+    db = _db(cursor)
+
+    def reject(output):
+        assert output.return_code == 0
+        assert not db.connection.committed
+        raise ValueError("Original handler value was not restored.")
+
+    with pytest.raises(ValueError, match="Original handler value"):
+        db.call_procedure("EXEC x", (), rollback=False, validate=reject)
+    assert db.connection.rolled_back
+    assert not db.connection.committed
+    assert cursor.closed
+
+
+def test_validation_sees_messages_and_return_code_before_commit():
+    cursor = FakeCursor([{"messages": ["restored"], "rows": [{"dcc_return_code": 0}]}])
+    db = _db(cursor)
+
+    def verify(output):
+        assert output.return_code == 0
+        assert output.messages == ["restored"]
+        assert not db.connection.committed
+
+    db.call_procedure("EXEC x", (), rollback=False, validate=verify)
+    assert db.connection.committed

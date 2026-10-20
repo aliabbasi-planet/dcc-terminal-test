@@ -11,6 +11,7 @@ from docx.oxml.ns import qn
 from dcc_console.docx_report import generate_cab_docx
 from dcc_console.execution import TestResult
 from dcc_console.report import cab_report
+from dcc_console.rollback import METHOD_PROCEDURE_JSON, build_rollback_call
 
 
 def mk(**overrides) -> TestResult:
@@ -120,15 +121,29 @@ def _all_text(doc: Document) -> str:
 
 
 def mk_bit8_live(**overrides) -> TestResult:
-    """A full Bit 8 live run: SP script captured, rolled back, flag verified."""
+    """A full Bit 8 live run: originals captured, restored through SP JSON, verified."""
+    plan = {
+        "version": 1, "operation": "rollback", "bit": 8,
+        "test_key": "Bit 8 — DCC Handler Flags (instance)",
+        "target_type": "instance", "target": "I000000001", "field": "dccEnableCompletion",
+        "records": [{"handler_id": "77", "object_value": "0"}],
+        "originals": [{
+            "handler_id": "77",
+            "original": '<extra_config><extra_config config_name="dccEnableCompletion" '
+            'config_value="false"/></extra_config>',
+        }],
+    }
+    sql, _, payload = build_rollback_call(plan)
     return mk(
         mode="LIVE", status="PASS", value="dccEnableCompletion",
-        transaction="COMMITTED then MANUAL ROLLED BACK (procedure script)",
+        transaction="COMMITTED then MANUAL ROLLED BACK (SP JSON)",
         change_persisted=False,
-        grids=[[{"rollback_script": _SCRIPT, "handler_name": "handler-A"}]],
-        rollback_log=[{"ok": True, "rows": 1, "sql": _SCRIPT, "trigger": "manual",
+        grids=[[{"handler_name": "handler-A"}]],
+        rollback_plan=plan,
+        rollback_log=[{"ok": True, "rows": 1, "sql": sql, "trigger": "manual",
+                       "method": METHOD_PROCEDURE_JSON, "payload": payload,
                        "error": None, "at": "2026-09-21T20:48:00+00:00"}],
-        sp_rollback_scripts=[_SCRIPT], sp_managed=True,
+        sp_managed=True,
         sp_prior_states=[{"handler_name": "handler-A", "flag_value": "false"}],
         sp_after_states=[{"handler_name": "handler-A", "flag_value": "true"}],
         sp_restored_states=[{"handler_name": "handler-A", "flag_value": "false"}],
@@ -147,8 +162,9 @@ def test_word_report_contains_every_required_evidence_item():
         "Database code exercised",
         "spApplyDCCEnablementConfiguration",       # 1 - the EXEC issued
         "Verification read",                        # 2 - verification SELECT
-        "the procedure's OWN returned script",      # 3 - authoritative rollback
-        "UPDATE [cccintegrang].[handler]",          # the SP script text itself
+        "SP JSON rollback",                         # 3 - captured structured rollback
+        "@is_rollback = 1",
+        '"handler_id": "77"',
         "Rollback statements actually executed",    # 4 - what actually ran
         "Before / applied change / after evidence",
         "Procedure-managed bit",                    # honesty note

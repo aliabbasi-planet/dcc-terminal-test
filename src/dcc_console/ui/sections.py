@@ -21,6 +21,7 @@ from ..pdf_report import generate_cab_pdf
 from ..readiness import all_passed, capture_procedure_version, grant_script, run_readiness
 from ..reference import load_instances, load_locations, load_terminals
 from ..report import cab_report_with_hash
+from ..rollback import build_rollback_call
 from ..state import add_result, connection, results
 from ..trace import discover_trace_signature
 
@@ -919,82 +920,39 @@ def _render_rollback_panel(result: TestResult) -> None:
         else:
             st.error(f"{label} rollback failed at {entry['at']}: {entry['error']}")
 
-    # Procedure-managed bits (e.g. Bit 8, Bit 16): the change is on a related table
-    # the generic verify column never sees, so roll back with the procedure's OWN
-    # returned script rather than the generic column-restore.
-    if definition.sp_managed and result.has_sp_rollback:
-        sp_column = getattr(definition, "sp_column", "extra_config")
-        st.caption(
-            "Procedure-managed change: the value lives in a related table (e.g. "
-            f"`[cccintegrang].[handler].{sp_column}`), so rollback runs the compensating "
-            "`UPDATE` the procedure itself returned — not a write to the instance row."
-        )
-        with st.popover("Show the procedure's rollback script"):
-            st.code("\n\n".join(result.sp_rollback_scripts), language="sql")
-        already = any(e.get("ok") for e in result.rollback_log)
-        if already:
-            if result.sp_flag_verified is True:
-                st.success(
-                    "Rolled back using the procedure's own script — verified that "
-                    f"`{result.value}` returned to its pre-test value on "
-                    f"{len(result.sp_flag_rows)} affected handler(s)."
-                )
-            elif result.sp_flag_verified is False:
-                st.error(
-                    f"Rollback ran, but `{result.value}` did NOT return to its pre-test "
-                    "value on every handler — investigate before closing the change."
-                )
-            else:
-                st.success(
-                    "Rolled back using the procedure's own script (confirmed by rows "
-                    "affected; value-level verification was unavailable)."
-                )
-            if result.sp_flag_rows:
-                with st.popover("Show handler flag verification"):
-                    st.table(result.sp_flag_rows)
-        else:
-            st.warning("This live change is still applied. Run the procedure's restore script.")
-        if st.button(
-            "↩️ Roll back this change (run the procedure's restore script)",
-            key=f"rb-sp-{result.id}",
-            type="primary",
-            use_container_width=True,
-        ):
-            with st.spinner("Running the procedure's rollback script…"):
-                apply_rollback(connection(), definition, result)
-            st.rerun()
-        return
-
-    st.caption(
-        f"Restores the value captured before the test into "
-        f"`{definition.verify.qualified}` for {result.target_type} `{result.target}`."
-    )
-
     if not result.restore_point_known:
         st.warning(
-            "No restore point was captured for this row, so an automatic restore is not "
-            "possible. Recover from a backup if the value must be reverted."
+            result.rollback_capture_error or
+            "No structured JSON restore point was captured. Legacy UPDATE scripts are "
+            "never executed. Ask the DBA to review this older result."
         )
         return
-
+    st.caption(
+        "Rollback calls spApplyDCCEnablementConfiguration with @is_rollback = 1 "
+        "and original values per record. No direct UPDATE is executed. "
+        "Return code and restored values are checked before commit."
+    )
     with st.popover("Show the restore point"):
-        st.code(_clip(result.restore_point, 2000))
-
-    if result.can_rollback:
+        sql, _, payload = build_rollback_call(result.rollback_plan)
+        st.code(sql, language="sql")
+        st.code(payload, language="json")
+    if result.sp_rolled_back:
+        st.success("Restored through the SP and verified against the original values.")
+        return
+    if result.rollback_available:
         st.warning("This live change is still applied to the database.")
         if st.button("↩️ Roll back this change", key=f"rb-{result.id}", type="primary"):
-            with st.spinner("Restoring the pre-test value…"):
+            with st.spinner("Restoring original values through the SP…"):
                 apply_rollback(connection(), definition, result)
             st.rerun()
         return
-
-    st.success("The verified column currently matches its pre-test value.")
+    st.info("No outstanding change was detected for this result.")
     if st.button(
         "↩️ Force restore anyway",
         key=f"rb-force-{result.id}",
-        help="Re-writes the captured pre-test value even though no difference was detected.",
+        help="Calls the SP with the original values, even if no difference was detected.",
     ):
-        with st.spinner("Re-writing the pre-test value…"):
+        with st.spinner("Restoring original values through the SP…"):
             apply_rollback(connection(), definition, result, trigger="forced")
         st.rerun()
 

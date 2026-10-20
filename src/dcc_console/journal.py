@@ -26,11 +26,10 @@ _JOURNAL_DB = _JOURNAL_DIR / "restore_journal.db"
 # Environments that use the journal.  DEV is deliberately excluded.
 _JOURNALED_ENVIRONMENTS = {"UAT", "PROD"}
 
-# How an entry is restored. COLUMN: the generic parameterised UPDATE, bound with
-# (original_value, target). SP_SCRIPT: the procedure's own complete compensating
-# statement(s), stored as a JSON list and run verbatim with no parameters.
+# Legacy kinds are retained for migration/inspection only. Recovery executes SP_JSON only.
 RESTORE_COLUMN = "COLUMN"
 RESTORE_SP_SCRIPT = "SP_SCRIPT"
+RESTORE_SP_JSON = "SP_JSON"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS restore_journal (
@@ -125,13 +124,14 @@ class RestoreJournal:
         original_value: Any,
         restore_sql: str,
         campaign_id: str | None = None,
+        rollback_plan: dict | None = None,
     ) -> int:
         """Write a restore point BEFORE the live procedure call.
 
         Returns the journal row id.  The write is committed immediately
         (WAL mode) so it survives even if the app crashes on the next line.
-        The entry starts as a generic column restore; procedure-managed bits
-        switch it to the procedure's own script via :meth:`set_procedure_scripts`.
+        New executions store the full SP_JSON restore point here, including handler IDs,
+        before any live write. Legacy entries are never executed by recovery.
         """
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         cursor = self._conn.execute(
@@ -144,7 +144,8 @@ class RestoreJournal:
                 environment, server, database_name, login,
                 test_key, bit, target_type, target, config_value,
                 str(original_value) if original_value is not None else None,
-                restore_sql, campaign_id, now, RESTORE_COLUMN,
+                json.dumps(rollback_plan) if rollback_plan else restore_sql,
+                campaign_id, now, RESTORE_SP_JSON if rollback_plan else RESTORE_COLUMN,
             ),
         )
         self._conn.commit()
@@ -163,13 +164,7 @@ class RestoreJournal:
         self._conn.commit()
 
     def set_procedure_scripts(self, entry_id: int, scripts: list[str]) -> None:
-        """Make the procedure's own rollback script(s) the authoritative restore.
-
-        Used for procedure-managed bits (Bit 8, Bit 16): the restore point written
-        before the call is the generic column restore, but the real rollback is the
-        procedure's returned script, only known after the call. Stored as a JSON list
-        and flagged ``SP_SCRIPT`` so recovery runs each statement verbatim.
-        """
+        """Store a legacy script for inspection only; recovery will refuse to execute it."""
         statements = [str(s) for s in scripts if str(s).strip()]
         self._conn.execute(
             "UPDATE restore_journal SET restore_sql = ?, restore_kind = ? WHERE id = ?",
@@ -219,7 +214,7 @@ class RestoreJournal:
         and is offered by crash recovery. A remediation fix is meant to stay applied:
         once it is verified and logged it must drop out of crash recovery, or "Restore
         ALL" would silently undo it. The local row is kept until the normal 30-day
-        purge; the durable audit (before-state + rollback script) is ``APP_FIX_LOG``.
+        purge; the durable audit (before-state + JSON restore point) is ``APP_FIX_LOG``.
         """
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self._conn.execute(
@@ -234,12 +229,12 @@ class RestoreJournal:
         if environment:
             rows = self._conn.execute(
                 f"{_SELECT} WHERE status = 'PENDING' AND environment = ? "
-                "ORDER BY created_at DESC",
+                "ORDER BY created_at DESC, id DESC",
                 (environment,),
             ).fetchall()
         else:
             rows = self._conn.execute(
-                f"{_SELECT} WHERE status = 'PENDING' ORDER BY created_at DESC",
+                f"{_SELECT} WHERE status = 'PENDING' ORDER BY created_at DESC, id DESC",
             ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 

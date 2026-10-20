@@ -13,14 +13,13 @@ from .config import BIT8_FALSE_FLAGS, PROCEDURE, RETURN_CODE_COLUMN
 from .database import DatabaseConnection
 from .journal import get_journal
 from .rollback import (
-    METHOD_PROCEDURE_SCRIPT,
+    METHOD_PROCEDURE_JSON,
     RollbackOutcome,
+    capture_rollback_plan,
     flag_states_match,
     read_sp_flag_states,
     read_state,
-    restore_state,
-    restore_statement,
-    restore_via_scripts,
+    restore_via_payload,
 )
 from .trace import TraceSignature, trace_from_messages
 
@@ -69,9 +68,7 @@ class TestResult:
     trace_status: str = "NOT_CAPTURED"
     trace_reason: str | None = None
     return_code: int | None = None
-    # Compensating UPDATE(s) the procedure returned in its `rollback_script` result
-    # set. For sp_managed bits (e.g. Bit 8) these are the authoritative rollback,
-    # because the change is on a related table the generic verify column never sees.
+    # Legacy SP output is retained as evidence only, never executed.
     sp_rollback_scripts: list[str] = field(default_factory=list)
     # True when this test's bit is procedure-managed (see TestDefinition.sp_managed).
     sp_managed: bool = False
@@ -89,6 +86,10 @@ class TestResult:
     # Which part of the console produced the run (ORIGIN_* below). Remediation fixes
     # are kept on purpose and roll back only through the DCC Remediation tab.
     origin: str = "test"
+    rollback_plan: dict = field(default_factory=dict)
+    rollback_capture_error: str | None = None
+    server: str = ""
+    database_name: str = ""
 
     @property
     def trace_text(self) -> str:
@@ -110,43 +111,33 @@ class TestResult:
 
     @property
     def restore_point_known(self) -> bool:
-        return self.restore_point is not None
+        return bool(self.rollback_plan)
 
     @property
     def can_rollback(self) -> bool:
-        """Live run, a captured restore point, and a value that still differs."""
-        return self.is_live and self.restore_point_known and self.change_persisted
+        """A live change with structured original values that has not been restored."""
+        return self.rollback_available
 
     @property
     def has_sp_rollback(self) -> bool:
-        """Live run for which the procedure returned its own compensating script.
-
-        Used to offer rollback for procedure-managed Bits 8/16 where the generic
-        verify column never moves, so ``can_rollback`` would be False even though
-        a change was committed and can be undone.
-        """
-        return self.is_live and bool(self.sp_rollback_scripts)
+        """A live run with a structured SP JSON restore point."""
+        return self.is_live and bool(self.rollback_plan)
 
     @property
     def sp_rolled_back(self) -> bool:
-        """The procedure's own rollback script has already run successfully."""
+        """The SP has restored and verified this result's original values."""
         return any(
-            entry.get("ok") and entry.get("method") == METHOD_PROCEDURE_SCRIPT
+            entry.get("ok") and entry.get("method") == METHOD_PROCEDURE_JSON
             for entry in self.rollback_log
         )
 
     @property
     def rollback_available(self) -> bool:
-        """A committed change is still applied and there is a way to undo it.
-
-        Procedure-managed results roll back with the procedure's own script, so once
-        that has succeeded nothing is outstanding (running it again would rewrite the
-        prior value over anything changed since). Column restores update
-        ``change_persisted`` themselves, so ``can_rollback`` already turns False.
-        """
-        if self.has_sp_rollback:
-            return not self.sp_rolled_back
-        return self.can_rollback
+        """Never offer legacy SQL or replay a verified rollback."""
+        return (
+            self.has_sp_rollback and not self.sp_rolled_back
+            and (self.effective_change_persisted or bool(self.error))
+        )
 
     @property
     def sp_flag_rows(self) -> list[dict]:
@@ -159,7 +150,11 @@ class TestResult:
         ):
             for state in states:
                 name = state.get("handler_name")
-                row = by_handler.setdefault(name, {"handler_name": name})
+                handler_id = state.get("handler_id")
+                identity = str(handler_id) if handler_id is not None else name
+                row = by_handler.setdefault(identity, {"handler_name": name})
+                if handler_id is not None:
+                    row["handler_id"] = str(handler_id)
                 row[label] = state.get("flag_value")
         return list(by_handler.values())
 
@@ -174,7 +169,12 @@ class TestResult:
             return None
         if len(rows) == 1:
             return rows[0].get(field_key)
-        return "; ".join(f"{r.get('handler_name')}: {r.get(field_key)}" for r in rows)
+        return "; ".join(
+            f"{r.get('handler_name')}"
+            + (f" (handler_id={r['handler_id']})" if "handler_id" in r else "")
+            + f": {r.get(field_key)}"
+            for r in rows
+        )
 
     @property
     def sp_display_before(self) -> object:
@@ -201,10 +201,12 @@ class TestResult:
         bits (where the generic verify column never moves), else the verify column's own
         before/after comparison.
         """
+        if self.sp_rolled_back:
+            return False
         if self.sp_managed:
             if self.sp_change_detected is not None:
                 return self.sp_change_detected
-            return self.has_sp_rollback and not self.sp_rolled_back
+            return self.has_sp_rollback and not self.sp_rolled_back and self.status == "PASS"
         return self.change_persisted
 
     @property
@@ -245,8 +247,8 @@ class TestResult:
                 "so nothing was persisted. This proves the call ran, not that a config changed."
             ),
             "APPLIED": (
-                "Live call committed and the procedure's own output confirms the handler "
-                "flag was changed; roll back with the procedure's returned script."
+                "Live call committed and a fresh handler read confirms the value "
+                "changed; rollback restores the original values through the SP JSON interface."
                 if self.sp_managed
                 else "Live call committed and the verified column changed from its pre-test "
                 "value, confirming the configuration was actually applied."
@@ -340,6 +342,7 @@ def build_call(
     else:
         raise ValueError(f"Unsupported display_config bit: {bit}")
 
+    sql += ", @is_rollback = 0"
     sql = _wrap_with_return_code(sql)
     rendered = sql
     for value in params:
@@ -374,12 +377,7 @@ ROLLBACK_SCRIPT_COLUMN = "rollback_script"
 
 
 def _extract_rollback_scripts(grids: list[pd.DataFrame]) -> list[str]:
-    """Collect the procedure's own compensating UPDATE(s) from its result sets.
-
-    The procedure returns a ``rollback_script`` column (one row per affected
-    handler). These are authored by the procedure and target the correct table
-    and prior value, so they are the authoritative rollback for sp_managed bits.
-    """
+    """Retain returned SQL as evidence only; rollback never executes it."""
     scripts: list[str] = []
     for frame in grids:
         if ROLLBACK_SCRIPT_COLUMN in getattr(frame, "columns", []):
@@ -417,9 +415,7 @@ def run_test(
     before = read_state(connection, definition, target_identifier)
     started = datetime.now()
 
-    # Handler-level snapshot BEFORE the call (sp_managed bits only: Bit 8's flags,
-    # Bit 16's receipt template). Read via the procedure's own join; additive
-    # evidence, never blocks the test.
+    # Display evidence; the strict snapshot below separately enforces live rollback capture.
     sp_prior_states: list[dict] = []
     if definition.sp_managed:
         sp_flag_name = config_value if definition.sp_value_is_flag_name else None
@@ -433,10 +429,22 @@ def run_test(
     return_code: int | None = None
     rollback_log: list[dict] = []
     journal_id: int | None = None
+    rollback_plan: dict = {}
+    rollback_capture_error: str | None = None
+    try:
+        rollback_plan = capture_rollback_plan(
+            connection, definition, target_identifier, config_value
+        )
+        if not definition.sp_managed:
+            before = rollback_plan["originals"][0]["original"]
+    except Exception as exc:
+        rollback_capture_error = f"Could not capture an exact SP JSON restore point: {exc}"
+        if not simulation:
+            error = rollback_capture_error
 
     # Write restore point to journal BEFORE live execution on UAT/PROD.
     journal = get_journal()
-    if not simulation and journal.is_journaled(environment):
+    if not simulation and not error and journal.is_journaled(environment):
         journal_id = journal.record_restore_point(
             environment=environment,
             server=connection.server,
@@ -448,17 +456,21 @@ def run_test(
             target=target_identifier,
             config_value=config_value,
             original_value=before,
-            restore_sql=restore_statement(definition),
+            restore_sql="",
             campaign_id=campaign_id,
+            rollback_plan=rollback_plan,
         )
 
-    try:
-        output = connection.call_procedure(sql, params, rollback=simulation)
-        grids, messages = output.grids, output.messages
-        return_code = output.return_code
-    except Exception as exc:
-        error = str(exc)
-        connection.safe_rollback()
+    if not error:
+        try:
+            output = connection.call_procedure(sql, params, rollback=simulation)
+            grids, messages = output.grids, output.messages
+            return_code = output.return_code
+            if return_code not in (None, 0):
+                error = f"Procedure returned failure code {return_code}."
+        except Exception as exc:
+            error = str(exc)
+            connection.safe_rollback()
 
     # The procedure surfaces its trace via PRINT db.fnDisplayTrace(...); those
     # lines arrive on the message stream, which we already captured above.
@@ -481,53 +493,43 @@ def run_test(
     # internal trace is the evidence that the intended change was computed.
     proposed_change_observed = bool(grids) or bool(messages) or bool(trace.rows)
 
-    # Capture the procedure's own compensating UPDATE(s). For sp_managed bits the
-    # change is on a related table (e.g. handler.extra_config, handler.receipt_config)
-    # that the generic verify column never sees, so these scripts are the
-    # authoritative rollback.
     sp_rollback_scripts = _extract_rollback_scripts(grids)
 
-    # For sp_managed bits the generic before/after read is not the column the
-    # procedure edits, so trust the procedure's own signal: a returned rollback
-    # script on a committed live call means it changed something.
-    sp_applied = bool(
-        definition.sp_managed and not simulation and sp_rollback_scripts and not error
+    if rollback_plan and not rollback_capture_error:
+        try:
+            current = capture_rollback_plan(connection, definition, target_identifier, config_value)
+            if not definition.sp_managed:
+                after = current["originals"][0]["original"]
+                persisted = before != after
+        except Exception as exc:
+            error = error or f"Could not verify post-call original-value state: {exc}"
+    sp_changed = bool(
+        definition.sp_managed and sp_prior_states and sp_after_states
+        and not flag_states_match(sp_prior_states, sp_after_states)
     )
+    sp_applied = not simulation and sp_changed
 
-    # A failed live call must never leave a half-applied change behind.
-    if not simulation and error and persisted and before is not None:
-        auto: RollbackOutcome = restore_state(
-            connection, definition, target_identifier, before, trigger="automatic"
-        )
-        rollback_log.append(auto.as_dict())
-        after = read_state(connection, definition, target_identifier)
-        persisted = before != after
-
-    # `persisted` stays truthful about the verify column; classification also
-    # accepts the procedure-managed signal so the verdict is not a false REVIEW.
-    status = classify(simulation, error, persisted or sp_applied)
+    status = classify(simulation, error, persisted or sp_changed)
 
     if simulation:
         transaction = "ROLLED BACK (simulation)"
     elif any(entry["trigger"] == "automatic" and entry["ok"] for entry in rollback_log):
         transaction = "COMMITTED then AUTO-ROLLED BACK"
+    elif rollback_capture_error:
+        transaction = "NOT EXECUTED (no exact restore point)"
     else:
         transaction = "COMMITTED"
 
-    # For sp_managed live changes, replace the journal's generic (wrong) restore
-    # SQL with the procedure's own script so crash recovery restores the right row
-    # (flagged SP_SCRIPT, so recovery runs it verbatim without bound parameters).
-    if journal_id is not None and sp_applied and sp_rollback_scripts:
-        journal.set_procedure_scripts(journal_id, sp_rollback_scripts)
-
     # Update journal: mark resolved if auto-rolled back or genuinely no change.
     if journal_id is not None:
-        if not (persisted or sp_applied):
+        if not error and not (persisted or sp_applied) and (
+            not definition.sp_managed or (sp_prior_states and sp_after_states)
+        ):
             journal.mark_not_needed(journal_id)
         elif any(e.get("trigger") == "automatic" and e.get("ok") for e in rollback_log):
             journal.mark_resolved(journal_id)
 
-    return TestResult(
+    result = TestResult(
         id=f"{definition.bit}-{started.strftime('%H%M%S%f')}",
         test_key=definition.key,
         bit=definition.bit,
@@ -565,7 +567,14 @@ def run_test(
         sp_managed=definition.sp_managed,
         sp_prior_states=sp_prior_states,
         sp_after_states=sp_after_states,
+        rollback_plan=rollback_plan,
+        rollback_capture_error=rollback_capture_error,
+        server=connection.server,
+        database_name=connection.database,
     )
+    if not simulation and error and rollback_plan and (persisted or sp_changed):
+        apply_rollback(connection, definition, result, trigger="automatic")
+    return result
 
 
 def apply_rollback(
@@ -574,62 +583,50 @@ def apply_rollback(
     result: TestResult,
     trigger: str = "manual",
 ) -> RollbackOutcome:
-    """Restore the pre-test value and refresh the result in place.
-
-    Use the procedure's own returned rollback script whenever available; otherwise
-    use the catalogue-defined generic column restore.
-    """
-    if result.sp_rollback_scripts:
-        # The procedure also returns a rollback_script under @is_simulation=1 as a
-        # PREVIEW. That simulated change was never committed, so running the script
-        # would be an unrequested write. Refuse rather than touch the database.
-        if not result.is_live:
-            return RollbackOutcome(
-                ok=False,
-                rows=0,
-                sql="",
-                trigger=trigger,
-                error=(
-                    "Refusing to run the procedure's rollback script for a SIMULATION "
-                    "result — the simulated change was never committed, so there is "
-                    "nothing to restore."
-                ),
-            )
-        outcome = restore_via_scripts(connection, result.sp_rollback_scripts, trigger=trigger)
-        result.rollback_log.append(outcome.as_dict())
-        if outcome.ok:
-            result.transaction = (
-                f"COMMITTED then {trigger.upper()} ROLLED BACK (procedure script)"
-            )
-            if definition.sp_managed:
-                sp_flag_name = result.value if definition.sp_value_is_flag_name else None
-                result.sp_restored_states = read_sp_flag_states(
-                    connection, result.target, sp_flag_name, column=definition.sp_column
-                )
-                if result.sp_restored_states:
-                    result.sp_after_states = result.sp_restored_states
-                if result.sp_prior_states and result.sp_restored_states:
-                    result.sp_flag_verified = flag_states_match(
-                        result.sp_prior_states, result.sp_restored_states
-                    )
-                else:
-                    result.sp_flag_verified = None
-            else:
-                result.state_after = read_state(connection, definition, result.target)
-                result.change_persisted = result.state_after != result.restore_point
-            if result.journal_id is not None:
-                get_journal().mark_resolved(result.journal_id)
-        return outcome
-
-    outcome = restore_state(
-        connection, definition, result.target, result.restore_point, trigger=trigger
-    )
+    """Restore through the SP JSON interface shared by every console workflow."""
+    reason = None
+    if not result.is_live:
+        reason = "Refusing rollback for a SIMULATION result; nothing was committed."
+    elif result.sp_rolled_back:
+        reason = "This result has already been rolled back; refusing to replay it."
+    elif not result.rollback_plan:
+        reason = (
+            "No structured JSON restore point was captured. Legacy SQL rollback is disabled; "
+            "do not execute the returned UPDATE scripts."
+        )
+    elif (
+        (result.server and result.server.casefold() != connection.server.casefold())
+        or (result.database_name
+            and result.database_name.casefold() != connection.database.casefold())
+    ):
+        reason = "Connect to the original server/database before rolling back this result."
+    elif (
+        definition.key != result.test_key
+        or result.rollback_plan.get("test_key") != result.test_key
+        or result.rollback_plan.get("target") != result.target
+    ):
+        reason = "The rollback definition or target does not match this result."
+    if reason:
+        outcome = RollbackOutcome(
+            False, 0, "", trigger, reason, method=METHOD_PROCEDURE_JSON
+        )
+    else:
+        outcome = restore_via_payload(connection, result.rollback_plan, trigger)
     result.rollback_log.append(outcome.as_dict())
-
     if outcome.ok:
-        result.state_after = read_state(connection, definition, result.target)
-        result.change_persisted = result.state_after != result.restore_point
-        result.transaction = f"COMMITTED then {trigger.upper()} ROLLED BACK"
+        result.state_after = (
+            read_state(connection, definition, result.target)
+            if definition.sp_managed else result.rollback_plan["originals"][0]["original"]
+        )
+        result.change_persisted = False
+        result.transaction = f"COMMITTED then {trigger.upper()} ROLLED BACK (SP JSON)"
+        if definition.sp_managed:
+            flag = result.value if definition.sp_value_is_flag_name else None
+            result.sp_restored_states = read_sp_flag_states(
+                connection, result.target, flag, column=definition.sp_column
+            )
+            result.sp_after_states = result.sp_restored_states
+            result.sp_flag_verified = True
         if result.journal_id is not None:
             get_journal().mark_resolved(result.journal_id)
     return outcome
@@ -685,27 +682,33 @@ def run_rollback_evidence_test(
         1. Read state BEFORE
         2. Execute procedure in LIVE mode (commits)
         3. Read state AFTER APPLY
-        4. Immediately rollback (compensating UPDATE)
+        4. Immediately restore through the SP's JSON rollback operation
         5. Read state AFTER ROLLBACK
         6. Verify: before == after_rollback (full cycle proven)
     """
-    # Step 1: capture before
-    state_before = read_state(connection, definition, target_identifier)
-
     # Step 2: run live (commits)
     live_result = run_test(
         connection, definition, target_identifier, config_value,
         simulation=False, environment=environment, login=login,
     )
-    state_after_apply = live_result.state_after
-    change_detected = live_result.change_persisted
+    state_before = (
+        live_result.sp_display_before if definition.sp_managed else live_result.state_before
+    )
+    state_after_apply = (
+        live_result.sp_display_after if definition.sp_managed else live_result.state_after
+    )
+    change_detected = live_result.effective_change_persisted
 
     # Step 3: rollback if change was applied
     rollback_outcome: RollbackOutcome | None = None
     error: str | None = live_result.error
     if change_detected and live_result.can_rollback:
         rollback_outcome = apply_rollback(connection, definition, live_result, trigger="evidence")
-        state_after_rollback = read_state(connection, definition, target_identifier)
+        state_after_rollback = (
+            live_result.sp_display_after if definition.sp_managed else live_result.state_after
+        )
+        if not rollback_outcome.ok:
+            error = rollback_outcome.error
     elif not change_detected and not error:
         state_after_rollback = state_after_apply
         error = "Procedure did not change the verified column — rollback not needed."
@@ -715,13 +718,7 @@ def run_rollback_evidence_test(
     rollback_successful = (
         rollback_outcome is not None and rollback_outcome.ok
     ) if rollback_outcome else False
-    full_cycle = (
-        state_before is not None
-        and state_after_apply is not None
-        and state_after_rollback is not None
-        and str(state_before) == str(state_after_rollback)
-        and change_detected
-    )
+    full_cycle = rollback_successful and change_detected and not error
 
     return RollbackEvidenceResult(
         test_key=definition.key,

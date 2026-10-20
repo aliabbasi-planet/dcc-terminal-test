@@ -5,22 +5,17 @@ only restored when the live connection is the exact target it was recorded
 against (environment, server **and** database), it is still PENDING, and there is
 something trustworthy to restore:
 
-* ``COLUMN`` entries re-run the generic parameterised ``UPDATE`` with the captured
-  pre-change value, then read it back to confirm.
-* ``SP_SCRIPT`` entries run the procedure's own compensating statement(s) verbatim,
-  with no bound parameters (the script already carries its values).
+Only structured ``SP_JSON`` restore points may be executed. Legacy SQL entries
+remain pending for explicit operator review, never parsed or executed.
 """
 
 from __future__ import annotations
 
-import logging
+import json
 from dataclasses import dataclass
 
-from .catalog import TEST_CATALOG
-from .journal import RESTORE_SP_SCRIPT, RestoreJournal
-from .rollback import read_state, restore_via_scripts
-
-logger = logging.getLogger(__name__)
+from .journal import RESTORE_SP_JSON, RestoreJournal
+from .rollback import restore_via_payload
 
 
 @dataclass(frozen=True)
@@ -69,39 +64,28 @@ def recover_entry(
         status = current["status"] if current else "missing"
         return RecoveryOutcome(False, f"{label} is no longer pending ({status}); nothing to do.")
 
-    if current.get("restore_kind") == RESTORE_SP_SCRIPT:
-        scripts = journal.procedure_scripts(current)
-        outcome = restore_via_scripts(connection, scripts, trigger="recovery")
-        if not outcome.ok:
-            return RecoveryOutcome(False, f"Recovery failed for {label}: {outcome.error}")
-        journal.mark_resolved(current["id"])
-        return RecoveryOutcome(
-            True, f"Restored {label} with the procedure's own script ({outcome.rows} row(s))."
-        )
-
-    if current.get("original_value") is None:
-        # Writing NULL back would destroy the row's configuration rather than restore it.
+    if current.get("restore_kind") != RESTORE_SP_JSON:
         return RecoveryOutcome(
             False,
-            f"No pre-change value was captured for {label}, so an automatic restore would "
-            "write NULL. Restore it manually from a backup.",
+            f"Legacy restore point for {label}: no structured JSON original values were "
+            "captured. SQL/UPDATE execution is disabled; ask the DBA to review this entry "
+            "(including any NULL values).",
         )
     try:
-        connection.execute_write(
-            current["restore_sql"], (current["original_value"], current["target"])
-        )
-    except Exception as exc:
-        logger.error("Recovery failed for %s: %s", label, exc)
-        return RecoveryOutcome(False, f"Recovery failed for {label}: {exc}")
-
-    definition = TEST_CATALOG.get(current["test_key"])
-    if definition is not None:
-        restored = read_state(connection, definition, current["target"])
-        if str(restored) != str(current["original_value"]):
+        plan = json.loads(current["restore_sql"])
+        if not isinstance(plan, dict) or any(
+            plan.get(k) != current[v]
+            for k, v in (("target", "target"), ("test_key", "test_key"), ("bit", "bit"))
+        ):
             return RecoveryOutcome(
-                False,
-                f"Restore for {label} committed but the stored value still differs from the "
-                "captured one — investigate before retrying.",
+                False, f"Restore payload does not match journal entry for {label}."
             )
+    except (ValueError, TypeError) as exc:
+        return RecoveryOutcome(False, f"Invalid recovery JSON for {label}: {exc}")
+    outcome = restore_via_payload(connection, plan, trigger="recovery")
+    if not outcome.ok:
+        return RecoveryOutcome(False, f"Recovery failed for {label}: {outcome.error}")
     journal.mark_resolved(current["id"])
-    return RecoveryOutcome(True, f"Restored {label}.")
+    return RecoveryOutcome(
+        True, f"Restored and verified {label} through the SP ({outcome.rows} record(s))."
+    )

@@ -9,6 +9,7 @@ does in the console. The restore journal is isolated to a temp directory.
 from __future__ import annotations
 
 import importlib
+import json
 import re
 from datetime import date, datetime, timezone
 
@@ -317,17 +318,30 @@ class FakeSql:
         return None
 
     def query(self, sql: str, params=()):
+        if "configdownload_version" in sql:
+            return pd.DataFrame([{"configdownload_version": self.version}], dtype=object)
         return pd.DataFrame([])
 
-    def call_procedure(self, sql: str, params, rollback: bool) -> ProcedureOutput:
+    def call_procedure(self, sql: str, params, rollback: bool, validate=None) -> ProcedureOutput:
         self.calls.append((tuple(params), rollback))
+        before = self.version
         if not rollback and params[0] == 2:
-            self.version = {"Standard": "1", "ECB DCC": "2"}[params[2]]
-        return ProcedureOutput(grids=[], messages=[], return_code=0)
+            if "@is_rollback = 1" in sql:
+                value = json.loads(params[1])[0]["object_value"]
+                self.version = None if value == "NULL" else value
+            else:
+                self.version = {"Standard": "1", "ECB DCC": "2"}[params[2]]
+        output = ProcedureOutput(grids=[], messages=[], return_code=0)
+        try:
+            if validate:
+                validate(output)
+        except Exception:
+            self.version = before
+            raise
+        return output
 
     def execute_write(self, sql: str, params=()) -> int:
-        self.version = params[0]
-        return 1
+        raise AssertionError("Rollback must call the SP, never issue a direct UPDATE.")
 
     def safe_rollback(self) -> None:
         pass
@@ -706,6 +720,33 @@ def test_uat_operator_full_cycle_logs_a_verified_fix_and_keeps_it(journal):
     assert journal.pending_entries() == []  # a verified, logged fix leaves crash recovery
     assert any("verified" in s.value for s in at.success)
     assert at.session_state["results"][0].origin == "remediation"
+
+
+def test_remediation_rollback_uses_json_and_reopens_the_check(journal):
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    sql = FakeSql()
+    at = _render(snow, **_fixer_state("UAT", sql, armed=True))
+    at.button(key="rem_pre_T-9").click().run()
+    at.button(key="rem_dry_T-9").click().run()
+    _reviewed_checkbox(at).check().run()
+    at.button(key="rem_apply_T-9").click().run()
+    assert sql.version == "2"
+    assert not at.button(key="rem_rollback_T-9").disabled
+    at.button(key="rem_rollback_T-9").click().run()
+
+    assert _problems(at) == []
+    assert sql.version == "1"
+    assert [rollback for _, rollback in sql.calls] == [True, False, False]
+    assert json.loads(sql.calls[-1][0][1]) == [
+        {"terminal_identifier": "T-9", "object_value": "1"}
+    ]
+    reverted = [r for r in snow.fix_log_rows() if r["OUTCOME"] == "ROLLED_BACK"]
+    assert len(reverted) == 1 and reverted[0]["VERIFIED"]
+    assert json.loads(reverted[0]["ROLLBACK_SCRIPT"])["operation"] == "rollback"
+    assert any("DELETE FROM" in s and "DCC_FIX_REGISTRY" in s for s, _ in snow.writes)
+    result = at.session_state["results"][0]
+    assert result.sp_rolled_back and not result.rollback_available
+    assert journal.get_entry(result.journal_id)["status"] == "RESOLVED"
 
 
 def test_non_operator_cannot_apply_even_when_armed():

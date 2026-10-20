@@ -143,28 +143,27 @@ def test_kept_fix_leaves_crash_recovery(journal):
 # --- recovery guards ----------------------------------------------------------------
 
 
-def test_sp_script_entry_recovers_without_parameters(journal):
+def test_sp_script_entry_is_refused_without_executing_sql(journal):
     entry_id = _record(journal, test_key=BIT8, bit=8, target_type="instance")
     journal.set_procedure_scripts(entry_id, ["UPDATE h SET extra_config = '<x/>'"])
     sql = FakeSql()
 
     outcome = recover_entry(journal.get_entry(entry_id), sql, "UAT", journal)
 
-    assert outcome.ok, outcome.message
-    assert sql.batches == [["UPDATE h SET extra_config = '<x/>'"]]
-    assert sql.writes == []  # never bound (original_value, target) onto the script
-    assert journal.get_entry(entry_id)["status"] == "RESOLVED"
+    assert not outcome.ok
+    assert sql.batches == [] and sql.writes == []
+    assert journal.get_entry(entry_id)["status"] == "PENDING"
 
 
-def test_column_entry_recovers_with_bound_value_and_verifies(journal):
+def test_legacy_column_entry_is_refused_without_direct_update(journal):
     entry_id = _record(journal)
     sql = FakeSql(state="1")
 
     outcome = recover_entry(journal.get_entry(entry_id), sql, "UAT", journal)
 
-    assert outcome.ok, outcome.message
-    assert sql.writes == [(restore_statement(TEST_CATALOG[BIT2]), ("1", "T1"))]
-    assert journal.get_entry(entry_id)["status"] == "RESOLVED"
+    assert not outcome.ok
+    assert sql.writes == []
+    assert journal.get_entry(entry_id)["status"] == "PENDING"
 
 
 def test_column_restore_that_does_not_land_stays_pending(journal):
@@ -247,9 +246,9 @@ def _live_sp_result(**overrides) -> TestResult:
     return TestResult(**fields)
 
 
-def test_successful_sp_rollback_is_no_longer_offered():
+def test_legacy_script_is_not_offered_as_executable_rollback():
     result = _live_sp_result()
-    assert result.rollback_available is True
+    assert result.rollback_available is False
 
     class Conn(FakeSql):
         def query(self, sql, params=()):
@@ -259,9 +258,8 @@ def test_successful_sp_rollback_is_no_longer_offered():
 
     outcome = apply_rollback(Conn(), TEST_CATALOG[BIT8], result, trigger="manual")
 
-    assert outcome.ok
-    assert result.rollback_log[-1]["method"] == METHOD_PROCEDURE_SCRIPT
-    assert result.sp_rolled_back is True
+    assert not outcome.ok
+    assert result.sp_rolled_back is False
     assert result.rollback_available is False
     assert result.effective_change_persisted is False
 
@@ -271,13 +269,13 @@ def test_failed_sp_rollback_is_still_offered():
     result.rollback_log.append(
         {"ok": False, "method": METHOD_PROCEDURE_SCRIPT, "trigger": "manual", "rows": 0}
     )
-    assert result.rollback_available is True
+    assert result.rollback_available is False
 
 
 def test_automatic_column_restore_does_not_hide_the_sp_rollback():
     result = _live_sp_result()
     result.rollback_log.append({"ok": True, "method": METHOD_COLUMN, "trigger": "automatic"})
-    assert result.rollback_available is True
+    assert result.rollback_available is False
 
 
 # --- a failed live procedure call is never committed ----------------------------------

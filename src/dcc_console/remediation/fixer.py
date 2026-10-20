@@ -653,7 +653,7 @@ def rollback_outcome(ok: bool, error: str | None, reverted: bool | None = None) 
     """Outcome of a rollback. ``reverted`` is a fresh read confirming the undo.
 
     VERIFIED means "confirmed reverted by a fresh SQL-Server read", not merely that the
-    compensating script ran. A rollback whose reversion cannot be confirmed is still
+    SP call completed. A rollback whose reversion cannot be confirmed is still
     ROLLED_BACK but unverified, and carries a warning (the registry row is kept until a
     read confirms the check is open again).
     """
@@ -729,7 +729,7 @@ def log_records(
     if result is not None:
         before = _states_text(result.sp_prior_states, result.state_before)
         after = _states_text(result.sp_after_states, result.state_after)
-        rollback = _clip("\n".join(result.sp_rollback_scripts), _STATE_MAX) or None
+        rollback = json.dumps(result.rollback_plan) if result.rollback_plan else None
     else:
         before, after, rollback = None, None, None
     if pre is not None:
@@ -788,12 +788,12 @@ def registry_records(
 ) -> list[dict]:
     """One ``DCC_FIX_REGISTRY`` upsert record per worklist terminal the call covers.
 
-    Stores the procedure's own compensating script (when the bit is SP-managed) so a
-    verified PROD fix can still be rolled back later, even from a fresh session.
+    The historical SP_ROLLBACK_SCRIPT column now holds a versioned JSON envelope,
+    never executable SQL. Do not truncate recovery data.
     """
     rollback_script = None
-    if result is not None and getattr(result, "sp_rollback_scripts", None):
-        rollback_script = _clip("\n".join(result.sp_rollback_scripts), _STATE_MAX)
+    if result is not None and result.rollback_plan:
+        rollback_script = json.dumps(result.rollback_plan)
     change = (change_ref or "").strip() or None
     records = []
     for row in covered_rows:

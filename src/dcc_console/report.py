@@ -22,7 +22,12 @@ from .catalog import TEST_CATALOG
 from .config import configdownload_version_text
 from .coverage import compute_coverage, coverage_totals
 from .execution import TestResult
-from .rollback import read_statement, restore_statement
+from .rollback import (
+    HANDLER_TYPE_FILTER,
+    build_rollback_call,
+    handler_read_statement,
+    read_statement,
+)
 
 _MAX_GRID_ROWS = 25
 _MAX_CELL = 200
@@ -366,60 +371,48 @@ def _db_code_block(result: TestResult) -> list[str]:
         "```",
     ]
 
-    sp_scripts = getattr(result, "sp_rollback_scripts", []) or []
-    sp_managed = getattr(result, "sp_managed", False)
-
     if definition is not None:
         verify = definition.verify
-        read_sql = read_statement(definition)
-        restore_sql = restore_statement(definition)
+        read_sql = (
+            handler_read_statement(definition.sp_column)
+            if definition.sp_managed else read_statement(definition)
+        )
+        verified_column = (
+            f"[cccintegrang].[handler].{definition.sp_column}"
+            if definition.sp_managed else f"{verify.table}.{verify.column}"
+        )
         lines += [
             "",
             "_2 · Verification read (before and after the call, bound key = "
             f"`{_cell(result.target)}`)_",
             "",
             "```sql",
-            f"-- verified column: {verify.table}.{verify.column}",
+            f"-- verified column: {verified_column}",
             read_sql,
             "```",
         ]
-        if sp_scripts:
-            explanation = (
-                "This is a procedure-managed bit: the change is written to a related table "
-                f"(not `{verify.table}`), so the generic column-restore below does **not** "
-                "revert it."
-                if sp_managed
-                else
-                "The procedure returned the compensating SQL used for rollback, avoiding "
-                "a direct UPDATE permission requirement on the verified table."
-            )
+        if definition.sp_managed:
+            lines += ["", f"Bound handler types: {', '.join(HANDLER_TYPE_FILTER)}."]
+        if result.rollback_plan:
+            restore_sql, _, payload = build_rollback_call(result.rollback_plan)
             lines += [
                 "",
-                "_3 · Compensating rollback — the procedure's OWN returned script "
-                "(authoritative)_",
-                "",
-                explanation,
-                "Rollback runs the `rollback_script` the procedure returned:",
+                "_3 · SP JSON rollback (no client UPDATE)_",
                 "",
                 "```sql",
-            ]
-            lines += (sp_scripts or ["-- (no rollback_script captured for this call)"])
-            lines += [
+                restore_sql,
                 "```",
                 "",
-                "_For reference only, the generic column-restore (NOT used for this bit): "
-                f"`{restore_sql}`_",
+                "Original values, bound as JSON (SQL NULL/missing nodes use the SP NULL sentinel):",
+                "```json",
+                payload,
+                "```",
+                "Return code and exact restored values are verified before commit.",
             ]
         else:
             lines += [
                 "",
-                "_3 · Compensating rollback statement (restores the captured pre-test value)_",
-                "",
-                "```sql",
-                f"-- bound params: (?1 = pre-test value = "
-                f"{_cell(_clip(result.state_before, 120))}, ?2 = {_cell(result.target)})",
-                restore_sql,
-                "```",
+                "_3 · No structured JSON restore point captured; SQL rollback is disabled._",
             ]
     else:
         lines += [
@@ -441,6 +434,8 @@ def _db_code_block(result: TestResult) -> list[str]:
                 str(entry.get("sql", "(not recorded)")),
                 "```",
             ]
+            if entry.get("payload"):
+                lines += ["", "```json", entry["payload"], "```"]
 
     return lines
 
@@ -492,8 +487,8 @@ def _evidence_block(index: int, result: TestResult) -> list[str]:
         lines += [
             "> **Procedure-managed bit.** Before/After above are read from "
             f"`[cccintegrang].[handler].{sp_column}` — the table the procedure actually "
-            "edits — not the instance column used for other bits. Rollback uses the "
-            "procedure's own returned `rollback_script` (see below).",
+            "edits — not the instance column used for other bits. Rollback sends the "
+            "original values per handler_id with `@is_rollback = 1`.",
             "",
         ]
     lines += _return_code_note(result)

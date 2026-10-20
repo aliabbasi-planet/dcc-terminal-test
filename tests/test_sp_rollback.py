@@ -1,4 +1,4 @@
-"""Bit 8 procedure-managed rollback: capture and run the SP's own rollback_script."""
+"""Legacy SQL is evidence only and must never be executed by rollback."""
 
 from __future__ import annotations
 
@@ -131,9 +131,9 @@ def test_extract_returns_empty_when_no_column():
 
 def test_has_sp_rollback_and_rollback_available():
     r = make_result()
-    assert r.has_sp_rollback is True
-    assert r.can_rollback is False  # generic column never moved
-    assert r.rollback_available is True
+    assert r.has_sp_rollback is False
+    assert r.can_rollback is False
+    assert r.rollback_available is False
 
 
 @pytest.mark.parametrize(
@@ -143,7 +143,7 @@ def test_has_sp_rollback_and_rollback_available():
         (BIT2, 2, "terminal", "T1"),
     ],
 )
-def test_non_managed_bit_uses_procedure_script_and_refreshes_state(
+def test_non_managed_bit_refuses_legacy_procedure_scripts(
     monkeypatch, test_key, bit, target_type, target
 ):
     from dcc_console import execution
@@ -165,10 +165,10 @@ def test_non_managed_bit_uses_procedure_script_and_refreshes_state(
 
     outcome = execution.apply_rollback(conn, TEST_CATALOG[test_key], result)
 
-    assert outcome.ok is True
-    assert conn.batches == [result.sp_rollback_scripts]
-    assert result.state_after == "1"
-    assert result.change_persisted is False
+    assert outcome.ok is False
+    assert conn.batches == []
+    assert result.state_after == "2"
+    assert result.change_persisted is True
 
 
 def test_simulation_has_no_sp_rollback():
@@ -182,12 +182,12 @@ def test_no_scripts_means_no_sp_rollback():
 # --- restore_via_scripts ---------------------------------------------------
 
 
-def test_restore_via_scripts_runs_batch_and_succeeds():
+def test_restore_via_scripts_never_runs_sql():
     conn = FakeConn(rows=1)
     outcome = restore_via_scripts(conn, ["UPDATE a", "UPDATE b"], trigger="manual")
-    assert outcome.ok is True
-    assert outcome.rows == 1
-    assert conn.batches == [["UPDATE a", "UPDATE b"]]
+    assert outcome.ok is False
+    assert outcome.rows == 0
+    assert conn.batches == []
 
 
 def test_restore_via_scripts_zero_rows_is_not_ok():
@@ -198,27 +198,25 @@ def test_restore_via_scripts_zero_rows_is_not_ok():
 def test_restore_via_scripts_captures_error():
     outcome = restore_via_scripts(FakeConn(fail=True), ["UPDATE a"], trigger="manual")
     assert outcome.ok is False
-    assert "boom" in outcome.error
+    assert "Legacy SQL rollback is disabled" in outcome.error
 
 
 def test_restore_via_scripts_empty_list():
     outcome = restore_via_scripts(FakeConn(), [], trigger="manual")
     assert outcome.ok is False
-    assert "No procedure rollback script" in outcome.error
+    assert "structured JSON restore point" in outcome.error
 
 
 # --- apply_rollback prefers the SP script ----------------------------------
 
 
-def test_apply_rollback_prefers_sp_script():
+def test_apply_rollback_refuses_legacy_sp_script():
     result = make_result(journal_id=None)
     conn = FakeConn(rows=1)
     outcome = apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
-    assert outcome.ok is True
-    # It ran the SP script, not a generic column-restore.
-    assert conn.batches == [result.sp_rollback_scripts]
-    assert "procedure script" in result.transaction
-    assert result.rollback_log[-1]["ok"] is True
+    assert outcome.ok is False
+    assert conn.batches == []
+    assert result.rollback_log[-1]["ok"] is False
 
 
 # --- handler-level flag verification ---------------------------------------
@@ -278,15 +276,16 @@ def _restored_df(flag: str, value: str):
     ])
 
 
-def test_apply_rollback_verifies_flag_restored():
+def test_legacy_flag_snapshot_does_not_authorize_sql_execution():
     conn = FakeConn(rows=1, query_result=_restored_df("dccEnableCompletion", "false"))
     result = make_result(
         journal_id=None, value="dccEnableCompletion",
         sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
     )
     apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
-    assert result.sp_flag_verified is True
-    assert result.sp_restored_states == [{"handler_name": "h1", "flag_value": "false"}]
+    assert result.sp_flag_verified is None
+    assert result.sp_restored_states == []
+    assert conn.batches == []
 
 
 def test_apply_rollback_flags_unverified_mismatch():
@@ -296,7 +295,8 @@ def test_apply_rollback_flags_unverified_mismatch():
         sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
     )
     apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
-    assert result.sp_flag_verified is False
+    assert result.sp_flag_verified is None
+    assert conn.batches == []
 
 
 def test_apply_rollback_refuses_to_run_sp_script_for_simulation():
@@ -309,12 +309,12 @@ def test_apply_rollback_refuses_to_run_sp_script_for_simulation():
     assert conn.batches == []  # nothing was executed against the database
 
 
-def test_apply_rollback_verification_unavailable_leaves_none_but_rollback_ok():
+def test_apply_rollback_legacy_verification_unavailable_never_claims_success():
     conn = FakeConn(rows=1, query_fail=True)
     result = make_result(
         journal_id=None, value="dccEnableCompletion",
         sp_prior_states=[{"handler_name": "h1", "flag_value": "false"}],
     )
     outcome = apply_rollback(conn, TEST_CATALOG[BIT8], result, trigger="manual")
-    assert outcome.ok is True  # rollback itself still committed (rows affected)
+    assert outcome.ok is False
     assert result.sp_flag_verified is None

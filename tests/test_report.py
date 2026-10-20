@@ -101,10 +101,11 @@ def test_section_a_shows_execution_evidence():
 
 def test_section_a_shows_verification_and_rollback_sql():
     text = _report([mk()])
-    # The catalogue-derived read + compensating UPDATE must appear as real SQL.
     assert "Verification read" in text
-    assert "Compensating rollback statement" in text
-    assert "UPDATE" in text and "SELECT TOP (1)" in text
+    assert "No structured JSON restore point" in text
+    assert "SELECT h.handler_id, h.handler_name" in text
+    assert "FROM [cccintegrang].[handler] h" in text
+    assert "Bound handler types:" in text
 
 
 def test_section_a_shows_database_message_stream():
@@ -113,7 +114,7 @@ def test_section_a_shows_database_message_stream():
     assert "Trace: proposing dccEnable=true" in text
 
 
-def test_sp_managed_report_shows_procedure_rollback_script_as_authoritative():
+def test_sp_managed_report_does_not_present_legacy_sql_as_executable():
     result = mk(
         mode="LIVE",
         status="PASS",
@@ -124,10 +125,8 @@ def test_sp_managed_report_shows_procedure_rollback_script_as_authoritative():
         ],
     )
     text = _report([result])
-    # The procedure's own script is presented as the authoritative rollback...
-    assert "the procedure's OWN returned script" in text
-    assert "UPDATE [cccintegrang].[handler]" in text
-    # ...and the real related-table source is explained.
+    assert "SQL rollback is disabled" in text
+    assert "UPDATE [cccintegrang].[handler]" not in text
     assert "Procedure-managed bit" in text
     assert "[cccintegrang].[handler].extra_config" in text
 

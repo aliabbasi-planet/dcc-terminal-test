@@ -124,9 +124,9 @@ class TestVerdictVocabulary:
             sp_rollback_scripts=["UPDATE handler"],
         )
         assert r.trace_text == "first second"
-        assert r.restore_point_known is True
-        assert r.can_rollback is True
-        assert r.rollback_available is True
+        assert r.restore_point_known is False
+        assert r.can_rollback is False
+        assert r.rollback_available is False
 
     @pytest.mark.parametrize("status", ["FAIL", "REVIEW"])
     def test_live_non_applied_verdicts(self, status):

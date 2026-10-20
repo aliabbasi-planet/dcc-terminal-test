@@ -3,11 +3,11 @@
 Each entry maps a `@display_config` bit of the stored procedure to:
   * the target entity and the procedure arguments it drives,
     * the business meaning displayed to the tester,
-  * the single column the harness reads before/after to prove the outcome,
-  * the cast used when restoring that column during a rollback.
+  * the target/handler columns read before and after to verify the outcome,
+  * the supported fields restored through the procedure's JSON interface.
 
 Table, column, key and cast are declared here and never built from user input,
-so the generated verification and restore statements cannot be injected into.
+so verification queries cannot be redirected through user input.
 """
 
 from __future__ import annotations
@@ -50,11 +50,8 @@ class TestDefinition:
     # A concise note surfaced in the CAB report when the mapping to the procedure
     # is inferred rather than confirmed by the procedure owner.
     assumption: str | None = None
-    # When True, the procedure changes a *related* table (not the `verify` row) and
-    # emits its own compensating `rollback_script`. For these bits the generic
-    # column read is context only; the change and its rollback are judged from the
-    # procedure's own output. See Bit 8 (handler.extra_config) and Bit 16
-    # (handler.receipt_config).
+    # Related-table bits use per-handler original values, not the context-only
+    # `verify` column. Their rollback JSON is keyed by handler_id.
     sp_managed: bool = False
     # For sp_managed bits, the column on [cccintegrang].[handler] the procedure
     # actually edits. Declared here (never built from user input) so the
@@ -247,9 +244,9 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             mechanism=(
                 "The procedure resolves the instance's DCC handler row(s) and edits the named "
                 "boolean inside `[cccintegrang].[handler].extra_config`, writing the document "
-                "back. It also emits a `rollback_script` result set — its own compensating "
-                "`UPDATE` for the exact handler row(s) and prior value — which this tool "
-                "captures and uses to roll back (the change is NOT on the instance row)."
+                "back. The console captures original values per handler_id before applying "
+                "and restores them through the same procedure with @is_rollback = 1. "
+                "Returned UPDATE scripts are evidence only and are never executed."
             ),
             value_label="Handler flag",
             value_options=(
@@ -269,8 +266,7 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             ),
             # NOTE: the flag lives in [cccintegrang].[handler].extra_config, not on the
             # instance row. The instance.package_config read below is retained only as
-            # displayed context; because sp_managed=True, the change and its rollback are
-            # judged from the procedure's own rollback_script, not this column.
+            # displayed context; per-handler values are used for rollback and verification.
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
@@ -303,10 +299,9 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             mechanism=(
                 "The procedure resolves the instance's DCC handler row(s) and rewrites the "
                 "`[cccintegrang].[handler].receipt_config` XML document with the named "
-                "template (or clears it, for Remove). It also emits a `rollback_script` "
-                "result set — its own compensating `UPDATE` for the exact handler row(s) and "
-                "prior value — which this tool captures and uses to roll back (the change is "
-                "NOT on the instance row)."
+                "template (or clears it, for Remove). Rollback calls the same procedure "
+                "with @is_rollback = 1 and each handler_id's own original template, "
+                "including missing elements. No returned UPDATE script is executed."
             ),
             value_label="Template name",
             value_options=None,
@@ -318,8 +313,7 @@ TEST_CATALOG: dict[str, TestDefinition] = {
             ),
             # NOTE: the template lives in [cccintegrang].[handler].receipt_config, not on
             # the instance row. The instance.package_config read below is retained only as
-            # displayed context; because sp_managed=True, the change and its rollback are
-            # judged from the procedure's own rollback_script, not this column.
+            # displayed context; per-handler values are used for rollback and verification.
             verify=VerifiedColumn(
                 "[cccintegrang].[instance]",
                 "package_config",
