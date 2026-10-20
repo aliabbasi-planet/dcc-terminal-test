@@ -979,8 +979,8 @@ def _render_batch(conn: SnowflakeConnection, objs: RemediationObjects, armed_liv
             key="rem_batch_upload_file",
             help=(
                 "The first column contains the check to fix; remaining columns must use supported "
-                "metadata headers such as instance_identifier, location_no, location_desc, country, "
-                "bank_merchant_id, acquirer_name and TerminalID. "
+                "metadata headers such as instance_identifier, location_no, location_desc, "
+                "country, bank_merchant_id, acquirer_name and TerminalID. "
                 "When a file is supplied, only validated file targets are loaded; filter results "
                 "are not added. Rows must match current actionable broken data."
             ),
