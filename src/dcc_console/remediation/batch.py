@@ -1,10 +1,9 @@
-"""Pure batch planner: turn a set of selected worklist rows into the fixes to run.
+"""Pure batch planner: group broken checks into calls by physical target scope.
 
-The operator filters the worklist (e.g. region + one check) and selects terminals;
-batch then fixes **every** fixable broken check those terminals have — not only the
-check that was filtered on. Because a worklist row is ``SELECT *`` over
-``V_CURRENT_BROKEN`` it already carries every check column, so :func:`fixer.plan_for_row`
-enumerates all of a terminal's fixable checks for free.
+The operator filters the worklist (e.g. region + one check) and selects target/check
+groups; batch then plans calls at the procedure's true scope: terminal (Bit 2), location
+(Bit 1), or instance (Bit 8). Shared-target coverage is expanded by the panel before
+execution so every matching broken terminal is logged and registered.
 
 This module is pure (no Streamlit, no DB): it groups the per-terminal steps into the
 minimum set of procedure calls, so one instance/location call is not issued twice when
@@ -12,7 +11,7 @@ several selected terminals share it. :mod:`.batch_panel` executes the plan by dr
 the same :mod:`.fixer` primitives the one-by-one panel uses.
 
 Decision (2026-10-02): the Bit 16 receipt-template fix is **not** auto-run in batch — its
-template is chosen per terminal and must be confirmed by the operator, so those checks
+template is chosen per instance and must be confirmed by the operator, so those checks
 are surfaced as ``templates`` (do them on the Single-fix page) rather than applied blind.
 """
 
@@ -27,22 +26,23 @@ from . import fixer
 class BatchItem:
     """One procedure call (one check on one target) that batch will run.
 
-    ``covered_rows`` are the selected terminals this one call repairs — several when they
-    share an instance (Bit 8/16) or a location (Bit 1); exactly one for a terminal-scoped
-    Bit 2. The call physically changes the whole target, so the panel may surface other
-    listed-but-unselected terminals on it; the registry/log still records one row each.
+    ``covered_rows`` initially holds the planned rows. Before execution, the Batch panel
+    expands shared instance/location targets to all matching broken terminals, so the
+    audit log and registry reflect the procedure's physical scope rather than only the
+    rows used to select the fix group.
     """
 
     step: fixer.FixStep
     covered_rows: tuple[dict, ...]
 
     @property
-    def key(self) -> tuple[str, str, str, str | None]:
+    def key(self) -> tuple:
         return (
             self.step.check_column,
             self.step.target_kind,
             self.step.target_identifier,
             self.step.config_value,
+            self.step.definition.bit8_config_value,
         )
 
     @property
@@ -52,7 +52,7 @@ class BatchItem:
 
 @dataclass(frozen=True)
 class TemplateItem:
-    """A Bit 16 receipt-template check that needs a manual, per-terminal template choice."""
+    """A Bit 16 instance-level check needing a manual, operator-confirmed template choice."""
 
     check_column: str
     flag_name: str
@@ -101,7 +101,7 @@ def _sort_rows(rows: list[dict]) -> tuple[dict, ...]:
 
 
 def plan_batch(rows: list[dict]) -> BatchPlan:
-    """Group every fixable broken check on the selected ``rows`` into batch calls.
+    """Group every fixable broken check on ``rows`` into calls by target and check.
 
     * deterministic fixes (Bit 1/2/8) are de-duplicated by
       ``(check, target_kind, target_identifier, value)`` so a shared instance/location is
@@ -135,7 +135,10 @@ def plan_batch(rows: list[dict]) -> BatchPlan:
                 template_rows.setdefault(tkey, []).append(row)
                 template_flag[tkey] = step.flag
                 continue
-            key = (step.check_column, step.target_kind, step.target_identifier, step.config_value)
+            key = (
+                step.check_column, step.target_kind, step.target_identifier,
+                step.config_value, step.definition.bit8_config_value,
+            )
             item_rows.setdefault(key, []).append(row)
             item_step.setdefault(key, step)
             fixes_per_terminal[tid] += 1

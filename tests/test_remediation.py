@@ -35,8 +35,8 @@ SHARED = RemediationObjects("DEV_CORE_XYZ", "MY_SCHEMA", "DEV_CORE_AAB", "DCC_RE
 # --------------------------------------------------------------------------- #
 
 
-def test_default_objects_is_dev_core_aab():
-    assert DEFAULT_OBJECTS.database == "DEV_CORE_AAB"
+def test_default_objects_is_ai_workspace():
+    assert DEFAULT_OBJECTS.database == "AI_WORKSPACE"
     assert DEFAULT_OBJECTS.schema == "DCC_REMEDIATION"
 
 
@@ -153,6 +153,13 @@ def test_refresh_merge_mentions_every_tracked_check():
     for col in mapping.TRACKED_CHECK_COLUMNS:
         assert col in sql
     assert "CONFIGDOWNLOAD_VERSION_CHECK_BASE" in sql
+    assert "MAX(DCCPROVIDER_CODE) AS DCCPROVIDER_CODE" in sql
+    for column in (
+        "PRINTOUT_TYPE_RECEIPT",
+        "PRINTOUT_TYPE_TEMPLATE_DCC",
+        "PRINTOUT_TYPE_DISPLAY",
+    ):
+        assert f"MAX({column}) AS {column}" in sql
 
 
 def test_refresh_merge_is_terminal_grain_upsert():
@@ -208,6 +215,23 @@ def test_worklist_dimension_in_clause_binds_values():
     sql, params = wl.build_worklist_query(filters, OBJS)
     assert "COUNTRY_NAME IN (%s, %s)" in sql
     assert params == ["Germany", "France"]
+
+
+def test_worklist_exact_identifier_filters_are_bound_and_trimmed():
+    filters = wl.WorklistFilters(
+        remediation_state=None,
+        identifiers={"LOCATION_NO": " L1 ", "INSTANCE_IDENTIFIER": " I1 "},
+    )
+    sql, params = wl.build_worklist_query(filters, OBJS)
+    assert "INSTANCE_IDENTIFIER = %s" in sql
+    assert "LOCATION_NO = %s" in sql
+    assert params == ["I1", "L1"]
+
+
+def test_worklist_identifier_filter_rejects_unknown_column():
+    filters = wl.WorklistFilters(identifiers={"DROP_TABLE": "x"})
+    with pytest.raises(ValueError, match="Unknown identifier column"):
+        wl.build_worklist_query(filters, OBJS)
 
 
 def test_worklist_check_filter_orders_and_binds_nothing():
@@ -443,15 +467,66 @@ def test_view_reads_the_fix_registry_for_prod_resolutions():
     assert ddl.VIEW_MARKER_COLUMN in view
 
 
+def test_batch_history_query_uses_bound_covered_terminal_ids():
+    sql, params = fixlog.build_batch_history_query(OBJS, ("T-A", "T-B", "T-A"))
+    assert OBJS.fix_log_table in sql
+    assert "TERMINAL_IDENTIFIER IN (%s, %s)" in sql
+    assert "CHANGE_REF" in sql
+    assert "ORDER BY APPLIED_AT DESC, FIX_ID DESC" in sql
+    assert "LIMIT" not in sql
+    assert params == ["T-A", "T-B"]
+    assert "T-A" not in sql and "T-B" not in sql
+    with pytest.raises(ValueError, match="covered terminal"):
+        fixlog.build_batch_history_query(OBJS, ())
+
+
 def test_kpis_separate_prod_fixes_from_rehearsals():
     kpis = next(s for s in ddl.build_create_statements(OBJS) if "V_REMEDIATION_KPIS AS" in s)
     assert "AS TOTAL_LIVE_FIXES" in kpis and "AS REHEARSAL_FIXES" in kpis
-    assert "NOT ENVIRONMENT = 'PROD'" in kpis
+    assert "AS FIXABLE_TERMINALS" in kpis
+    assert "AS ALREADY_OK_PROD" in kpis and "AS PROD_SIMULATIONS" in kpis
+    assert "AS LIVE_APPLIED_UAT_DEV" in kpis
+    assert "OUTCOME = 'SKIPPED_ALREADY_OK'" in kpis
+    assert "MODE = 'SIMULATION' AND ENVIRONMENT IN ('UAT', 'DEV')" in kpis
+
+
+def test_fix_activity_separates_prod_outcomes_from_uat_dev_dry_runs():
+    query = an.build_fix_activity_query(OBJS)
+    assert "AS LIVE_APPLIED_PROD" in query
+    assert "AS ALREADY_OK_PROD" in query
+    assert "AS DRY_RUN_PROD" in query
+    assert "AS DRY_RUN_UAT" in query
+    assert "AS DRY_RUN_DEV" in query
+    assert "AS LIVE_APPLIED_UAT_DEV" in query
+    assert "SELECT DISTINCT CAST(APPLIED_AT AS DATE)" in query
+    assert "CORRELATION_ID, APPLIED_AT, MODE, ENVIRONMENT, OUTCOME" in query
+
+
+def test_fix_coverage_counts_unique_targets_and_terminals_by_registry_status():
+    query = an.build_fix_coverage_query(OBJS)
+    assert OBJS.registry_table in query
+    assert "COUNT(DISTINCT TARGET_IDENTIFIER) AS REGISTERED_TARGETS" in query
+    assert "COUNT(DISTINCT IFF(STATUS = 'CONFIRMED'" in query
+    assert "COUNT(DISTINCT TERMINAL_IDENTIFIER) AS TERMINALS_COVERED" in query
+    assert "ENVIRONMENT = 'PROD' AND STATUS IN ('FIXED', 'CONFIRMED')" in query
+
+
+def test_bit_fix_coverage_separates_calls_registry_checks_and_terminals():
+    query = an.build_bit_fix_coverage_query(OBJS)
+    assert "FROM VALUES (1), (2), (8), (16)" in query
+    assert "AS LIVE_APPLIED_CALLS" in query
+    assert "AS ALREADY_OK_CALLS" in query
+    assert "AS DRY_RUN_ATTEMPTS" in query
+    assert "AS REGISTERED_CHECKS" in query
+    assert "AS PENDING_CONFIRMATION_CHECKS" in query
+    assert "AS CONFIRMED_CHECKS" in query
+    assert "AS TERMINALS_COVERED" in query
 
 
 def test_snapshot_stores_source_load_time_in_utc():
     merge = snapshot.build_refresh_merge(OBJS)
     assert "CONVERT_TIMEZONE('UTC', LAST_ALTERED)::TIMESTAMP_NTZ" in merge
+    assert "MAX(LOCATION_DESC) AS LOCATION_DESC" in merge
 
 
 def test_ddl_seed_has_all_flags_from_mapping():
@@ -476,6 +551,16 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
     assert "TABLE_NAME = 'DCC_FIX_REGISTRY'" in sql and "'CONFIRMED_AT_UTC'" in sql
     assert "TABLE_NAME = 'FIX_OPERATORS'" in sql and "'CAN_PROD'" in sql
     assert f"COLUMN_NAME = '{ddl.VIEW_MARKER_COLUMN}'" in sql
+    expected_snapshot_columns = ", ".join(
+        f"'{name}'" for name, _ in ddl.SNAPSHOT_ADDED_COLUMNS
+    )
+    assert f"COLUMN_NAME IN ({expected_snapshot_columns})" in sql
+    create_statements = ddl.build_create_statements(OBJS)
+    for name, _ in ddl.SNAPSHOT_ADDED_COLUMNS:
+        assert any(
+            f"ADD COLUMN IF NOT EXISTS {name}" in statement
+            for statement in create_statements
+        )
 
 
 @pytest.mark.parametrize(
@@ -488,6 +573,7 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 3,
                 "OPERATOR_COLUMNS": 1,
                 "REGISTRY_COLUMNS": 1,
+                "SNAPSHOT_COLUMNS": len(ddl.SNAPSHOT_ADDED_COLUMNS),
                 "VIEW_CURRENT": 1,
             },
             True,
@@ -501,10 +587,11 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 0,
                 "OPERATOR_COLUMNS": 0,
                 "REGISTRY_COLUMNS": 0,
+                "SNAPSHOT_COLUMNS": 0,
                 "VIEW_CURRENT": 0,
             },
             False,
-            2,
+                3,
         ),
         # Fix log present, but the operator allowlist (CAN_PROD) and registry (CONFIRMED_AT_UTC)
         # upgrades are missing, and the handoff table is absent.
@@ -515,6 +602,7 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 3,
                 "OPERATOR_COLUMNS": 0,
                 "REGISTRY_COLUMNS": 0,
+                "SNAPSHOT_COLUMNS": len(ddl.SNAPSHOT_ADDED_COLUMNS),
                 "VIEW_CURRENT": 1,
             },
             False,
@@ -527,6 +615,7 @@ def test_ddl_objects_present_query_checks_own_and_shared_schemas():
                 "FIX_LOG_COLUMNS": 0,
                 "OPERATOR_COLUMNS": 0,
                 "REGISTRY_COLUMNS": 0,
+                "SNAPSHOT_COLUMNS": 0,
                 "VIEW_CURRENT": 0,
             },
             False,
@@ -555,25 +644,71 @@ def test_shared_target_query_validates_and_binds():
         wl.build_shared_target_query("LOCATION_NO", "NOT_A_CHECK", OBJS)
 
 
-def test_template_suggestions_bind_profile_and_skip_missing_levels():
-    full = suggest.build_template_suggestion_queries(
-        {"TERMINAL_BRAND_NAME": "PAX", "TERMINAL_MODEL_NAME": "A920", "ACQUIRER_NAME": "Elavon"}
+@pytest.mark.parametrize(
+    ("provider", "brand", "expected"),
+    [
+        ("PLANETPAYMENT", "PAX", ("PLANET_PAX",)),
+        ("PLANETPAYMENT", "Ingenico", ("PLANET_ING_5000", "PLANET_ING_LANE3000")),
+        ("PLANETPAYMENT", "ATOS WORLDLINE", ("PLANET",)),
+        ("PLANETPAYMENT", "VERIFONE", ("PLANET_VERIFONE",)),
+        ("Elavon", "PAX", ("ELAVONEUROPE_PAX",)),
+        ("ELAVON", "ATOS WORLDLINE", ("ELAVONEUROPE",)),
+        ("ELAVON", "INGENICO", ("ELAVONEUROPE_ING_5000",)),
+        ("FCC", "ATOS WORLDLINE", ("GLOBALBLUE",)),
+        ("FCC", "INGENICO", ("GLOBALBLUE_ING_5000",)),
+        ("FCC", "Verifone", ("GLOBALBLUEE355",)),
+        ("FCC", "PAX", ("GLOBALBLUE_PAX",)),
+        ("SIXPAYMENT", "ATOS WORLDLINE", ("SIX_WORDLINE",)),
+        ("SIXPAYMENT", "INGENICO", ("SIX_ING_5000", "SIX_ING_5000_UK")),
+        ("SIXPAYMENT", "PAX", ("SIX_PAX",)),
+        ("SIXMULTIPAY", "PAX", ("SIX_PAX",)),
+        ("FEXCO", "PAX", ("FEXCOEUROPE_PAX",)),
+        ("FEXCO", "ATOS WORLDLINE", ("FEXCOEUROPE_WORLDLINE",)),
+        ("Fexco", "Ingenico", ("FEXCOEUROPE_ING",)),
+        ("GLOBALBLUE", "PAX", ()),
+        ("Unknown", "PAX", ()),
+    ],
+)
+def test_template_rules_match_workbook_provider_and_brand(provider, brand, expected):
+    assert suggest.allowed_templates(
+        {"DCCPROVIDER_CODE": provider, "TERMINAL_BRAND_NAME": brand}
+    ) == expected
+
+
+def test_template_rule_intersection_requires_a_choice_valid_for_every_instance_terminal():
+    rows = [
+        {"DCCPROVIDER_CODE": "PLANETPAYMENT", "TERMINAL_BRAND_NAME": "INGENICO"},
+        {"DCCPROVIDER_CODE": "PLANETPAYMENT", "TERMINAL_BRAND_NAME": "Ingenico"},
+    ]
+    assert suggest.common_allowed_templates(rows) == (
+        "PLANET_ING_5000",
+        "PLANET_ING_LANE3000",
     )
-    assert [len(q.params) for q in full] == [3, 2]
-    assert full[0].params == ["PAX", "A920", "Elavon"]
-    assert "%s" in full[0].sql and "PAX" not in full[0].sql
-    no_acquirer = suggest.build_template_suggestion_queries(
-        {"TERMINAL_BRAND_NAME": "PAX", "TERMINAL_MODEL_NAME": "A920", "ACQUIRER_NAME": None}
+    rows.append({"DCCPROVIDER_CODE": "ELAVON", "TERMINAL_BRAND_NAME": "Ingenico"})
+    assert suggest.common_allowed_templates(rows) == ()
+
+
+def test_template_rules_use_dcc_provider_not_acquirer_name():
+    row = {
+        "DCCPROVIDER_CODE": "ELAVON",
+        "ACQUIRER_NAME": "PLANETPAYMENT",
+        "TERMINAL_BRAND_NAME": "PAX",
+    }
+    assert suggest.allowed_templates(row) == ("ELAVONEUROPE_PAX",)
+    assert suggest.allowed_templates(
+        {"ACQUIRER_NAME": "PLANETPAYMENT", "TERMINAL_BRAND_NAME": "PAX"}
+    ) == ()
+
+
+def test_provider_lookup_binds_unique_terminal_identifiers():
+    sql, params = suggest.build_provider_lookup_query(
+        [
+            {"TERMINAL_IDENTIFIER": "T-2"},
+            {"TERMINAL_IDENTIFIER": "T-1"},
+            {"TERMINAL_IDENTIFIER": "T-2"},
+        ]
     )
-    assert [len(q.params) for q in no_acquirer] == [2]
-    assert suggest.build_template_suggestion_queries({}) == []
-    assert MAINTENANCE_SOURCE in suggest.build_known_templates_query()
-
-
-def test_template_suggestion_summary_has_shares():
-    import pandas as pd
-
-    frame = pd.DataFrame({"TEMPLATE": ["Planet_PAX", "Six_PAX"], "TERMINALS": [95, 5]})
-    ranked = suggest.summarise(frame)
-    assert ranked[0].template == "Planet_PAX" and ranked[0].share == pytest.approx(0.95)
-    assert suggest.summarise(None) == []
+    assert MAINTENANCE_SOURCE in sql
+    assert "DCCPROVIDER_CODE" in sql
+    assert "TERMINAL_IDENTIFIER IN (%s, %s)" in sql
+    assert params == ["T-1", "T-2"]

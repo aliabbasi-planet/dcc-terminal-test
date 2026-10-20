@@ -27,6 +27,10 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from xml.etree import ElementTree
+
+from defusedxml.common import DefusedXmlException
+from defusedxml.ElementTree import fromstring
 
 from ..catalog import TEST_CATALOG, TestDefinition
 from ..config import BIT8_FALSE_FLAGS
@@ -68,6 +72,9 @@ _DIMENSIONS = (
     "TERMINAL_MODEL_NAME",
 )
 _ROW_IDENTIFIERS = ("INSTANCE_IDENTIFIER", "TERMINAL_IDENTIFIER", "LOCATION_NO")
+NFC_CHECKS = frozenset({
+    "HANDLER_DCCENABLENFC_CHECK_O", "HANDLER_DCCENABLENFCSINGLETAP_CHECK_O",
+})
 
 
 # --------------------------------------------------------------------------- #
@@ -87,6 +94,12 @@ class FixStep:
     config_value: str | None  # None until the operator confirms a Bit 16 template
     worklist_target: str  # the row's own identifier (differs only for a substitute)
     resolved: bool = False  # already settled in this snapshot (awaiting refresh)
+
+    @property
+    def display_value(self) -> str:
+        if self.check_column in NFC_CHECKS and self.definition.bit8_config_value is not None:
+            return f"{self.config_value}={'true' if self.definition.bit8_config_value else 'false'}"
+        return self.config_value or ""
 
     @property
     def needs_template(self) -> bool:
@@ -116,9 +129,12 @@ class FixStep:
             raise ValueError("Enter the substitute target identifier.")
         return replace(self, target_identifier=target)
 
-    def signature(self, environment: str) -> tuple[str, str, str, str | None]:
+    def signature(self, environment: str) -> tuple:
         """What a dry run must have covered for Apply to be allowed."""
-        return (environment.upper(), self.check_column, self.target_identifier, self.config_value)
+        return (
+            environment.upper(), self.check_column, self.target_identifier,
+            self.config_value, self.definition.bit8_config_value,
+        )
 
 
 @dataclass(frozen=True)
@@ -204,6 +220,15 @@ def plan_for_row(row: dict) -> tuple[list[FixStep], list[NotFixable]]:
             )
             continue
         definition = TEST_CATALOG[flag.catalog_key]
+        if flag.check_column in NFC_CHECKS:
+            provider = str(row.get("DCCPROVIDER_CODE") or "").strip().upper()
+            if not provider:
+                blocked.append(NotFixable(
+                    flag.check_column, flag,
+                    "DCC provider is missing or ambiguous; cannot determine the NFC value.",
+                ))
+                continue
+            definition = replace(definition, bit8_config_value=provider != "FEXCO")
         try:
             value = _resolve_value(flag, definition)
         except ValueError as exc:
@@ -336,7 +361,10 @@ def precheck(connection, step: FixStep, environment: str) -> Precheck:
                 f"Instance {target} has no DCC handler of the types the procedure edits.",
             )
         current = "; ".join(f"{s.get('handler_name')}={s.get('flag_value')}" for s in states)
-        expected = "false" if flag_name in BIT8_FALSE_FLAGS else "true"
+        expected_value = definition.bit8_config_value
+        if expected_value is None:
+            expected_value = flag_name not in BIT8_FALSE_FLAGS
+        expected = "true" if expected_value else "false"
         if all(str(s.get("flag_value")).strip().lower() == expected for s in states):
             return verdict(
                 ALREADY_OK,
@@ -362,7 +390,22 @@ def precheck(connection, step: FixStep, environment: str) -> Precheck:
         template = step.template
         if template is None:
             return verdict(UNKNOWN, current, "Choose the receipt template to compare.", states)
-        if all(_token(template).search(d) for d in documents):
+        try:
+            roots = [fromstring(document) if document else None for document in documents]
+        except (ElementTree.ParseError, DefusedXmlException):
+            return verdict(
+                UNKNOWN, current, "Could not parse a handler's receipt_config XML.", states
+            )
+        template_nodes = [
+            root.findall("./printout_type_template_dcc")
+            if root is not None and root.tag == "receipt_config"
+            else []
+            for root in roots
+        ]
+        if all(
+            len(nodes) == 1 and (nodes[0].text or "") == template
+            for nodes in template_nodes
+        ):
             return verdict(
                 ALREADY_OK,
                 current,

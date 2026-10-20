@@ -1,7 +1,8 @@
 """Environment and runtime settings.
 
-Only non-secret values live here. Database usernames and passwords are always
-supplied through the UI at connect time and are never read from disk.
+Environment-specific SQL Server credentials can be loaded from a local ``.env``
+file into the connection UI. Keep that file private; ``.env.example`` contains
+only blank credential placeholders. Snowflake account and user values are UI defaults.
 """
 
 from __future__ import annotations

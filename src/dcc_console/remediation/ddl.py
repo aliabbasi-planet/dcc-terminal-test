@@ -40,6 +40,14 @@ OPERATORS_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (("CAN_PROD", "BOOLEAN"),
 # Columns added to DCC_FIX_REGISTRY after its first release (migrated in place). Set when
 # the Cortex source confirms a fix and it is handed to the profit app (see :mod:`.reconcile`).
 REGISTRY_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (("CONFIRMED_AT_UTC", "TIMESTAMP_NTZ"),)
+# Columns added to HEALTH_DAILY_SNAPSHOT after its first release (migrated in place).
+SNAPSHOT_ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("LOCATION_DESC", "VARCHAR(500)"),
+    ("DCCPROVIDER_CODE", "VARCHAR(100)"),
+    ("PRINTOUT_TYPE_RECEIPT", "VARCHAR(200)"),
+    ("PRINTOUT_TYPE_TEMPLATE_DCC", "VARCHAR(200)"),
+    ("PRINTOUT_TYPE_DISPLAY", "VARCHAR(200)"),
+)
 # A column only the current V_CURRENT_BROKEN exposes; if absent, views need upgrading.
 VIEW_MARKER_COLUMN = "OPEN_FIXABLE_CHECKS"
 
@@ -55,10 +63,15 @@ _SNAPSHOT_FIXED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("COUNTRY_NAME", "VARCHAR(100)"),
     ("REGION", "VARCHAR(100)"),
     ("INDUSTRY_NAME", "VARCHAR(100)"),
+    ("DCCPROVIDER_CODE", "VARCHAR(100)"),
+    ("PRINTOUT_TYPE_RECEIPT", "VARCHAR(200)"),
+    ("PRINTOUT_TYPE_TEMPLATE_DCC", "VARCHAR(200)"),
+    ("PRINTOUT_TYPE_DISPLAY", "VARCHAR(200)"),
     ("BANK_MERCHANT_ID", "VARCHAR(50)"),
     ("MERCHANT_NAME", "VARCHAR(250)"),
     ("CUSTOMER_NAME", "VARCHAR(250)"),
     ("ACQUIRER_NAME", "VARCHAR(250)"),
+    ("LOCATION_DESC", "VARCHAR(500)"),
     ("LOCATION_NAME", "VARCHAR(500)"),
     ("TERMINAL_BRAND_NAME", "VARCHAR(100)"),
     ("TERMINAL_MODEL_NAME", "VARCHAR(200)"),
@@ -219,6 +232,14 @@ def _create_snapshot(objs: RemediationObjects) -> str:
 CLUSTER BY (SNAPSHOT_DATE)"""
 
 
+def _upgrade_snapshot(objs: RemediationObjects) -> list[str]:
+    """Add snapshot metadata columns introduced after the first release."""
+    return [
+        f"ALTER TABLE {objs.snapshot_table} ADD COLUMN IF NOT EXISTS {name} {ddl}"
+        for name, ddl in SNAPSHOT_ADDED_COLUMNS
+    ]
+
+
 def _open_fixable_expr() -> str:
     """Count of fixable checks broken on the row and not yet resolved."""
     return "\n        + ".join(
@@ -296,13 +317,32 @@ SELECT
         WHERE REMEDIATION_STATE = 'ACTIONABLE')                       AS BROKEN_ACTIONABLE,
     (SELECT COUNT(*) FROM {objs.v_current_broken}
         WHERE REMEDIATION_STATE = 'AWAITING_REFRESH')                 AS AWAITING_REFRESH,
+    (SELECT COUNT(*) FROM {objs.v_current_broken}
+        WHERE OPEN_FIXABLE_CHECKS > 0)                                 AS FIXABLE_TERMINALS,
     -- One CORRELATION_ID per procedure call; one row per terminal it covered.
-    (SELECT COUNT(DISTINCT CORRELATION_ID) FROM {objs.fix_log_table}
-        WHERE {live_applied} AND {prod})                              AS TOTAL_LIVE_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE {live_applied} AND {prod}
+    ))                                                                AS TOTAL_LIVE_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'LIVE' AND OUTCOME = 'SKIPPED_ALREADY_OK' AND {prod}
+    ))
+                                                                      AS ALREADY_OK_PROD,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'SIMULATION' AND {prod}
+    ))                                                                AS PROD_SIMULATIONS,
     (SELECT COUNT(DISTINCT TERMINAL_IDENTIFIER) FROM {objs.fix_log_table}
         WHERE {live_applied} AND {prod})                              AS UNIQUE_TERMINALS_FIXED,
-    (SELECT COUNT(DISTINCT CORRELATION_ID) FROM {objs.fix_log_table}
-        WHERE {live_applied} AND NOT {prod})                          AS REHEARSAL_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'SIMULATION' AND ENVIRONMENT IN ('UAT', 'DEV')
+    ))                                                                AS REHEARSAL_FIXES,
+    (SELECT COUNT(*) FROM (
+        SELECT DISTINCT CORRELATION_ID, APPLIED_AT FROM {objs.fix_log_table}
+        WHERE MODE = 'LIVE' AND OUTCOME = 'APPLIED' AND ENVIRONMENT IN ('UAT', 'DEV')
+    ))                                                                AS LIVE_APPLIED_UAT_DEV,
     (SELECT COUNT(*) FROM {objs.registry_table}
         WHERE {prod} AND STATUS IN ('{registry.STATUS_FIXED}', '{registry.STATUS_CONFIRMED}'))
                                                                       AS REGISTERED_FIXES,
@@ -320,6 +360,7 @@ def build_create_statements(objs: RemediationObjects) -> list[str]:
         f"CREATE SCHEMA IF NOT EXISTS {objs.schema_fqn}",
         _create_flag_reference(objs),
         _create_snapshot(objs),
+        *_upgrade_snapshot(objs),
         _create_v_current_broken(objs),
         _create_v_fix_history(objs),
         _create_v_kpis(objs),
@@ -386,6 +427,7 @@ def build_objects_present_query(objs: RemediationObjects) -> str:
     added = tuple(name for name, _ in FIX_LOG_ADDED_COLUMNS)
     operator_added = tuple(name for name, _ in OPERATORS_ADDED_COLUMNS)
     registry_added = tuple(name for name, _ in REGISTRY_ADDED_COLUMNS)
+    snapshot_added = tuple(name for name, _ in SNAPSHOT_ADDED_COLUMNS)
     return f"""SELECT
     (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.TABLES
       WHERE TABLE_SCHEMA = '{objs.schema.upper()}'
@@ -402,6 +444,9 @@ def build_objects_present_query(objs: RemediationObjects) -> str:
     (SELECT COUNT(*) FROM {objs.shared_database}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '{objs.shared_schema.upper()}' AND TABLE_NAME = 'DCC_FIX_REGISTRY'
         AND COLUMN_NAME IN ({_in_list(registry_added)}))            AS REGISTRY_COLUMNS,
+        (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = '{objs.schema.upper()}' AND TABLE_NAME = 'HEALTH_DAILY_SNAPSHOT'
+                AND COLUMN_NAME IN ({_in_list(snapshot_added)}))            AS SNAPSHOT_COLUMNS,
     (SELECT COUNT(*) FROM {objs.database}.INFORMATION_SCHEMA.COLUMNS
       WHERE TABLE_SCHEMA = '{objs.schema.upper()}' AND TABLE_NAME = 'V_CURRENT_BROKEN'
         AND COLUMN_NAME = '{VIEW_MARKER_COLUMN}')                     AS VIEW_CURRENT"""
@@ -426,7 +471,10 @@ def schema_status(row: dict) -> SchemaStatus:
         value = row.get(key)
         return int(value) if value is not None else 0
 
-    own = count("OWN_TABLES") >= len(OWN_TABLES)
+    own = (
+        count("OWN_TABLES") >= len(OWN_TABLES)
+        and count("SNAPSHOT_COLUMNS") >= len(SNAPSHOT_ADDED_COLUMNS)
+    )
     shared = (
         count("SHARED_TABLES") >= len(SHARED_TABLES)
         and count("FIX_LOG_COLUMNS") >= len(FIX_LOG_ADDED_COLUMNS)

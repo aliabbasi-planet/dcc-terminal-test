@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import streamlit as st
 
 from ..config import ENVIRONMENTS
@@ -29,9 +31,16 @@ def render_connection() -> None:
     database = st.sidebar.text_input(
         "Database", value=environment.database, key=f"db_database_{env_name}"
     )
-    username = st.sidebar.text_input(f"{env_name} username", key=f"db_user_{env_name}")
+    username = st.sidebar.text_input(
+        f"{env_name} username",
+        value=os.getenv(f"{env_name}_DB_USERNAME", ""),
+        key=f"db_user_{env_name}",
+    )
     password = st.sidebar.text_input(
-        f"{env_name} password", type="password", key=f"db_pass_{env_name}"
+        f"{env_name} password",
+        value=os.getenv(f"{env_name}_DB_PASSWORD", ""),
+        type="password",
+        key=f"db_pass_{env_name}",
     )
 
     connect_col, disconnect_col = st.sidebar.columns(2)

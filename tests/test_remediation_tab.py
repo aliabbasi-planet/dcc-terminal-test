@@ -9,6 +9,7 @@ does in the console. The restore journal is isolated to a temp directory.
 from __future__ import annotations
 
 import importlib
+import re
 from datetime import date, datetime, timezone
 
 import pandas as pd
@@ -16,8 +17,17 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from dcc_console.database import ProcedureOutput
+from dcc_console.remediation import ddl
 from dcc_console.remediation.mapping import TRACKED_CHECK_COLUMNS
 from dcc_console.remediation.sf_connection import SnowflakeSettings
+
+
+def _render_connection_sidebar() -> None:
+    from dcc_console.state import init_state
+    from dcc_console.ui.sidebar import render_connection
+
+    init_state()
+    render_connection()
 
 
 def _row(tid: str, **broken) -> dict:
@@ -34,6 +44,7 @@ def _row(tid: str, **broken) -> dict:
         "TERMINAL_BRAND_NAME": "PAX",
         "TERMINAL_MODEL_NAME": "A920",
         "ACQUIRER_NAME": "Planet",
+        "DCCPROVIDER_CODE": "PLANETPAYMENT",
         "BANK_MERCHANT_ID": "BM-1",
         "FIRMWARE_VERSION": "1.2.3",
         "IS_DCC_BROKEN": True,  # BOOLEAN
@@ -90,6 +101,7 @@ class FakeSnowflake:
                         "FIX_LOG_COLUMNS": 3 * full,
                         "OPERATOR_COLUMNS": int(full),
                         "REGISTRY_COLUMNS": int(full),
+                        "SNAPSHOT_COLUMNS": len(ddl.SNAPSHOT_ADDED_COLUMNS) * int(full),
                         "VIEW_CURRENT": int(full),
                     }
                 ]
@@ -102,9 +114,13 @@ class FakeSnowflake:
                     {
                         "BROKEN_ACTIONABLE": 12654 if self.loaded else 0,
                         "AWAITING_REFRESH": 0,
+                        "FIXABLE_TERMINALS": 11000 if self.loaded else 0,
                         "TOTAL_LIVE_FIXES": 0,
+                        "ALREADY_OK_PROD": 0,
+                        "PROD_SIMULATIONS": 0,
                         "UNIQUE_TERMINALS_FIXED": 0,
                         "REHEARSAL_FIXES": 0,
+                        "LIVE_APPLIED_UAT_DEV": 0,
                         "REGISTERED_FIXES": 0,
                         "PENDING_CONFIRMATION": 0,
                         "CONFIRMED_FIXES": 0,
@@ -113,7 +129,48 @@ class FakeSnowflake:
                     }
                 ]
             )
-        if "PENDING_CONFIRMATION" in sql:  # reconcile panel summary
+        if "DCC_PROVIDER_COUNT" in sql:
+            rows_by_terminal = self.frame.set_index("TERMINAL_IDENTIFIER")
+            return pd.DataFrame(
+                [
+                    {
+                        "TERMINAL_IDENTIFIER": terminal_id,
+                        "DCC_PROVIDER_CODE": rows_by_terminal.loc[terminal_id][
+                            "DCCPROVIDER_CODE"
+                        ],
+                        "DCC_PROVIDER_COUNT": 1,
+                    }
+                    for terminal_id in params
+                    if terminal_id in rows_by_terminal.index
+                ]
+            )
+        if "NFC_PROVIDER_COUNT" in sql:
+            records = []
+            for instance in params:
+                rows = self.frame[self.frame["INSTANCE_IDENTIFIER"].astype(str) == instance]
+                providers = rows["DCCPROVIDER_CODE"].dropna().astype(str).str.strip().str.upper()
+                values = providers.unique().tolist()
+                records.append({
+                    "INSTANCE_IDENTIFIER": instance,
+                    "NFC_PROVIDER_CODE": values[0] if values else None,
+                    "NFC_PROVIDER_COUNT": len(values),
+                })
+            return pd.DataFrame(records)
+        if "FIX_CONFIRMED_PROD" in sql:
+            return pd.DataFrame([{"FIX_CONFIRMED_PROD": 368}])
+        if "UNIQUE_FIXED_TERMINALS_PROD" in sql:
+            return pd.DataFrame([{"UNIQUE_FIXED_TERMINALS_PROD": 367}])
+        if "PENDING_CONFIRMATION_APPLIED" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "PENDING_CONFIRMATION_APPLIED": 2,
+                        "CONFIRMED_IN_REGISTRY_APPLIED": 3,
+                        "HANDED_OFF_APPLIED": 4,
+                    }
+                ]
+            )
+        if "PENDING_CONFIRMATION" in sql and "FIX_BIT" not in sql:  # reconcile summary
             return pd.DataFrame(
                 [
                     {
@@ -135,7 +192,57 @@ class FakeSnowflake:
                 ]
             )
         if "FIX_DATE" in sql:  # Overview fix-activity trend
-            return pd.DataFrame(columns=["FIX_DATE", "LIVE_APPLIED", "REHEARSED"])
+            return pd.DataFrame(
+                columns=[
+                    "FIX_DATE",
+                    "LIVE_APPLIED_PROD",
+                    "ALREADY_OK_PROD",
+                    "DRY_RUN_PROD",
+                    "DRY_RUN_UAT",
+                    "DRY_RUN_DEV",
+                    "LIVE_APPLIED_UAT_DEV",
+                ]
+            )
+        if "REGISTERED_TARGETS" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "TARGET_TYPE": "Instance",
+                        "REGISTERED_TARGETS": 100,
+                        "CONFIRMED_TARGETS": 80,
+                        "TERMINALS_COVERED": 150,
+                    },
+                    {
+                        "TARGET_TYPE": "Terminal",
+                        "REGISTERED_TARGETS": 120,
+                        "CONFIRMED_TARGETS": 100,
+                        "TERMINALS_COVERED": 120,
+                    },
+                ]
+            )
+        if "LIVE_APPLIED_CALLS" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "FIX_BIT": bit,
+                        "LIVE_APPLIED_CALLS": 1 if bit == 2 else 0,
+                        "ALREADY_OK_CALLS": 0,
+                        "DRY_RUN_ATTEMPTS": 1,
+                        "REGISTERED_CHECKS": 1 if bit == 2 else 0,
+                        "PENDING_CONFIRMATION_CHECKS": 0,
+                        "CONFIRMED_CHECKS": 1 if bit == 2 else 0,
+                        "TERMINALS_COVERED": 1 if bit == 2 else 0,
+                    }
+                    for bit in (1, 2, 8, 16)
+                ]
+            )
+        if "APP_FIXED_TERMINALS_BY_BIT" in sql:
+            return pd.DataFrame(
+                [
+                    {"FIX_BIT": bit, "APP_FIXED_TERMINALS_BY_BIT": value}
+                    for bit, value in ((1, 12), (2, 367), (8, 22), (16, 4))
+                ]
+            )
         if "SUM(" in sql:
             # SUM over zero rows is NULL in Snowflake, not 0.
             totals = {
@@ -155,7 +262,16 @@ class FakeSnowflake:
             return pd.DataFrame()
         frame = self.frame if self.loaded else self.frame.iloc[0:0]
         if "V_CURRENT_BROKEN" in sql and "= %s AND" in sql:  # terminals one call covers
-            column = sql.split("WHERE ", 1)[1].split(" = %s", 1)[0].strip()
+            if " OR " in sql:
+                matches = re.findall(r"\((\w+) = %s AND (\w+) = 1\)", sql)
+                selected = []
+                for index, (target_column, check_column) in enumerate(matches):
+                    mask = (frame[target_column].astype(str) == str(params[index])) & (
+                        frame[check_column].astype(str) == "1"
+                    )
+                    selected.append(frame[mask])
+                return pd.concat(selected).drop_duplicates() if selected else frame.iloc[0:0]
+            column = sql.split("WHERE ", 1)[1].split(" = %s", 1)[0].strip(" (")
             return frame[frame[column].astype(str) == str(params[0])]
         if "V_CURRENT_BROKEN WHERE TERMINAL_IDENTIFIER = %s" in sql:  # one terminal
             return frame[frame["TERMINAL_IDENTIFIER"] == params[0]]
@@ -241,8 +357,20 @@ def _console_script() -> None:
     render_remediation(armed_live=st.session_state.get("_test_armed", False))
 
 
-def _render(fake: FakeSnowflake, **state) -> AppTest:
-    at = AppTest.from_function(_console_script, default_timeout=30)
+def _campaign_script() -> None:
+    import streamlit as st
+
+    from dcc_console.remediation import campaign_panel
+    from dcc_console.remediation.tab import _objects
+
+    conn = st.session_state["rem_sf_conn"]
+    campaign_panel.render_campaign_panel(
+        conn, _objects(conn), armed_live=st.session_state.get("_test_armed", False)
+    )
+
+
+def _render(fake: FakeSnowflake, *, script=_console_script, **state) -> AppTest:
+    at = AppTest.from_function(script, default_timeout=30)
     at.session_state["rem_sf_conn"] = fake
     at.session_state["results"] = []
     for key, value in state.items():
@@ -284,6 +412,74 @@ def test_overview_page_shows_kpis_beside_sidebar_disconnect():
     assert _problems(at) == []
     assert at.button(key="rem_sf_disconnect").label == "Disconnect"
     assert at.metric[0].value == "12,654"
+    labels = [metric.label for metric in at.metric]
+    assert "Already OK · PROD" in labels
+    assert "Fix confirmed · PROD" in labels
+    fix_confirmed = next(metric for metric in at.metric if metric.label == "Fix confirmed · PROD")
+    assert fix_confirmed.value == "368"
+    fixed_terminals = next(
+        metric for metric in at.metric if metric.label == "Terminals fixed · PROD"
+    )
+    assert fixed_terminals.value == "367"
+    assert "Dry runs · PROD" in labels
+    assert "Fixable" in labels
+    assert "Live applied · UAT/DEV" in labels
+    assert "Latest snapshot" in labels
+    latest_snapshot = next(metric for metric in at.metric if metric.label == "Latest snapshot")
+    assert latest_snapshot.value == "2026-09-28"
+    assert any(
+        "Target type" in frame.value.columns and "Terminals covered" in frame.value.columns
+        for frame in at.dataframe
+    )
+    bit_coverage = next(
+        frame.value for frame in at.dataframe if "Live applied calls" in frame.value.columns
+    )
+    assert bit_coverage["Bit"].tolist() == [1, 2, 8, 16]
+    assert bit_coverage.loc[bit_coverage["Bit"] == 2, "Live applied calls"].iloc[0] == 1
+    fixed_by_bit = next(
+        frame.value for frame in at.dataframe if "Terminals fixed" in frame.value.columns
+    )
+    assert fixed_by_bit["Bit"].tolist() == [1, 2, 8, 16]
+    assert fixed_by_bit.loc[fixed_by_bit["Bit"] == 2, "Terminals fixed"].iloc[0] == 367
+
+
+def test_snowflake_connection_defaults_to_ai_workspace(monkeypatch):
+    monkeypatch.delenv("SNOWFLAKE_DATABASE", raising=False)
+    monkeypatch.delenv("DCC_SHARED_SCHEMA", raising=False)
+    fake = FakeSnowflake()
+    at = _render(fake)
+
+    assert _problems(at) == []
+    assert at.text_input(key="rem_sf_database").label == "Database"
+    assert at.text_input(key="rem_sf_database").value == "AI_WORKSPACE"
+    assert at.text_input(key="rem_sf_shared").value == "AI_WORKSPACE.DCC_REMEDIATION"
+    assert fake.settings.database == "AI_WORKSPACE"
+    assert fake.settings.shared_schema == "AI_WORKSPACE.DCC_REMEDIATION"
+
+
+def test_remediation_navigation_removes_campaign_and_resets_stale_selection():
+    at = _render(FakeSnowflake(), rem_page="Campaign")
+
+    assert _problems(at) == []
+    section = at.radio(key="rem_page")
+    assert section.options == ["Overview", "Single fix", "Batch fix"]
+    assert section.value == "Overview"
+    assert not any(button.key == "rem_campaign_run" for button in at.button)
+
+
+@pytest.mark.parametrize("environment", ["DEV", "UAT", "PROD"])
+def test_sidebar_uses_per_environment_sql_credentials(monkeypatch, environment):
+    username = f"{environment.lower()}-example-user"
+    password = f"{environment.lower()}-example-password"
+    monkeypatch.setenv(f"{environment}_DB_USERNAME", username)
+    monkeypatch.setenv(f"{environment}_DB_PASSWORD", password)
+
+    at = AppTest.from_function(_render_connection_sidebar)
+    at.session_state["active_env"] = environment
+    at.run()
+
+    assert at.text_input(key=f"db_user_{environment}").value == username
+    assert at.text_input(key=f"db_pass_{environment}").value == password
 
 
 def test_single_page_shows_worklist_and_fixer_prompt():
@@ -292,6 +488,21 @@ def test_single_page_shows_worklist_and_fixer_prompt():
     assert _problems(at) == []
     assert len(at.dataframe) == 1
     assert any("Select a terminal" in info.value for info in at.info)
+    assert at.text_input(key="rem_target_LOCATION_NO")
+    assert at.text_input(key="rem_target_INSTANCE_IDENTIFIER")
+    assert at.text_input(key="rem_target_TERMINAL_IDENTIFIER")
+
+
+def test_batch_page_shows_exact_target_filters():
+    at = _render(FakeSnowflake(), rem_page="Batch fix")
+
+    assert _problems(at) == []
+    target_filter_keys = {
+        "rembatch_target_LOCATION_NO",
+        "rembatch_target_INSTANCE_IDENTIFIER",
+        "rembatch_target_TERMINAL_IDENTIFIER",
+    }
+    assert target_filter_keys.issubset({widget.key for widget in at.text_input})
 
 
 def test_empty_snapshot_renders_without_errors():
@@ -319,13 +530,13 @@ def test_uninitialised_schema_only_offers_initialise():
     ],
 )
 def test_action_outcome_is_visible_after_click(button_key, failure_text, success_text):
-    failing = _render(FakeSnowflake(fail_writes=True))
+    failing = _render(FakeSnowflake(fail_writes=True, initialised=button_key != "rem_init"))
     failing.button(key=button_key).click().run()
 
     assert [e.value for e in failing.exception] == []
     assert any(failure_text in e.value for e in failing.error)
 
-    fake = FakeSnowflake()
+    fake = FakeSnowflake(initialised=button_key != "rem_init")
     ok = _render(fake)
     ok.button(key=button_key).click().run()
 
@@ -335,7 +546,7 @@ def test_action_outcome_is_visible_after_click(button_key, failure_text, success
 
 
 def test_initialise_creates_the_shared_log_before_the_views():
-    fake = FakeSnowflake()
+    fake = FakeSnowflake(initialised=False)
     at = _render(fake)
     at.button(key="rem_init").click().run()
     statements = [sql for sql, _ in fake.writes]
@@ -345,6 +556,58 @@ def test_initialise_creates_the_shared_log_before_the_views():
     view_at = next(i for i, s in enumerate(statements) if "V_CURRENT_BROKEN AS" in s)
     assert log_at < view_at
     assert any("FIX_OPERATORS" in s for s in statements)
+
+
+def test_verify_ready_schema_does_not_write_even_without_ddl_permissions():
+    fake = FakeSnowflake(fail_writes=True)
+    at = _render(fake)
+    at.button(key="rem_init").click().run()
+
+    assert _problems(at) == []
+    assert fake.writes == []
+    assert any("Verified without changes" in item.value for item in at.success)
+
+
+def test_initialise_skips_ready_shared_tables_when_worklist_view_needs_upgrade():
+    class MissingWorklistView(FakeSnowflake):
+        def query(self, sql, params=None):
+            frame = super().query(sql, params)
+            if "INFORMATION_SCHEMA" in sql:
+                frame["VIEW_CURRENT"] = 0
+            return frame
+
+    fake = MissingWorklistView()
+    at = _render(fake)
+    at.button(key="rem_init").click().run()
+
+    assert _problems(at) == []
+    assert fake.writes
+    assert not any(
+        "ALTER TABLE" in sql and any(
+            table in sql for table in ("APP_FIX_LOG", "FIX_OPERATORS", "DCC_FIX_REGISTRY")
+        )
+        for sql, _ in fake.writes
+    )
+    assert not any(
+        "CREATE TABLE IF NOT EXISTS" in sql and "APP_FIX_LOG" in sql
+        for sql, _ in fake.writes
+    )
+
+
+def test_failed_schema_metadata_check_disables_initialise():
+    class FailedMetadataRead(FakeSnowflake):
+        def query(self, sql, params=None):
+            if "INFORMATION_SCHEMA" in sql:
+                raise RuntimeError("Metadata access denied")
+            return super().query(sql, params)
+
+    fake = FailedMetadataRead()
+    at = _render(fake)
+
+    assert not at.exception
+    assert at.button(key="rem_init").disabled
+    assert any("Metadata access denied" in item.value for item in at.error)
+    assert fake.writes == []
 
 
 def test_reconcile_button_runs_the_confirmation_handoff():
@@ -462,12 +725,73 @@ def test_bit16_needs_a_confirmed_template_before_anything_runs():
     at = _render(FakeSnowflake(rows=[row]), **_fixer_state("UAT", FakeSql(), tid="T-16"))
 
     assert _problems(at) == []
-    assert any("Planet_PAX" in s.value for s in at.success)  # 95% of peers → strong
     assert at.button(key="rem_pre_T-16").disabled
-    assert at.selectbox(key="rem_tpl_T-16").value == "Planet_PAX"
+    assert at.selectbox(key="rem_tpl_T-16").value == "PLANET_PAX"
+    assert at.radio(key="rem_tpl_source_T-16").value == "Workbook list"
+    confirm_key = "rem_tpl_confirm_T-16_Workbook list_PLANET_PAX"
+    assert not at.checkbox(key=confirm_key).value
 
-    next(c for c in at.checkbox if c.label.startswith("I confirm")).check().run()
+    at.checkbox(key=confirm_key).check().run()
     assert not at.button(key="rem_pre_T-16").disabled
+
+
+@pytest.mark.parametrize("page", ["Single fix", "Batch fix"])
+@pytest.mark.parametrize("check", [
+    "HANDLER_DCCENABLENFC_CHECK_O", "HANDLER_DCCENABLENFCSINGLETAP_CHECK_O",
+])
+def test_fexco_nfc_dry_run_uses_false_in_single_and_batch(page, check):
+    class NfcSql(FakeSql):
+        def query(self, sql, params=()):
+            if "handler_type" in sql:
+                return pd.DataFrame([{
+                    "handler_name": "handlerTerminalRequester",
+                    "extra_config": (
+                        '<extra_config><extra_config config_name="dccEnableNfc" '
+                        'config_value="true"/><extra_config config_name="dccEnableNfcSingleTap" '
+                        'config_value="true"/></extra_config>'
+                    ),
+                }])
+            return super().query(sql, params)
+
+    row = _row("T-NFC", DCCPROVIDER_CODE="FEXCO", **{check: 1})
+    snow = FakeSnowflake(rows=[row])
+    sql = NfcSql()
+    state = _fixer_state("UAT", sql, tid="T-NFC")
+    state["rem_page"] = page
+    at = _render(snow, **state)
+    if page == "Batch fix":
+        next(button for button in at.button if button.label == "Load / add terminals").click().run()
+        selection = next(frame.value for frame in at.dataframe if "Include" in frame.value)
+        assert selection["Value"].str.endswith("=false").all()
+        at.button(key="rem_batch_run").click().run()
+    else:
+        at.button(key="rem_pre_T-NFC").click().run()
+        at.button(key="rem_dry_T-NFC").click().run()
+    assert _problems(at) == []
+    assert len(sql.calls) == 1
+    assert sql.calls[0][0][3] == 0
+    assert sql.calls[0][1] is True
+
+
+def test_bit16_without_a_workbook_rule_cannot_proceed():
+    row = _row(
+        "T-16-UNMAPPED",
+        DCCPROVIDER_CODE="GLOBALBLUE",
+        PRINTOUTTYPETEMPLATEDCC_CHECK_C=1,
+    )
+    at = _render(
+        FakeSnowflake(rows=[row]),
+        **_fixer_state("UAT", FakeSql(), tid="T-16-UNMAPPED"),
+    )
+
+    assert at.exception == []
+    assert "rem_tpl_custom_T-16-UNMAPPED" in [item.key for item in at.text_input]
+    assert at.button(key="rem_pre_T-16-UNMAPPED").disabled
+    at.text_input(key="rem_tpl_custom_T-16-UNMAPPED").set_value("NEW_GLOBALBLUE_TEMPLATE").run()
+    assert at.button(key="rem_pre_T-16-UNMAPPED").disabled
+    exception_confirm = "rem_tpl_confirm_T-16-UNMAPPED_Custom exception_NEW_GLOBALBLUE_TEMPLATE"
+    at.checkbox(key=exception_confirm).check().run()
+    assert not at.button(key="rem_pre_T-16-UNMAPPED").disabled
 
 
 def test_failed_fix_log_write_is_queued_and_retried():
@@ -506,20 +830,472 @@ def test_batch_page_plans_and_rehearses_dry_runs_for_the_selection():
     at = _render(snow, **_batch_state("UAT", sql))
 
     assert _problems(at) == []
+    assert at.session_state["rem_batch_loaded_rows"] == []
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
     assert any(m.label == "Fixes to run" and m.value == "1" for m in at.metric)
     assert at.button(key="rem_batch_run").label == "Rehearse 1 fix(es)"
+    assert any(
+        expander.label == "Fix history for terminals covered by this batch"
+        for expander in at.expander
+    )
+    assert any("TERMINAL_IDENTIFIER IN (%s)" in query for query in snow.reads)
 
+    at.text_input(key="rem_batch_change_ref").set_value("BATCH-REHEARSAL-001").run()
     at.button(key="rem_batch_run").click().run()
     assert _problems(at) == []
     # A rehearse is a dry run only: the SP was called once and rolled back, logged SIMULATED.
     assert [rollback for _, rollback in sql.calls] == [True]
     assert [(r["MODE"], r["OUTCOME"]) for r in snow.fix_log_rows()] == [("SIMULATION", "SIMULATED")]
+    assert all(row["CHANGE_REF"] == "BATCH-REHEARSAL-001" for row in snow.fix_log_rows())
     assert sql.version == "1"  # nothing applied live
+
+
+def test_batch_dry_run_start_exception_is_logged_as_failed_simulation(monkeypatch):
+    from dcc_console.remediation import fixer
+
+    def fail_before_result(*_args, **_kwargs):
+        raise RuntimeError("dry-run setup failed")
+
+    monkeypatch.setattr(fixer, "run_step", fail_before_result)
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    at = _render(snow, **_batch_state("PROD", FakeSql()))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert _problems(at) == []
+    at.button(key="rem_batch_run").click().run()
+
+    assert _problems(at) == []
+    rows = snow.fix_log_rows()
+    assert len(rows) == 1
+    assert rows[0]["MODE"] == "SIMULATION"
+    assert rows[0]["OUTCOME"] == "FAILED"
+    assert "dry-run setup failed" in rows[0]["ERROR"]
+    assert rows[0]["TERMINAL_IDENTIFIER"] == "T-9"
+
+
+def test_batch_live_requires_fresh_rehearsal_and_logs_every_execution():
+    snow = FakeSnowflake(rows=[_bit2_row()], can_prod=True)
+    sql = FakeSql()
+    at = _render(snow, **_batch_state("PROD", sql, armed=True))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    at.text_input(key="rem_batch_change_ref").set_value("CHG-BATCH-001").run()
+    at.radio(key="rem_batch_mode").set_value("Apply live").run()
+    at.checkbox(key="rem_batch_authorise").check().run()
+    assert at.button(key="rem_batch_run").disabled
+
+    at.radio(key="rem_batch_mode").set_value("Rehearse (dry run only)").run()
+    at.button(key="rem_batch_run").click().run()
+    at.radio(key="rem_batch_mode").set_value("Apply live").run()
+    at.checkbox(key="rem_batch_authorise").check().run()
+    assert not at.button(key="rem_batch_run").disabled
+
+    rehearsal = at.session_state["rem_batch_rehearsal"]
+    at.session_state["rem_batch_rehearsal"] = (rehearsal[0], 0, rehearsal[2])
+    at.run()
+    assert at.button(key="rem_batch_run").disabled
+    at.session_state["rem_batch_rehearsal"] = rehearsal
+    at.run()
+    at.button(key="rem_batch_run").click().run()
+
+    assert _problems(at) == []
+    assert [rollback for _, rollback in sql.calls] == [True, True, False]
+    assert [row["MODE"] for row in snow.fix_log_rows()] == [
+        "SIMULATION", "SIMULATION", "LIVE",
+    ]
+    assert all(row["CHANGE_REF"] == "CHG-BATCH-001" for row in snow.fix_log_rows())
+    assert at.button(key="rem_batch_run").disabled
+
+
+def test_batch_terminal_limit_updates_selection_and_allows_more_than_200():
+    snow = FakeSnowflake(rows=[_bit2_row(f"T-{index:04}") for index in range(201)])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+
+    assert at.number_input(key="rem_batch_terminal_limit").value == 200
+    assert not any(widget.key == "rem_batch_terminals" for widget in at.multiselect)
+    assert at.session_state["rem_batch_selected_fix_keys"] == []
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 200
+    selection_table = next(frame.value for frame in at.dataframe if "Include" in frame.value)
+    assert selection_table["Include"].all()
+    batch_metrics = [metric for metric in at.metric if metric.label in (
+        "Terminals affected", "Fixes to run", "Need manual template", "Manual follow-up"
+    )]
+    assert len(batch_metrics) == 4
+    assert all(metric.proto.help for metric in batch_metrics)
+
+    at.number_input(key="rem_batch_terminal_limit").set_value(250).run()
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 200
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 201
+    assert not at.button(key="rem_batch_run").disabled
+
+    at.number_input(key="rem_batch_terminal_limit").set_value(10).run()
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 201
+
+
+def test_batch_filters_preserve_loaded_rows_until_explicit_add():
+    snow = FakeSnowflake(rows=[_bit2_row("T-OLD")])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    assert at.session_state["rem_batch_loaded_rows"] == []
+
+    def is_worklist_query(query: str) -> bool:
+        return "V_CURRENT_BROKEN" in query and "REMEDIATION_STATE = %s" in query
+
+    assert sum(is_worklist_query(query) for query in snow.reads) == 0
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-OLD"]
+    assert sum(is_worklist_query(query) for query in snow.reads) == 1
+    snow.frame = pd.DataFrame([_bit2_row("T-NEW")])
+    at.text_input(key="rembatch_target_TERMINAL_IDENTIFIER").set_value("T-NEW").run()
+
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-OLD"]
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 1
+    assert sum(is_worklist_query(query) for query in snow.reads) == 1
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-OLD", "T-NEW"]
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 2
+    assert sum(is_worklist_query(query) for query in snow.reads) == 2
+    assert all(button.proto.help for button in at.button if button.label in (
+        "Apply selection", "Load / add terminals",
+    ))
+
+
+def test_batch_add_at_terminal_limit_preserves_rows_and_deduplicates():
+    snow = FakeSnowflake(rows=[_bit2_row(f"T-{index:04}") for index in range(200)])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 200
+
+    snow.frame = pd.DataFrame([_bit2_row("T-0000"), _bit2_row("T-NEW")])
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert at.session_state["rem_batch_loaded_ids"].count("T-0000") == 1
+    assert "T-NEW" in at.session_state["rem_batch_loaded_ids"]
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 201
+
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert len(at.session_state["rem_batch_loaded_ids"]) == 201
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 201
+
+
+def test_batch_empty_table_stays_empty_until_explicit_load():
+    snow = FakeSnowflake(rows=[_bit2_row("T-OLD")])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    assert at.session_state["rem_batch_loaded_rows"] == []
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    at.session_state["rem_batch_authorise"] = True
+    next(button for button in at.button if button.label == "Empty table").click().run()
+
+    assert _problems(at) == []
+    assert at.session_state["rem_batch_loaded_rows"] == []
+    assert at.session_state["rem_batch_selected_fix_keys"] == []
+    assert not at.session_state["rem_batch_authorise"]
+    assert not any(button.key == "rem_batch_run" for button in at.button)
+
+    snow.frame = pd.DataFrame([_bit2_row("T-NEW")])
+    at.text_input(key="rembatch_target_TERMINAL_IDENTIFIER").set_value("T-NEW").run()
+    assert at.session_state["rem_batch_loaded_rows"] == []
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert at.session_state["rem_batch_loaded_ids"] == ["T-NEW"]
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 1
+
+
+def test_batch_bit8_selects_instance_scope_and_logs_all_broken_terminals():
+    class FakeBit8Sql(FakeSql):
+        def query(self, sql: str, params=()):
+            if "handler_type" in sql:
+                return pd.DataFrame(
+                    [
+                        {
+                            "handler_name": "handlerTerminalRequester",
+                            "extra_config": (
+                                '<extra_config><entry config_name="dccEnable" '
+                                'config_value="false"/></extra_config>'
+                            ),
+                        }
+                    ]
+                )
+            return super().query(sql, params)
+
+    rows = [
+        _row("T-A", INSTANCE_IDENTIFIER="I-SHARED", HANDLER_DCCENABLE_CHECK_O=1),
+        _row("T-B", INSTANCE_IDENTIFIER="I-SHARED", HANDLER_DCCENABLE_CHECK_O=1),
+    ]
+    snow = FakeSnowflake(rows=rows)
+    sql = FakeBit8Sql()
+    at = _render(snow, **_batch_state("UAT", sql))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert _problems(at) == []
+    selection_table = next(frame.value for frame in at.dataframe if "Target scope" in frame.value)
+    bit8 = selection_table[selection_table["Bit"] == 8]
+    assert len(bit8) == 1
+    assert bit8.iloc[0]["Target scope"] == "Instance"
+    assert bit8.iloc[0]["Target"] == "I-SHARED"
+    assert bit8.iloc[0]["Terminals covered"] == 2
+
+    at.button(key="rem_batch_run").click().run()
+    assert _problems(at) == []
+    records = [
+        record for record in snow.fix_log_rows()
+        if record["CHECK_COLUMN"] == "HANDLER_DCCENABLE_CHECK_O"
+    ]
+    assert {record["TERMINAL_IDENTIFIER"] for record in records} == {"T-A", "T-B"}
+    assert [rollback for _, rollback in sql.calls] == [True]
+
+
+def test_batch_uncheck_excludes_the_whole_shared_instance_fix_group():
+    row = _row("T-A", INSTANCE_IDENTIFIER="I-SHARED", HANDLER_DCCENABLE_CHECK_O=1)
+    at = _render(FakeSnowflake(rows=[row]), **_batch_state("UAT", FakeSql()))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert len(at.session_state["rem_batch_selected_fix_keys"]) == 1
+    revision = at.session_state["rem_batch_editor_revision"]
+    at.session_state[f"rem_batch_selection_{revision}"] = {
+        "edited_rows": {0: {"Include": False}},
+        "added_rows": [],
+        "deleted_rows": [],
+    }
+    next(button for button in at.button if button.label == "Apply selection").click().run()
+
+    assert at.session_state["rem_batch_selected_fix_keys"] == []
+    assert not any(button.key == "rem_batch_run" for button in at.button)
+    assert any("Check at least one automatic fix group" in note.value for note in at.info)
+
+
+def test_batch_selection_groups_bit1_location_bit2_terminal_and_bit8_instance():
+    rows = [
+        _row(
+            "T-A",
+            INSTANCE_IDENTIFIER="I-A",
+            LOCATION_NO="L-SHARED",
+            DCCXPRESSCO_CHECK_O=1,
+            CONFIGDOWNLOAD_VERSION_CHECK_C=1,
+            HANDLER_DCCENABLE_CHECK_O=1,
+        ),
+        _row(
+            "T-B",
+            INSTANCE_IDENTIFIER="I-B",
+            LOCATION_NO="L-SHARED",
+            COUNTRY_NAME="Portugal",
+            REGION="Iberia",
+            TERMINAL_BRAND_NAME="Ingenico",
+            ACQUIRER_NAME="Elavon",
+            DCCXPRESSCO_CHECK_O=1,
+            CONFIGDOWNLOAD_VERSION_CHECK_C=1,
+            HANDLER_DCCENABLE_CHECK_O=1,
+        ),
+    ]
+    at = _render(FakeSnowflake(rows=rows), **_batch_state("UAT", FakeSql()))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert _problems(at) == []
+    selection_table = next(
+        frame.value for frame in at.dataframe if "Target scope" in frame.value
+    )
+    bit1 = selection_table[selection_table["Bit"] == 1]
+    bit2 = selection_table[selection_table["Bit"] == 2]
+    bit8 = selection_table[selection_table["Bit"] == 8]
+    assert len(bit1) == 1
+    assert bit1.iloc[0]["Target scope"] == "Location"
+    assert bit1.iloc[0]["Target"] == "L-SHARED"
+    assert bit1.iloc[0]["Terminals covered"] == 2
+    assert bit1.iloc[0]["Country"] == "Portugal, Spain"
+    assert bit1.iloc[0]["Region"] == "EMEA, Iberia"
+    assert bit1.iloc[0]["Terminal brand"] == "Ingenico, PAX"
+    assert bit1.iloc[0]["Acquirer"] == "Elavon, Planet"
+    assert len(bit2) == 2
+    assert set(bit2["Target scope"]) == {"Terminal"}
+    assert len(bit8) == 2
+    assert set(bit8["Target scope"]) == {"Instance"}
+    assert set(bit8["Target"]) == {"I-A", "I-B"}
+
+
+def test_batch_bit16_rule_or_custom_template_requires_individual_confirmation():
+    class FakeReceiptSql(FakeSql):
+        def query(self, sql: str, params=()):
+            if "handler_type" in sql:
+                return pd.DataFrame([{
+                    "handler_name": "handlerTerminalRequester",
+                    "receipt_config": "<receipt_config>OldTemplate</receipt_config>",
+                }])
+            return super().query(sql, params)
+
+    snow = FakeSnowflake(rows=[
+        _row("T-A", TERMINAL_BRAND_NAME="INGENICO", PRINTOUTTYPETEMPLATEDCC_CHECK_C=1),
+        _row("T-B", TERMINAL_BRAND_NAME="INGENICO", PRINTOUTTYPETEMPLATEDCC_CHECK_C=1),
+    ])
+    sql = FakeReceiptSql()
+    at = _render(snow, **_batch_state("UAT", sql))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert _problems(at) == []
+    assert at.selectbox(key="rem_tpl_T-A").value == "PLANET_ING_5000"
+    assert at.selectbox(key="rem_tpl_T-B").value == "PLANET_ING_5000"
+    assert sum(
+        expander.label == "Bit 16 receipt templates (2 instances)"
+        for expander in at.expander
+    ) == 1
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000"
+    ).value
+    at.radio(key="rem_tpl_source_T-B").set_value("Custom exception").run()
+    at.text_input(key="rem_tpl_custom_T-B").set_value("CUSTOM_ING_LANE3000").run()
+    custom_confirmation = "rem_tpl_confirm_T-B_Custom exception_CUSTOM_ING_LANE3000"
+    assert not at.checkbox(key=custom_confirmation).value
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000"
+    ).value
+    at.checkbox(key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000").check().run()
+    at.checkbox(key=custom_confirmation).check().run()
+
+    selection = next(frame.value for frame in at.dataframe if "Include" in frame.value)
+    assert set(selection["Value"]) == {
+        "Add:PLANET_ING_5000",
+        "Add:CUSTOM_ING_LANE3000",
+    }
+    assert set(selection["Target scope"]) == {"Instance"}
+    at.button(key="rem_batch_run").click().run()
+    assert _problems(at) == []
+    assert [params[2] for params, _ in sql.calls] == [
+        "PLANET_ING_5000",
+        "CUSTOM_ING_LANE3000",
+    ]
+    assert all(rollback for _, rollback in sql.calls)
+    records = snow.fix_log_rows()
+    assert {row["VALUE_SENT"] for row in records} == {
+        "Add:PLANET_ING_5000",
+        "Add:CUSTOM_ING_LANE3000",
+    }
+    assert all(row["MODE"] == "SIMULATION" for row in records)
+    at.radio(key="rem_tpl_source_T-B").set_value("Workbook list").run()
+    assert not at.checkbox(
+        key="rem_tpl_confirm_T-B_Workbook list_PLANET_ING_5000"
+    ).value
+    assert "rem_batch_rehearsal" not in at.session_state
+    next(button for button in at.button if button.label == "Empty table").click().run()
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    assert _problems(at) == []
+    assert at.selectbox(key="rem_tpl_T-B").value == "PLANET_ING_5000"
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-A_Workbook list_PLANET_ING_5000"
+    ).value
+    assert at.checkbox(
+        key="rem_tpl_confirm_T-B_Workbook list_PLANET_ING_5000"
+    ).value
+
+
+def test_batch_configurable_limit_keeps_procedure_call_cap():
+    snow = FakeSnowflake(rows=[_bit2_row(f"T-{index:04}") for index in range(301)])
+    at = _render(snow, **_batch_state("UAT", FakeSql()))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+    at.number_input(key="rem_batch_terminal_limit").set_value(301).run()
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
+
+    assert len(at.exception) == 0
+    assert at.button(key="rem_batch_run").disabled
+    assert any("300 fixes" in error.value for error in at.error)
+
+
+def test_campaign_rehearsal_requires_and_logs_campaign_reference():
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    sql = FakeSql()
+    state = _batch_state("UAT", sql)
+    state["rem_page"] = "Campaign"
+    at = _render(snow, script=_campaign_script, **state)
+
+    assert _problems(at) == []
+    assert not any(widget.key == "rem_campaign_name" for widget in at.text_input)
+    at.button(key="rem_campaign_load_targets").click().run()
+    terminal_targets = at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER")
+    assert terminal_targets.value == []
+    terminal_targets.set_value(["T-9"]).run()
+    assert at.text_input(key="rem_campaign_ref").value == ""
+    assert at.button(key="rem_campaign_run").disabled
+
+    at.text_input(key="rem_campaign_ref").set_value("UAT-DCC-20261008").run()
+    assert not at.button(key="rem_campaign_run").disabled
+    at.button(key="rem_campaign_run").click().run()
+
+    assert _problems(at) == []
+    assert [rollback for _, rollback in sql.calls] == [True]
+    rows = snow.fix_log_rows()
+    assert len(rows) == 1
+    assert rows[0]["MODE"] == "SIMULATION"
+    assert rows[0]["CHANGE_REF"] == "UAT-DCC-20261008"
+    assert "Campaign " in rows[0]["NOTES"]
+    assert not any("DCC_FIX_REGISTRY" in sql for sql, _ in snow.writes)
+
+
+def test_campaign_runs_only_the_selected_checks():
+    row = _row(
+        "T-9",
+        CONFIGDOWNLOAD_VERSION_CHECK_C=1,
+        HANDLER_DCCENABLE_CHECK_O=1,
+    )
+    snow = FakeSnowflake(rows=[row])
+    sql = FakeSql()
+    state = _batch_state("UAT", sql)
+    state["rem_page"] = "Campaign"
+    at = _render(snow, script=_campaign_script, **state)
+
+    checks = at.multiselect(key="rem_campaign_checks")
+    checks.set_value(["CONFIGDOWNLOAD_VERSION_CHECK_C"]).run()
+    at.button(key="rem_campaign_load_targets").click().run()
+    at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER").set_value(["T-9"]).run()
+    at.text_input(key="rem_campaign_ref").set_value("UAT-BIT2-001").run()
+    at.button(key="rem_campaign_run").click().run()
+
+    assert _problems(at) == []
+    assert len(sql.calls) == 1
+    assert sql.calls[0][0][0] == 2
+    assert all(
+        row["CHECK_COLUMN"] == "CONFIGDOWNLOAD_VERSION_CHECK_C"
+        for row in snow.fix_log_rows()
+    )
+
+
+def test_campaign_live_uat_logs_and_registers_shared_reference():
+    snow = FakeSnowflake(rows=[_bit2_row()])
+    sql = FakeSql()
+    state = _batch_state("UAT", sql, armed=True)
+    state["rem_page"] = "Campaign"
+    at = _render(snow, script=_campaign_script, **state)
+    at.button(key="rem_campaign_load_targets").click().run()
+    at.multiselect(key="rem_campaign_targets_TERMINAL_IDENTIFIER").set_value(["T-9"]).run()
+    at.radio(key="rem_campaign_mode").set_value("Apply live").run()
+    at.text_input(key="rem_campaign_ref").set_value("UAT-CAMPAIGN-002").run()
+    next(check for check in at.checkbox if check.label.startswith("I reviewed these")).check().run()
+
+    assert not at.button(key="rem_campaign_run").disabled
+    at.button(key="rem_campaign_run").click().run()
+
+    assert _problems(at) == []
+    assert sql.version == "2"
+    records = snow.fix_log_rows()
+    assert [record["MODE"] for record in records] == ["SIMULATION", "LIVE"]
+    assert all(record["CHANGE_REF"] == "UAT-CAMPAIGN-002" for record in records)
+    assert all(record["NOTES"].startswith("Campaign ") for record in records)
+    registry_writes = [
+        params for sql_text, params in snow.writes if "MERGE INTO" in sql_text
+        and "DCC_FIX_REGISTRY" in sql_text
+    ]
+    assert registry_writes and "UAT-CAMPAIGN-002" in registry_writes[0]
 
 
 def test_batch_prod_apply_is_blocked_without_approval_and_change_ref():
     snow = FakeSnowflake(rows=[_bit2_row()], can_prod=False)
     at = _render(snow, **_batch_state("PROD", FakeSql(), armed=True))
+    next(button for button in at.button if button.label == "Load / add terminals").click().run()
 
     at.radio(key="rem_batch_mode").set_value("Apply live").run()
     assert _problems(at) == []
